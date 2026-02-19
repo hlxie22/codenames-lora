@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import yaml
 from pathlib import Path
 from typing import Iterable, List, Set, Tuple
 
@@ -73,6 +74,7 @@ def build_vocab(
     max_len: int,
     token_regex: str,
     extra_ban: Set[str],
+    max_words: int | None = None,
 ) -> Tuple[List[str], dict]:
     token_re = re.compile(token_regex)
 
@@ -124,9 +126,16 @@ def build_vocab(
 
     # deterministic ordering: more frequent first, then alpha
     kept.sort(key=lambda t: (-t[1], t[0]))
-    vocab = [w for (w, _) in kept]
 
+    n_pre_cap = len(kept)
+    if max_words is not None:
+        if int(max_words) <= 0:
+            raise ValueError(f"max_words must be > 0 (got {max_words})")
+        kept = kept[: int(max_words)]
+
+    vocab = [w for (w, _) in kept]
     zs = [z for (_, z) in kept]
+
     manifest = {
         "lang": lang,
         "stop_n": stop_n,
@@ -135,9 +144,12 @@ def build_vocab(
         "min_len": min_len,
         "max_len": max_len,
         "token_regex": token_regex,
+        "max_words": int(max_words) if max_words is not None else None,
         "counts": {
             "total_seen": n_total,
+            "kept_pre_cap": n_pre_cap,
             "kept": len(vocab),
+            "capped": max(0, n_pre_cap - len(vocab)),
             "filtered_stopwords": n_stop,
             "filtered_banned": n_banned,
             "filtered_badshape": n_badshape,
@@ -186,50 +198,101 @@ def write_manifest(path: str, manifest: dict) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
+def load_yaml(path: str | Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="data/vocab.txt", help="Output vocab path")
-    ap.add_argument("--manifest", default=None, help="Optional JSON manifest path")
+    # Internal defaults (used if neither CLI nor config provide values)
+    OUT_DEFAULT = "data/vocab.txt"
+    LANG_DEFAULT = "en"
+    STOP_N_DEFAULT = 300
+    MIN_ZIPF_DEFAULT = 3.0
+    MAX_ZIPF_DEFAULT = 6.0
+    MIN_LEN_DEFAULT = 3
+    MAX_LEN_DEFAULT = 12
+    TOKEN_REGEX_DEFAULT = r"^[a-z]+$"
 
-    ap.add_argument("--lang", default="en", help="Language code for wordfreq")
-    ap.add_argument("--stop-n", type=int, default=300, help="Remove top-N most frequent words as stopwords")
-    ap.add_argument("--min-zipf", type=float, default=3.0, help="Minimum Zipf frequency to keep")
-    ap.add_argument("--max-zipf", type=float, default=6.0, help="Maximum Zipf frequency to keep (drops ultra-common)")
-    ap.add_argument("--min-len", type=int, default=3, help="Minimum token length")
-    ap.add_argument("--max-len", type=int, default=12, help="Maximum token length")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=None, help="Optional YAML config path (e.g., configs/default.yaml)")
+
+    # If provided, CLI overrides config; if omitted, config (then defaults) are used.
+    ap.add_argument("--out", default=None, help="Output vocab path (overrides config paths.vocab_path)")
+    ap.add_argument("--manifest", default=None, help="Optional JSON manifest path (overrides config vocab.manifest_path)")
+
+    ap.add_argument("--lang", default=None, help="Language code for wordfreq (overrides config vocab.lang)")
+    ap.add_argument("--stop-n", type=int, default=None, help="Remove top-N most frequent words as stopwords")
+    ap.add_argument("--min-zipf", type=float, default=None, help="Minimum Zipf frequency to keep")
+    ap.add_argument("--max-zipf", type=float, default=None, help="Maximum Zipf frequency to keep (drops ultra-common)")
+    ap.add_argument("--min-len", type=int, default=None, help="Minimum token length")
+    ap.add_argument("--max-len", type=int, default=None, help="Maximum token length")
+    ap.add_argument(
+        "--max-words",
+        type=int,
+        default=None,
+        help="Optional cap on vocab size after filtering/sorting (top-N by Zipf). Overrides config vocab.max_words.",
+    )
     ap.add_argument(
         "--token-regex",
-        default=r"^[a-z]+$",
+        default=None,
         help="Regex a token must match (default keeps only lowercase alphabetic words).",
     )
     ap.add_argument(
         "--extra-banlist",
         default=None,
-        help="Optional path to a newline-separated banlist (lowercased). Lines starting with # are ignored.",
+        help="Optional path to a newline-separated banlist (overrides config vocab.extra_banlist).",
     )
 
     args = ap.parse_args()
 
-    extra_ban = load_extra_banlist(args.extra_banlist)
+    cfg = load_yaml(args.config) if args.config else {}
+    vcfg = cfg.get("vocab", {}) if isinstance(cfg, dict) else {}
+    pcfg = cfg.get("paths", {}) if isinstance(cfg, dict) else {}
 
-    vocab, manifest = build_vocab(
-        lang=args.lang,
-        stop_n=args.stop_n,
-        min_zipf=args.min_zipf,
-        max_zipf=args.max_zipf,
-        min_len=args.min_len,
-        max_len=args.max_len,
-        token_regex=args.token_regex,
-        extra_ban=extra_ban,
+    out_path = (
+        args.out
+        or pcfg.get("vocab_path")
+        or vcfg.get("out")
+        or OUT_DEFAULT
+    )
+    manifest_path = (
+        args.manifest
+        or vcfg.get("manifest_path")
+        or None
     )
 
-    write_vocab(args.out, vocab)
-    print(f"Wrote {len(vocab)} words -> {args.out}")
+    lang = args.lang or vcfg.get("lang") or LANG_DEFAULT
+    stop_n = args.stop_n if args.stop_n is not None else int(vcfg.get("stop_n", STOP_N_DEFAULT))
+    min_zipf = args.min_zipf if args.min_zipf is not None else float(vcfg.get("min_zipf", MIN_ZIPF_DEFAULT))
+    max_zipf = args.max_zipf if args.max_zipf is not None else float(vcfg.get("max_zipf", MAX_ZIPF_DEFAULT))
+    min_len = args.min_len if args.min_len is not None else int(vcfg.get("min_len", MIN_LEN_DEFAULT))
+    max_len = args.max_len if args.max_len is not None else int(vcfg.get("max_len", MAX_LEN_DEFAULT))
+    token_regex = args.token_regex or vcfg.get("token_regex") or TOKEN_REGEX_DEFAULT
+    max_words = args.max_words if args.max_words is not None else vcfg.get("max_words", None)
+    if max_words is not None:
+        max_words = int(max_words)
 
-    if args.manifest:
-        write_manifest(args.manifest, manifest)
-        print(f"Wrote manifest -> {args.manifest}")
+    extra_banlist_path = args.extra_banlist or vcfg.get("extra_banlist") or None
+    extra_ban = load_extra_banlist(extra_banlist_path)
+
+    vocab, manifest = build_vocab(
+        lang=lang,
+        stop_n=stop_n,
+        min_zipf=min_zipf,
+        max_zipf=max_zipf,
+        min_len=min_len,
+        max_len=max_len,
+        token_regex=token_regex,
+        extra_ban=extra_ban,
+        max_words=max_words,
+    )
+
+    write_vocab(out_path, vocab)
+    print(f"Wrote {len(vocab)} words -> {out_path}")
+
+    if manifest_path:
+        write_manifest(manifest_path, manifest)
+        print(f"Wrote manifest -> {manifest_path}")
     else:
         # quick console summary
         print(json.dumps(manifest["counts"], indent=2))

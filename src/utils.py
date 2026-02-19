@@ -10,7 +10,6 @@ from typing import Any, Dict, Iterable, List, Optional
 import numpy as np
 import yaml
 
-
 def load_yaml(path: str | Path) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)

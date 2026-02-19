@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 import numpy as np
 
-from .model_wrappers import HFTextGenerator, Embedder, load_lora_on_generator
+from .model_wrappers import make_text_generator, Embedder, load_lora_on_generator
 from .rollout import run_turn, select_best_candidate
 from .metrics import aggregate
 from .utils import load_yaml, read_jsonl, write_jsonl, ensure_dir, save_config_snapshot, save_run_meta, set_global_seed
@@ -29,12 +29,12 @@ def main():
     boards = read_jsonl(cfg["paths"]["boards_eval_path"])
 
     # models
-    spymaster = HFTextGenerator(cfg["models"]["spymaster_model_id"], device_map="auto")
+    spymaster = make_text_generator(cfg["models"]["spymaster_model_id"], cfg)
     if args.mode == "sft":
         adapter_dir = cfg["training"]["output_adapter_dir"]
         spymaster = load_lora_on_generator(spymaster, adapter_dir)
 
-    guesser = HFTextGenerator(cfg["models"]["guesser_model_id"], device_map="auto")
+    guesser = make_text_generator(cfg["models"]["guesser_model_id"], cfg)
 
     device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
     embedder = Embedder(cfg["models"]["embedding_model_id"], device=device)

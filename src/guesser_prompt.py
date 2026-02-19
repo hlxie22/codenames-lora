@@ -19,6 +19,9 @@ CLUE: {clue}
 NUM: {num}
 
 Return at least {num} guesses if possible.
+
+OUTPUT FORMAT (exactly):
+GUESSES: word1, word2, word3
 """
     return [
         {"role": "system", "content": system},

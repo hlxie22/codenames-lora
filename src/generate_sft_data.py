@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 import numpy as np
 
-from .model_wrappers import HFTextGenerator, Embedder
+from .model_wrappers import make_text_generator, Embedder
 from .rollout import run_turn, select_best_candidate
 from .spymaster_prompt import build_spymaster_messages
 from .utils import load_yaml, read_jsonl, write_jsonl, ensure_dir, set_global_seed
@@ -70,8 +70,8 @@ def main():
     boards = read_jsonl(cfg["paths"]["boards_train_path"])
 
     # Models
-    spymaster = HFTextGenerator(cfg["models"]["spymaster_model_id"], device_map="auto")
-    guesser = HFTextGenerator(cfg["models"]["guesser_model_id"], device_map="auto")
+    spymaster = make_text_generator(cfg["models"]["spymaster_model_id"], cfg)
+    guesser = make_text_generator(cfg["models"]["guesser_model_id"], cfg)
 
     # Embedder (use cuda if available)
     device = "cuda" if __import__("torch").cuda.is_available() else "cpu"

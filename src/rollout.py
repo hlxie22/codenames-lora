@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from .model_wrappers import Embedder, HFTextGenerator, GenerationConfig
+from .model_wrappers import Embedder, TextGenerator, GenerationConfig
 from .rules import is_valid_clue, normalize_word, score_turn
 from .spymaster_prompt import build_spymaster_messages
 from .guesser_prompt import build_guesser_messages
@@ -71,8 +71,8 @@ class CandidateResult:
 
 def run_one_candidate(
     board_record: Dict[str, Any],
-    spymaster: HFTextGenerator,
-    guesser: HFTextGenerator,
+    spymaster: TextGenerator,
+    guesser: TextGenerator,
     embedder: Embedder,
     cfg: Dict[str, Any],
     seed: Optional[int] = None,
@@ -159,8 +159,8 @@ def run_one_candidate(
 
 def run_turn(
     board_record: Dict[str, Any],
-    spymaster: HFTextGenerator,
-    guesser: HFTextGenerator,
+    spymaster: TextGenerator,
+    guesser: TextGenerator,
     embedder: Embedder,
     cfg: Dict[str, Any],
     n_candidates: int = 1,

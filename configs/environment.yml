@@ -30,6 +30,8 @@ dependencies:
   - git-lfs
 
   - pip:
+      - vllm>=0.6.4
+      
       # HF stack
       - transformers>=4.45.0
       - accelerate>=0.34.0

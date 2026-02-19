@@ -1,0 +1,1901 @@
+Directory structure:
+└── codenames-lora/
+    ├── .gitingestignore
+    ├── configs/
+    │   ├── default.yaml
+    │   └── environment.yml
+    └── src/
+        ├── __init__.py
+        ├── build_vocab.py
+        ├── eval.py
+        ├── generate_sft_data.py
+        ├── guesser_prompt.py
+        ├── make_boards.py
+        ├── metrics.py
+        ├── model_wrappers.py
+        ├── rollout.py
+        ├── rules.py
+        ├── spymaster_prompt.py
+        ├── train_lora_sft.py
+        └── utils.py
+
+================================================
+FILE: .gitingestignore
+================================================
+/run.slurm
+
+
+================================================
+FILE: configs/default.yaml
+================================================
+inference:
+  backend: "vllm"   # "hf" or "vllm"
+
+  vllm:
+    tensor_parallel_size: 2
+    gpu_memory_utilization: 0.90
+    max_model_len: 4096
+    dtype: "bfloat16"   # "auto" | "float16" | "bfloat16"
+    trust_remote_code: true
+
+    # If you want to run eval with your LoRA adapter in vLLM:
+    enable_lora: true
+    max_lora_rank: 64
+
+paths:
+  data_dir: "data"
+  outputs_dir: "outputs"
+  vocab_path: "data/vocab.txt"
+  boards_train_path: "data/boards_train.jsonl"
+  boards_eval_path: "data/boards_eval.jsonl"
+  sft_turns_path: "data/sft_turns.jsonl"
+  sft_turns_raw_path: "data/sft_turns_raw.jsonl"
+
+boards:
+  n_train_boards: 2000
+  n_eval_boards: 400
+  board_size: 25
+  n_team: 9
+  n_opp: 8
+  n_neu: 7
+  n_assassin: 1
+  seed_train: 123
+  seed_eval: 456
+  allow_duplicates: false
+  avoid_repeat_boards_within_split: true
+  avoid_repeat_boards_across_splits: true
+
+models:
+  spymaster_model_id: "Qwen/Qwen3-8B"
+  guesser_model_id: "Qwen/Qwen3-8B"
+  embedding_model_id: "sentence-transformers/all-MiniLM-L6-v2"
+
+qwen:
+  use_chat_template: true
+  enable_thinking_spymaster: true
+  enable_thinking_guesser: true
+  system_spymaster: "You are the Spymaster in a Codenames-like game."
+  system_guesser: "You are the Guesser in a Codenames-like game."
+
+decoding:
+  spymaster_temperature: 0.6
+  spymaster_top_p: 0.95
+  spymaster_top_k: 20
+  spymaster_max_new_tokens: 2048
+
+  guesser_temperature: 0.6
+  guesser_top_p: 0.95
+  guesser_top_k: 20
+  guesser_max_new_tokens: 2048
+
+  n_candidates: 8
+  max_resamples: 8
+
+constraints:
+  single_word_only: true
+  ban_board_words: true
+  ban_substrings: true
+  tau_direct: 0.52
+  directness_metric: "cosine"
+
+reward:
+  team_correct: 1.0
+  opp_wrong: -1.0
+  neu_wrong: -0.5
+  assassin_wrong: -3.0
+  repeat_penalty: 0.0
+  brevity_bonus: 0.0
+
+filtering:
+  mode: "rule_based"   # "top_percent" or "rule_based"
+  top_percent: 0.4
+  min_team_correct: 2
+  require_no_assassin: true
+
+training:
+  seed: 999
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  lr: 2.0e-4
+  epochs: 2
+  batch_size: 2
+  grad_accum: 8
+  max_seq_len: 4096
+  output_adapter_dir: "outputs/sft/lora_spymaster"
+  bf16: true
+  fp16: false
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]  # typical for Llama-like
+
+
+================================================
+FILE: configs/environment.yml
+================================================
+name: codenames-lora
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pip
+
+  # core utilities
+  - numpy>=1.26
+  - pyyaml>=6.0
+  - tqdm
+  - regex
+  - scipy
+  - pandas
+  - sentencepiece
+  - protobuf
+  - psutil
+
+  # PyTorch (GPU build). For CPU-only, remove pytorch-cuda and use pytorch-cpu (see note below).
+  - pytorch>=2.3
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+
+  # optional but handy if you ever git-clone HF models
+  - git
+  - git-lfs
+
+  - pip:
+      - vllm>=0.6.4
+      
+      # HF stack
+      - transformers>=4.45.0
+      - accelerate>=0.34.0
+      - peft>=0.12.0
+      - huggingface-hub>=0.25.0
+      - safetensors>=0.4.3
+      - tokenizers>=0.19.1
+
+      # embeddings (your Embedder will fall back to HF encoder if this isn't usable)
+      - sentence-transformers>=3.0.0
+
+      # vocab builder
+      - wordfreq>=3.1.0
+
+      # tokenizer backend often used by newer Llama-family tokenizers
+      - tiktoken>=0.7.0
+
+
+================================================
+FILE: src/__init__.py
+================================================
+[Empty file]
+
+
+================================================
+FILE: src/build_vocab.py
+================================================
+#!/usr/bin/env python3
+"""
+Build a clean Codenames-style vocabulary file using wordfreq.
+
+Approach (hybrid):
+- remove ultra-common stopwords: top_n_list('en', STOP_N)
+- keep only words within a Zipf frequency window: MIN_ZIPF <= zipf <= MAX_ZIPF
+- keep only lowercase alphabetic tokens (default: ^[a-z]+$)
+- filter by length
+- apply a small curated "ban list" for months/days/numbers/meta-words
+- write data/vocab.txt (one word per line)
+- optionally write a manifest with stats
+
+Usage:
+  pip install wordfreq
+  python -m src.build_vocab --out data/vocab.txt --manifest data/vocab_manifest.json
+
+Notes:
+- Output words are lowercased.
+- Ordering is deterministic: sorted by (-zipf, word).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+from typing import Iterable, List, Set, Tuple
+
+from wordfreq import iter_wordlist, top_n_list, zipf_frequency
+
+
+DEFAULT_BAN = {
+    # days
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    # months
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+    # numbers (word forms)
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "first", "second", "third",
+    # ultra-generic/meta (often unfun boards)
+    "thing", "things", "stuff", "object", "objects", "person", "people", "someone", "somebody",
+    "anything", "everything", "nothing", "something",
+    # directions (optional; remove if you like them)
+    "north", "south", "east", "west", "left", "right",
+}
+
+
+def load_extra_banlist(path: str | None) -> Set[str]:
+    if not path:
+        return set()
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Banlist file not found: {path}")
+    banned = set()
+    for line in p.read_text(encoding="utf-8").splitlines():
+        w = line.strip().lower()
+        if not w or w.startswith("#"):
+            continue
+        banned.add(w)
+    return banned
+
+
+def build_vocab(
+    *,
+    lang: str,
+    stop_n: int,
+    min_zipf: float,
+    max_zipf: float,
+    min_len: int,
+    max_len: int,
+    token_regex: str,
+    extra_ban: Set[str],
+) -> Tuple[List[str], dict]:
+    token_re = re.compile(token_regex)
+
+    stop = set(top_n_list(lang, stop_n))
+    banned = set(DEFAULT_BAN) | set(extra_ban)
+
+    kept: List[Tuple[str, float]] = []
+    seen = set()
+
+    n_total = 0
+    n_stop = 0
+    n_badshape = 0
+    n_len = 0
+    n_zipf = 0
+    n_banned = 0
+
+    for w in iter_wordlist(lang):
+        n_total += 1
+        w = w.strip().lower()
+        if not w:
+            continue
+
+        if w in seen:
+            continue
+        seen.add(w)
+
+        if w in stop:
+            n_stop += 1
+            continue
+
+        if w in banned:
+            n_banned += 1
+            continue
+
+        if not token_re.match(w):
+            n_badshape += 1
+            continue
+
+        if len(w) < min_len or len(w) > max_len:
+            n_len += 1
+            continue
+
+        z = float(zipf_frequency(w, lang))
+        if z < min_zipf or z > max_zipf:
+            n_zipf += 1
+            continue
+
+        kept.append((w, z))
+
+    # deterministic ordering: more frequent first, then alpha
+    kept.sort(key=lambda t: (-t[1], t[0]))
+    vocab = [w for (w, _) in kept]
+
+    zs = [z for (_, z) in kept]
+    manifest = {
+        "lang": lang,
+        "stop_n": stop_n,
+        "min_zipf": min_zipf,
+        "max_zipf": max_zipf,
+        "min_len": min_len,
+        "max_len": max_len,
+        "token_regex": token_regex,
+        "counts": {
+            "total_seen": n_total,
+            "kept": len(vocab),
+            "filtered_stopwords": n_stop,
+            "filtered_banned": n_banned,
+            "filtered_badshape": n_badshape,
+            "filtered_length": n_len,
+            "filtered_zipf": n_zipf,
+        },
+        "zipf_stats": {
+            "min": min(zs) if zs else None,
+            "max": max(zs) if zs else None,
+            "mean": (sum(zs) / len(zs)) if zs else None,
+            "p10": percentile(zs, 10) if zs else None,
+            "p50": percentile(zs, 50) if zs else None,
+            "p90": percentile(zs, 90) if zs else None,
+        },
+        "examples_top20": vocab[:20],
+    }
+    return vocab, manifest
+
+
+def percentile(values: List[float], p: float) -> float:
+    # small deterministic percentile helper without numpy
+    if not values:
+        return float("nan")
+    xs = sorted(values)
+    if p <= 0:
+        return xs[0]
+    if p >= 100:
+        return xs[-1]
+    k = (len(xs) - 1) * (p / 100.0)
+    f = int(k)
+    c = min(f + 1, len(xs) - 1)
+    if f == c:
+        return xs[f]
+    d = k - f
+    return xs[f] * (1 - d) + xs[c] * d
+
+
+def write_vocab(out_path: str, vocab: List[str]) -> None:
+    p = Path(out_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(vocab) + "\n", encoding="utf-8")
+
+
+def write_manifest(path: str, manifest: dict) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="data/vocab.txt", help="Output vocab path")
+    ap.add_argument("--manifest", default=None, help="Optional JSON manifest path")
+
+    ap.add_argument("--lang", default="en", help="Language code for wordfreq")
+    ap.add_argument("--stop-n", type=int, default=300, help="Remove top-N most frequent words as stopwords")
+    ap.add_argument("--min-zipf", type=float, default=3.0, help="Minimum Zipf frequency to keep")
+    ap.add_argument("--max-zipf", type=float, default=6.0, help="Maximum Zipf frequency to keep (drops ultra-common)")
+    ap.add_argument("--min-len", type=int, default=3, help="Minimum token length")
+    ap.add_argument("--max-len", type=int, default=12, help="Maximum token length")
+    ap.add_argument(
+        "--token-regex",
+        default=r"^[a-z]+$",
+        help="Regex a token must match (default keeps only lowercase alphabetic words).",
+    )
+    ap.add_argument(
+        "--extra-banlist",
+        default=None,
+        help="Optional path to a newline-separated banlist (lowercased). Lines starting with # are ignored.",
+    )
+
+    args = ap.parse_args()
+
+    extra_ban = load_extra_banlist(args.extra_banlist)
+
+    vocab, manifest = build_vocab(
+        lang=args.lang,
+        stop_n=args.stop_n,
+        min_zipf=args.min_zipf,
+        max_zipf=args.max_zipf,
+        min_len=args.min_len,
+        max_len=args.max_len,
+        token_regex=args.token_regex,
+        extra_ban=extra_ban,
+    )
+
+    write_vocab(args.out, vocab)
+    print(f"Wrote {len(vocab)} words -> {args.out}")
+
+    if args.manifest:
+        write_manifest(args.manifest, manifest)
+        print(f"Wrote manifest -> {args.manifest}")
+    else:
+        # quick console summary
+        print(json.dumps(manifest["counts"], indent=2))
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================
+FILE: src/eval.py
+================================================
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Any, Dict, List
+
+import numpy as np
+
+from .model_wrappers import make_text_generator, Embedder, load_lora_on_generator
+from .rollout import run_turn, select_best_candidate
+from .metrics import aggregate
+from .utils import load_yaml, read_jsonl, write_jsonl, ensure_dir, save_config_snapshot, save_run_meta, set_global_seed
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--mode", choices=["baseline", "sft"], required=True)
+    ap.add_argument("--out", required=True, help="Output directory (e.g., outputs/baselines/run1)")
+    args = ap.parse_args()
+
+    cfg = load_yaml(args.config)
+    set_global_seed(int(cfg["training"].get("seed", 0)))
+
+    out_dir = ensure_dir(args.out)
+    save_config_snapshot(cfg, out_dir)
+    save_run_meta(out_dir, command=["python", "-m", "src.eval", "--config", args.config, "--mode", args.mode, "--out", args.out])
+
+    boards = read_jsonl(cfg["paths"]["boards_eval_path"])
+
+    # models
+    spymaster = make_text_generator(cfg["models"]["spymaster_model_id"], cfg)
+    if args.mode == "sft":
+        adapter_dir = cfg["training"]["output_adapter_dir"]
+        spymaster = load_lora_on_generator(spymaster, adapter_dir)
+
+    guesser = make_text_generator(cfg["models"]["guesser_model_id"], cfg)
+
+    device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+    embedder = Embedder(cfg["models"]["embedding_model_id"], device=device)
+
+    per_board: List[Dict[str, Any]] = []
+    for i, b in enumerate(boards):
+        seed = int(b.get("seed", 0))
+        candidates, meta = run_turn(b, spymaster, guesser, embedder, cfg, n_candidates=1, seed=seed)
+        best = select_best_candidate(candidates)
+
+        rec = {
+            "board_id": b["board_id"],
+            "reward": float(best.reward),
+            "clue": best.clue,
+            "num": int(best.num),
+            "guess_words": best.guess_words,
+            "stats": {**best.stats, "directness": float(best.directness)},
+            "clue_meta": {
+                "valid": bool(best.valid),
+                "rejected_total": int(meta["rejected_total"]),
+                "rejection_counts": meta["rejection_counts"],
+            },
+        }
+        per_board.append(rec)
+
+        if (i + 1) % 50 == 0:
+            print(f"[{i+1}/{len(boards)}] mean_reward={np.mean([r['reward'] for r in per_board]):.3f}")
+
+    per_path = Path(out_dir) / "per_board.jsonl"
+    write_jsonl(per_path, per_board)
+
+    metrics = aggregate(per_board)
+    with open(Path(out_dir) / "metrics.json", "w", encoding="utf-8") as f:
+        import json
+        json.dump(metrics, f, indent=2)
+
+    print(f"Wrote per-board -> {per_path}")
+    print(f"Wrote metrics   -> {Path(out_dir) / 'metrics.json'}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================
+FILE: src/generate_sft_data.py
+================================================
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Any, Dict, List
+
+import numpy as np
+
+from .model_wrappers import make_text_generator, Embedder
+from .rollout import run_turn, select_best_candidate
+from .spymaster_prompt import build_spymaster_messages
+from .utils import load_yaml, read_jsonl, write_jsonl, ensure_dir, set_global_seed
+
+import re
+_THINK_RE = re.compile(r"<think>\s*(.*?)\s*</think>", re.IGNORECASE | re.DOTALL)
+
+def extract_think_block(text: str) -> str:
+    # Keep the model-produced think block if present; otherwise return "".
+    lo = text.lower().rfind("<think>")
+    hi = text.lower().rfind("</think>")
+    if lo != -1 and hi != -1 and hi > lo:
+        return text[lo : hi + len("</think>")].strip()
+    # Sometimes you might only see </think>; keep everything up to it as "thinking".
+    if hi != -1:
+        return text[: hi + len("</think>")].strip()
+    return ""
+
+def extract_think(text: str) -> str:
+    m = _THINK_RE.search(text)
+    return m.group(1).strip() if m else ""
+
+def filter_examples(records: List[Dict[str, Any]], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    fcfg = cfg["filtering"]
+    mode = fcfg["mode"]
+
+    if not records:
+        return []
+
+    if mode == "top_percent":   
+        top_p = float(fcfg["top_percent"])
+        rewards = np.array([r["reward"] for r in records], dtype=np.float32)
+        thr = float(np.quantile(rewards, 1.0 - top_p))
+        kept = [r for r in records if float(r["reward"]) >= thr]
+        return kept
+
+    if mode == "rule_based":
+        min_team = int(fcfg.get("min_team_correct", 0))
+        require_no_assassin = bool(fcfg.get("require_no_assassin", False))
+        kept = []
+        for r in records:
+            st = r.get("stats", {})
+            if int(st.get("n_team", 0)) < min_team:
+                continue
+            if require_no_assassin and int(st.get("assassin", 0)) > 0:
+                continue
+            kept.append(r)
+        return kept
+
+    raise ValueError(f"Unknown filtering mode: {mode}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    args = ap.parse_args()
+
+    cfg = load_yaml(args.config)
+    set_global_seed(int(cfg["training"].get("seed", 0)))
+
+    boards = read_jsonl(cfg["paths"]["boards_train_path"])
+
+    # Models
+    spymaster = make_text_generator(cfg["models"]["spymaster_model_id"], cfg)
+    guesser = make_text_generator(cfg["models"]["guesser_model_id"], cfg)
+
+    # Embedder (use cuda if available)
+    device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+    embedder = Embedder(cfg["models"]["embedding_model_id"], device=device)
+
+    n_candidates = int(cfg["decoding"]["n_candidates"])
+
+    raw_records: List[Dict[str, Any]] = []
+    for i, b in enumerate(boards):
+        # seed per board for stability
+        seed = int(b.get("seed", 0))
+
+        candidates, meta = run_turn(
+            b,
+            spymaster,
+            guesser,
+            embedder,
+            cfg,
+            n_candidates=n_candidates,
+            seed=seed,
+        )
+        best = select_best_candidate(candidates)
+
+        # prompt must match exactly the spymaster prompt used in rollouts
+        revealed = [False] * len(b["board_words"])
+        msgs = build_spymaster_messages(b["board_words"], b["labels"], revealed, cfg)
+
+        use_chat = bool(cfg.get("qwen", {}).get("use_chat_template", False))
+        sp_think = bool(cfg.get("qwen", {}).get("enable_thinking_spymaster", True))
+        prompt = spymaster.format_chat(msgs, add_generation_prompt=True, enable_thinking=sp_think) if use_chat else msgs[-1]["content"]
+
+        think_block = extract_think_block(best.raw_spymaster_text)
+        completion = ""
+        if think_block:
+            completion += think_block + "\n"
+        completion += f"CLUE: {best.clue}\nNUM: {best.num}\n"
+
+        rec = {
+            "example_id": f"turn_{i+1:06d}",
+            "board_id": b["board_id"],
+            "prompt": prompt,
+            "completion": completion,
+            "reward": float(best.reward),
+            "stats": {
+                **best.stats,
+                "directness": float(best.directness),
+            },
+            "clue_meta": {
+                "clue": best.clue,
+                "num": int(best.num),
+                "valid": bool(best.valid),
+                "rejected_candidates": int(meta["rejected_total"]),
+                "rejection_counts": meta["rejection_counts"],
+            },
+            "debug": {
+                "guess_words": best.guess_words,
+            },
+        }
+        raw_records.append(rec)
+
+        if (i + 1) % 50 == 0:
+            print(f"[{i+1}/{len(boards)}] mean_reward={np.mean([r['reward'] for r in raw_records]):.3f}")
+
+    # write raw
+    raw_path = cfg["paths"].get("sft_turns_raw_path")
+    if raw_path:
+        write_jsonl(raw_path, raw_records)
+        print(f"Wrote raw SFT records -> {raw_path}")
+
+    # filter and write final
+    filtered = filter_examples(raw_records, cfg)
+    write_jsonl(cfg["paths"]["sft_turns_path"], filtered)
+    print(f"Filtered {len(filtered)}/{len(raw_records)} -> {cfg['paths']['sft_turns_path']}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================
+FILE: src/guesser_prompt.py
+================================================
+from typing import Dict, List, Any
+
+def build_guesser_messages(
+    board_words: List[str],
+    revealed_mask: List[bool],
+    clue: str,
+    num: int,
+    cfg: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    system = cfg.get("qwen", {}).get("system_guesser", "You are the Guesser in a Codenames-like game.")
+    visible = [w for w, rev in zip(board_words, revealed_mask) if not rev]
+
+    user = f"""You only see the board words and the clue.
+ 
+ BOARD WORDS:
+ {", ".join(visible)}
+
+CLUE: {clue}
+NUM: {num}
+
+Return at least {num} guesses if possible.
+"""
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+
+================================================
+FILE: src/make_boards.py
+================================================
+from __future__ import annotations
+
+import argparse
+import hashlib
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+
+from .utils import load_yaml, set_global_seed, write_jsonl, ensure_dir
+
+
+def load_vocab(path: str | Path) -> List[str]:
+    vocab: List[str] = []
+    seen = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            w = line.strip()
+            if not w:
+                continue
+            wl = w.lower()
+            if wl in seen:
+                continue
+            seen.add(wl)
+            vocab.append(w)
+    return vocab
+
+
+def sample_board(vocab: List[str], rng: np.random.Generator, board_size: int, allow_duplicates: bool) -> List[str]:
+    if allow_duplicates:
+        idx = rng.integers(0, len(vocab), size=board_size).tolist()
+        return [vocab[i] for i in idx]
+    else:
+        if len(vocab) < board_size:
+            raise ValueError(f"Vocab too small: {len(vocab)} < {board_size}")
+        idx = rng.choice(len(vocab), size=board_size, replace=False).tolist()
+        return [vocab[i] for i in idx]
+
+
+def assign_labels(
+    rng: np.random.Generator,
+    board_size: int,
+    n_team: int,
+    n_opp: int,
+    n_neu: int,
+    n_assassin: int,
+) -> List[str]:
+    labels = (["TEAM"] * n_team) + (["OPP"] * n_opp) + (["NEU"] * n_neu) + (["ASSASSIN"] * n_assassin)
+    if len(labels) != board_size:
+        raise ValueError("Label counts do not sum to board_size.")
+    rng.shuffle(labels)
+    return labels
+
+
+def board_hash(board_words: List[str]) -> str:
+    s = "||".join(sorted([w.lower() for w in board_words]))
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+
+def make_split(
+    split_name: str,
+    n_boards: int,
+    vocab: List[str],
+    cfg: Dict[str, Any],
+    seed: int,
+    global_seen_hashes: set[str],
+) -> List[Dict[str, Any]]:
+    bcfg = cfg["boards"]
+    rng = np.random.default_rng(seed)
+    records: List[Dict[str, Any]] = []
+    local_seen = set()
+
+    for i in range(n_boards):
+        # try until unique (if requested)
+        while True:
+            board_seed = int(rng.integers(0, 2**31 - 1))
+            brng = np.random.default_rng(board_seed)
+            words = sample_board(vocab, brng, int(bcfg["board_size"]), bool(bcfg["allow_duplicates"]))
+            h = board_hash(words)
+
+            if bcfg.get("avoid_repeat_boards_within_split", True) and h in local_seen:
+                continue
+            if bcfg.get("avoid_repeat_boards_across_splits", True) and h in global_seen_hashes:
+                continue
+
+            local_seen.add(h)
+            global_seen_hashes.add(h)
+            labels = assign_labels(
+                brng,
+                int(bcfg["board_size"]),
+                int(bcfg["n_team"]),
+                int(bcfg["n_opp"]),
+                int(bcfg["n_neu"]),
+                int(bcfg["n_assassin"]),
+            )
+            rec = {
+                "board_id": f"{split_name}_{i+1:06d}",
+                "board_words": words,
+                "labels": labels,
+                "seed": board_seed,
+                "board_hash": h,
+            }
+            records.append(rec)
+            break
+
+    return records
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    args = ap.parse_args()
+
+    cfg = load_yaml(args.config)
+    vocab = load_vocab(cfg["paths"]["vocab_path"])
+
+    set_global_seed(0)
+
+    seen_hashes: set[str] = set()
+    train = make_split(
+        "train",
+        int(cfg["boards"]["n_train_boards"]),
+        vocab,
+        cfg,
+        int(cfg["boards"]["seed_train"]),
+        seen_hashes,
+    )
+    eval_ = make_split(
+        "eval",
+        int(cfg["boards"]["n_eval_boards"]),
+        vocab,
+        cfg,
+        int(cfg["boards"]["seed_eval"]),
+        seen_hashes,
+    )
+
+    write_jsonl(cfg["paths"]["boards_train_path"], train)
+    write_jsonl(cfg["paths"]["boards_eval_path"], eval_)
+
+    print(f"Wrote {len(train)} train boards -> {cfg['paths']['boards_train_path']}")
+    print(f"Wrote {len(eval_)} eval boards  -> {cfg['paths']['boards_eval_path']}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================
+FILE: src/metrics.py
+================================================
+from __future__ import annotations
+
+from typing import Any, Dict, List, Tuple
+import math
+import numpy as np
+
+
+def compute_clue_diversity(clues: List[str]) -> Dict[str, Any]:
+    clues = [c.strip().lower() for c in clues if c and c.strip()]
+    n = len(clues)
+    if n == 0:
+        return {"n": 0, "distinct": 0, "distinct_rate": 0.0, "entropy": 0.0}
+
+    from collections import Counter
+    ctr = Counter(clues)
+    distinct = len(ctr)
+    probs = np.array([v / n for v in ctr.values()], dtype=np.float64)
+    entropy = float(-(probs * np.log(probs + 1e-12)).sum())
+    return {"n": n, "distinct": distinct, "distinct_rate": float(distinct / n), "entropy": entropy}
+
+
+def bootstrap_ci(values: List[float], n: int = 1000, alpha: float = 0.05, seed: int = 0) -> Tuple[float, float]:
+    rng = np.random.default_rng(seed)
+    arr = np.array(values, dtype=np.float64)
+    if len(arr) == 0:
+        return (float("nan"), float("nan"))
+    means = []
+    for _ in range(n):
+        samp = rng.choice(arr, size=len(arr), replace=True)
+        means.append(float(np.mean(samp)))
+    lo = float(np.quantile(means, alpha / 2))
+    hi = float(np.quantile(means, 1 - alpha / 2))
+    return lo, hi
+
+
+def aggregate(per_board_records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rewards = [float(r["reward"]) for r in per_board_records]
+    n_team = [int(r["stats"].get("n_team", 0)) for r in per_board_records]
+    n_opp = [int(r["stats"].get("n_opp", 0)) for r in per_board_records]
+    n_neu = [int(r["stats"].get("n_neu", 0)) for r in per_board_records]
+    assassin = [int(r["stats"].get("assassin", 0)) for r in per_board_records]
+    directness = [float(r["stats"].get("directness", 0.0)) for r in per_board_records]
+    clues = [r.get("clue", "") for r in per_board_records]
+
+    assassin_rate = float(np.mean([1.0 if a > 0 else 0.0 for a in assassin])) if assassin else 0.0
+
+    out: Dict[str, Any] = {
+        "n_boards": len(per_board_records),
+        "reward_mean": float(np.mean(rewards)) if rewards else 0.0,
+        "reward_median": float(np.median(rewards)) if rewards else 0.0,
+        "reward_ci95": bootstrap_ci(rewards, n=500, seed=1) if rewards else (0.0, 0.0),
+        "team_mean": float(np.mean(n_team)) if n_team else 0.0,
+        "opp_mean": float(np.mean(n_opp)) if n_opp else 0.0,
+        "neu_mean": float(np.mean(n_neu)) if n_neu else 0.0,
+        "assassin_rate": assassin_rate,
+        "directness_mean": float(np.mean(directness)) if directness else 0.0,
+        "directness_p90": float(np.quantile(directness, 0.9)) if directness else 0.0,
+        "clue_diversity": compute_clue_diversity(clues),
+    }
+    return out
+
+
+================================================
+FILE: src/model_wrappers.py
+================================================
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable, Union
+
+import numpy as np
+
+
+@dataclass
+class GenerationConfig:
+    temperature: float
+    top_p: float
+    top_k: int | None = None
+    max_new_tokens: int
+
+@runtime_checkable
+class TextGenerator(Protocol):
+    model_id: str
+
+    def format_chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        add_generation_prompt: bool = True,
+        enable_thinking: bool = True,
+    ) -> str: ...
+
+    def generate(
+        self,
+        prompt_or_messages: str | List[Dict[str, str]],
+        gen_cfg: GenerationConfig,
+        seed: Optional[int] = None,
+        *,
+        use_chat_template: bool = False,
+        enable_thinking: bool = True,
+    ) -> str: ...
+
+class VLLMTextGenerator:
+    """
+    Thin wrapper around vLLM offline inference.
+    """
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.90,
+        max_model_len: int | None = None,
+        dtype: str = "auto",
+        trust_remote_code: bool = True,
+        enable_lora: bool = False,
+        max_lora_rank: int = 64,
+    ):
+        from transformers import AutoTokenizer
+        from vllm import LLM
+
+        self.model_id = model_id
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            use_fast=True,
+            trust_remote_code=trust_remote_code,
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # vLLM engine (offline)
+        self.llm = LLM(
+            model=model_id,
+            tokenizer=model_id,
+            tensor_parallel_size=int(tensor_parallel_size),
+            gpu_memory_utilization=float(gpu_memory_utilization),
+            max_model_len=max_model_len,
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            enable_lora=bool(enable_lora),
+            max_lora_rank=int(max_lora_rank),
+        )
+
+        self._lora_request = None  # set by load_lora_on_generator()
+
+    def format_chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        add_generation_prompt: bool = True,
+        enable_thinking: bool = True,
+    ) -> str:
+        try:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+
+    def generate(
+        self,
+        prompt_or_messages: str | List[Dict[str, str]],
+        gen_cfg: GenerationConfig,
+        seed: Optional[int] = None,
+        *,
+        use_chat_template: bool = False,
+        enable_thinking: bool = True,
+    ) -> str:
+        from vllm import SamplingParams
+
+        if use_chat_template:
+            assert isinstance(prompt_or_messages, list)
+            prompt = self.format_chat(
+                prompt_or_messages,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        else:
+            assert isinstance(prompt_or_messages, str)
+            prompt = prompt_or_messages
+
+        # vLLM: max_tokens == your max_new_tokens
+        sp = SamplingParams(
+            temperature=float(gen_cfg.temperature),
+            top_p=float(gen_cfg.top_p),
+            top_k=int(gen_cfg.top_k) if gen_cfg.top_k is not None else -1,
+            max_tokens=int(gen_cfg.max_new_tokens),
+            seed=seed,
+        )
+
+        outs = self.llm.generate([prompt], sp, lora_request=self._lora_request)
+        # vLLM returns RequestOutput objects; generated text is output.outputs[0].text
+        return outs[0].outputs[0].text
+
+class HFTextGenerator:
+    """
+    Thin wrapper around transformers generation for reproducible calls.
+    """
+    def __init__(self, model_id: str, device_map: str = "auto", torch_dtype: str | None = None):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch
+        self.model_id = model_id
+
+        dtype = None
+        if torch_dtype:
+            dtype = getattr(torch, torch_dtype)
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            device_map=device_map,
+            torch_dtype=dtype,
+        )
+        self.model.eval()
+
+    def format_chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        add_generation_prompt: bool = True,
+        enable_thinking: bool = True,
+    ) -> str:
+        # Qwen3 supports enable_thinking in apply_chat_template; fall back if tokenizer doesn't accept it.
+        try:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+
+    def generate(
+        self,
+        prompt_or_messages: str | List[Dict[str, str]],
+        gen_cfg: GenerationConfig,
+        seed: Optional[int] = None,
+        *,
+        use_chat_template: bool = False,
+        enable_thinking: bool = True,
+    ) -> str:
+        import torch
+
+        if seed is not None:
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+
+        if use_chat_template:
+            assert isinstance(prompt_or_messages, list)
+            text = self.format_chat(prompt_or_messages, add_generation_prompt=True, enable_thinking=enable_thinking)
+        else:
+            assert isinstance(prompt_or_messages, str)
+            text = prompt_or_messages
+
+        inputs = self.tokenizer(text, return_tensors="pt", padding=False)
+        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+
+        do_sample = gen_cfg.temperature is not None and gen_cfg.temperature > 1e-6
+        with torch.no_grad():
+            out = self.model.generate(
+                **inputs,
+                do_sample=do_sample,
+                temperature=float(gen_cfg.temperature) if do_sample else None,
+                top_p=float(gen_cfg.top_p) if do_sample else None,
+                top_k=int(gen_cfg.top_k) if (do_sample and gen_cfg.top_k is not None) else None,
+                max_new_tokens=int(gen_cfg.max_new_tokens),
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+
+        prompt_len = inputs["input_ids"].shape[1]
+        gen_ids = out[0][prompt_len:]
+        return self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+
+def load_lora_on_generator(base_generator: TextGenerator, adapter_dir: str) -> TextGenerator:
+    """
+    HF path: wraps with PeftModel
+    vLLM path: sets a LoRARequest that will be used on each generate() call
+    """
+    if isinstance(base_generator, HFTextGenerator):
+        from peft import PeftModel
+        base_generator.model = PeftModel.from_pretrained(base_generator.model, adapter_dir)
+        base_generator.model.eval()
+        return base_generator
+
+    if isinstance(base_generator, VLLMTextGenerator):
+        from vllm.lora.request import LoRARequest
+        # stable-ish ID (vLLM requires a globally unique int per adapter)
+        lora_int_id = abs(hash(adapter_dir)) % (2**31)
+        base_generator._lora_request = LoRARequest("codenames-lora", int(lora_int_id), adapter_dir)
+        return base_generator
+
+    raise TypeError(f"Unsupported generator type: {type(base_generator)}")
+
+
+def make_text_generator(model_id: str, cfg: Dict[str, Any]) -> TextGenerator:
+    backend = cfg.get("inference", {}).get("backend", "hf")
+    if backend == "vllm":
+        vcfg = cfg.get("inference", {}).get("vllm", {})
+        return VLLMTextGenerator(model_id, **vcfg)
+    return HFTextGenerator(model_id, device_map="auto")
+
+
+class Embedder:
+    """
+    Embeds single tokens/words/short strings with caching.
+    Uses sentence-transformers if available; otherwise uses a HF encoder with mean pooling.
+    """
+    def __init__(self, model_id: str, device: str = "cpu"):
+        self.model_id = model_id
+        self.device = device
+        self._cache: Dict[str, np.ndarray] = {}
+
+        self._mode = None
+        self._st_model = None
+        self._hf_tok = None
+        self._hf_model = None
+
+        # Prefer sentence-transformers if installed and model_id looks like one
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+            self._st_model = SentenceTransformer(model_id, device=device)
+            self._mode = "st"
+        except Exception:
+            self._mode = "hf"
+            from transformers import AutoModel, AutoTokenizer
+            import torch
+            self._hf_tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+            self._hf_model = AutoModel.from_pretrained(model_id)
+            self._hf_model.to(device)
+            self._hf_model.eval()
+
+    def embed(self, text: str) -> np.ndarray:
+        key = text.strip().lower()
+        if key in self._cache:
+            return self._cache[key]
+
+        if self._mode == "st":
+            vec = np.asarray(self._st_model.encode([text], normalize_embeddings=True)[0], dtype=np.float32)
+        else:
+            # HF encoder mean pooling
+            import torch
+            assert self._hf_tok is not None and self._hf_model is not None
+            with torch.no_grad():
+                toks = self._hf_tok([text], return_tensors="pt", padding=True, truncation=True).to(self.device)
+                out = self._hf_model(**toks)
+                last = out.last_hidden_state  # (B,T,H)
+                mask = toks["attention_mask"].unsqueeze(-1)  # (B,T,1)
+                pooled = (last * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+                vec = pooled[0].detach().cpu().numpy().astype(np.float32)
+                # normalize
+                n = np.linalg.norm(vec) + 1e-12
+                vec = vec / n
+
+        self._cache[key] = vec
+        return vec
+
+    @staticmethod
+    def cosine(a: np.ndarray, b: np.ndarray) -> float:
+        return float(np.dot(a, b) / ((np.linalg.norm(a) + 1e-12) * (np.linalg.norm(b) + 1e-12)))
+
+
+================================================
+FILE: src/rollout.py
+================================================
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+from .model_wrappers import Embedder, TextGenerator, GenerationConfig
+from .rules import is_valid_clue, normalize_word, score_turn
+from .spymaster_prompt import build_spymaster_messages
+from .guesser_prompt import build_guesser_messages
+
+
+_CLUE_RE = re.compile(r"CLUE\s*:\s*(.+)", re.IGNORECASE)
+_NUM_RE = re.compile(r"NUM\s*:\s*([0-9]+)", re.IGNORECASE)
+_GUESSES_RE = re.compile(r"GUESSES\s*:\s*(.+)", re.IGNORECASE)
+
+
+def parse_spymaster_output(text: str) -> Tuple[Optional[str], Optional[int]]:
+    clues = _CLUE_RE.findall(text)
+    nums = _NUM_RE.findall(text)
+    clue = clues[-1].strip().splitlines()[0].strip() if clues else None
+    num = int(nums[-1]) if nums else None
+
+    return clue, num
+
+
+def parse_guesser_output(text: str) -> List[str]:
+    ms = _GUESSES_RE.findall(text)
+    m = ms[-1] if ms else None
+    if not m:
+        # fallback: take first line
+        line = text.strip().splitlines()[0] if text.strip() else ""
+        raw = line
+    else:
+        raw = m
+
+    parts = [p.strip() for p in raw.replace("\n", " ").split(",")]
+    parts = [p for p in parts if p]
+    return parts
+
+
+def map_guesses_to_board(guesses: List[str], board_words: List[str]) -> List[str]:
+    """
+    Normalize and keep only guesses that match board words exactly after normalization.
+    Ensures uniqueness preserving order.
+    """
+    board_norm = {normalize_word(w): w for w in board_words}
+    out: List[str] = []
+    seen = set()
+    for g in guesses:
+        gn = normalize_word(g)
+        if gn in board_norm and gn not in seen:
+            out.append(gn)
+            seen.add(gn)
+    return out
+
+
+@dataclass
+class CandidateResult:
+    clue: str
+    num: int
+    valid: bool
+    rejection_reason: str
+    directness: float
+    reward: float
+    stats: Dict[str, Any]
+    guess_words: List[str]
+    raw_spymaster_text: str
+    raw_guesser_text: str
+
+
+def run_one_candidate(
+    board_record: Dict[str, Any],
+    spymaster: TextGenerator,
+    guesser: TextGenerator,
+    embedder: Embedder,
+    cfg: Dict[str, Any],
+    seed: Optional[int] = None,
+) -> CandidateResult:
+    board_words = board_record["board_words"]
+    labels = board_record["labels"]
+    revealed_mask = [False] * len(board_words)
+
+    target_words = [w for w, lab in zip(board_words, labels) if lab == "TEAM"]
+    labels_by_word = {normalize_word(w): lab for w, lab in zip(board_words, labels)}
+
+    sp_msgs = build_spymaster_messages(board_words, labels, revealed_mask, cfg)
+    sp_gen = GenerationConfig(
+        temperature=float(cfg["decoding"]["spymaster_temperature"]),
+        top_p=float(cfg["decoding"]["spymaster_top_p"]),
+        top_k=int(cfg["decoding"].get("spymaster_top_k", 20)),
+        max_new_tokens=int(cfg["decoding"]["spymaster_max_new_tokens"]),
+    )
+    use_chat = bool(cfg.get("qwen", {}).get("use_chat_template", False))
+    sp_think = bool(cfg.get("qwen", {}).get("enable_thinking_spymaster", True))
+    sp_text = spymaster.generate(sp_msgs, sp_gen, seed=seed, use_chat_template=use_chat, enable_thinking=sp_think)
+    clue, num = parse_spymaster_output(sp_text)
+
+    if clue is None or num is None:
+        return CandidateResult(
+            clue=clue or "",
+            num=num or 0,
+            valid=False,
+            rejection_reason="parse_fail",
+            directness=0.0,
+            reward=0.0,
+            stats={"n_team": 0, "n_opp": 0, "n_neu": 0, "assassin": 0},
+            guess_words=[],
+            raw_spymaster_text=sp_text,
+            raw_guesser_text="",
+        )
+
+    valid, reason, d = is_valid_clue(clue, board_words, target_words, embedder, cfg)
+    if not valid:
+        return CandidateResult(
+            clue=clue,
+            num=num,
+            valid=False,
+            rejection_reason=reason,
+            directness=d,
+            reward=0.0,
+            stats={"n_team": 0, "n_opp": 0, "n_neu": 0, "assassin": 0},
+            guess_words=[],
+            raw_spymaster_text=sp_text,
+            raw_guesser_text="",
+        )
+
+    # Run guesser
+    g_msgs = build_guesser_messages(board_words, revealed_mask, clue, num, cfg)
+    g_gen = GenerationConfig(
+        temperature=float(cfg["decoding"]["guesser_temperature"]),
+        top_p=float(cfg["decoding"]["guesser_top_p"]),
+        top_k=int(cfg["decoding"].get("guesser_top_k", 20)),
+        max_new_tokens=int(cfg["decoding"]["guesser_max_new_tokens"]),
+    )
+    g_think = bool(cfg.get("qwen", {}).get("enable_thinking_guesser", True))
+    g_text = guesser.generate(g_msgs, g_gen, seed=seed, use_chat_template=use_chat, enable_thinking=g_think)
+    guesses_raw = parse_guesser_output(g_text)
+    guesses = map_guesses_to_board(guesses_raw, board_words)
+
+    # Score using top-K where K = num (clamped)
+    k = max(0, min(int(num), len(guesses)))
+    scored = guesses[:k]
+    reward, stats = score_turn(scored, labels_by_word, cfg)
+
+    return CandidateResult(
+        clue=clue,
+        num=int(num),
+        valid=True,
+        rejection_reason="ok",
+        directness=float(d),
+        reward=float(reward),
+        stats=stats,
+        guess_words=scored,
+        raw_spymaster_text=sp_text,
+        raw_guesser_text=g_text,
+    )
+
+
+def run_turn(
+    board_record: Dict[str, Any],
+    spymaster: TextGenerator,
+    guesser: TextGenerator,
+    embedder: Embedder,
+    cfg: Dict[str, Any],
+    n_candidates: int = 1,
+    seed: Optional[int] = None,
+) -> Tuple[List[CandidateResult], Dict[str, Any]]:
+    """
+    Samples up to n_candidates *with validity-enforced resampling*.
+    Returns candidates and metadata including rejected counts.
+    """
+    max_resamples = int(cfg["decoding"]["max_resamples"])
+    candidates: List[CandidateResult] = []
+    rejection_counts: Dict[str, int] = {}
+    total_rejected = 0
+
+    # We produce n_candidates valid candidates (or exhaust resamples)
+    for ci in range(n_candidates):
+        got = None
+        for ri in range(max_resamples):
+            # deterministic-ish seed derivation
+            s = None if seed is None else (seed + ci * 1000 + ri)
+            res = run_one_candidate(board_record, spymaster, guesser, embedder, cfg, seed=s)
+
+            if res.valid:
+                got = res
+                break
+            total_rejected += 1
+            rejection_counts[res.rejection_reason] = rejection_counts.get(res.rejection_reason, 0) + 1
+
+        if got is None:
+            # record the last invalid result if we never got a valid one
+            got = res
+        candidates.append(got)
+
+    meta = {
+        "rejected_total": total_rejected,
+        "rejection_counts": rejection_counts,
+    }
+    return candidates, meta
+
+
+def select_best_candidate(candidates: List[CandidateResult]) -> CandidateResult:
+    # Primary: reward, Secondary: lower directness (more indirect) if tie
+    best = candidates[0]
+    for c in candidates[1:]:
+        if c.reward > best.reward:
+            best = c
+        elif c.reward == best.reward and c.directness < best.directness:
+            best = c
+    return best
+
+
+
+================================================
+FILE: src/rules.py
+================================================
+from __future__ import annotations
+
+import re
+from typing import Dict, List, Tuple, Any, Optional
+
+from .model_wrappers import Embedder
+
+
+_WORD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+
+
+def normalize_word(s: str) -> str:
+    return s.strip().lower()
+
+
+def is_single_word(s: str) -> bool:
+    s = s.strip()
+    if not s:
+        return False
+    # “single word” in the practical sense: no whitespace
+    return len(s.split()) == 1
+
+
+def violates_board_overlap(clue: str, board_words: List[str]) -> bool:
+    c = normalize_word(clue)
+    bw = {normalize_word(w) for w in board_words}
+    return c in bw
+
+
+def violates_substring_ban(clue: str, board_words: List[str]) -> bool:
+    c = normalize_word(clue)
+    for w in board_words:
+        ww = normalize_word(w)
+        if not c or not ww:
+            continue
+        if c in ww or ww in c:
+            return True
+    return False
+
+
+def looks_like_word_token(clue: str) -> bool:
+    # avoid punctuation / multi-token-ish outputs
+    c = clue.strip()
+    return bool(_WORD_RE.match(c))
+
+
+def directness_score(clue: str, target_words: List[str], embedder: Embedder) -> float:
+    cvec = embedder.embed(clue)
+    sims = []
+    for t in target_words:
+        tvec = embedder.embed(t)
+        sims.append(Embedder.cosine(cvec, tvec))
+    return float(max(sims) if sims else 0.0)
+
+
+def is_valid_clue(
+    clue: str,
+    board_words: List[str],
+    target_words: List[str],
+    embedder: Embedder,
+    cfg: Dict[str, Any],
+) -> Tuple[bool, str, float]:
+    cons = cfg["constraints"]
+    clue = clue.strip()
+
+    if cons.get("single_word_only", True) and not is_single_word(clue):
+        return False, "not_single_word", 0.0
+
+    if not looks_like_word_token(clue):
+        return False, "bad_token_shape", 0.0
+
+    if cons.get("ban_board_words", True) and violates_board_overlap(clue, board_words):
+        return False, "board_word", 0.0
+
+    if cons.get("ban_substrings", True) and violates_substring_ban(clue, board_words):
+        return False, "substring", 0.0
+
+    d = directness_score(clue, target_words, embedder)
+    if d >= float(cons["tau_direct"]):
+        return False, "too_direct", float(d)
+
+    return True, "ok", float(d)
+
+
+def score_turn(
+    guesses: List[str],
+    labels_by_word: Dict[str, str],
+    cfg: Dict[str, Any],
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    guesses: normalized board words guessed in order (unique)
+    labels_by_word: normalized_word -> label
+    """
+    r = cfg["reward"]
+    stats = {"n_team": 0, "n_opp": 0, "n_neu": 0, "assassin": 0}
+
+    reward = 0.0
+    for g in guesses:
+        lab = labels_by_word.get(g)
+        if lab is None:
+            continue
+        if lab == "TEAM":
+            reward += float(r["team_correct"])
+            stats["n_team"] += 1
+        elif lab == "OPP":
+            reward += float(r["opp_wrong"])
+            stats["n_opp"] += 1
+        elif lab == "NEU":
+            reward += float(r["neu_wrong"])
+            stats["n_neu"] += 1
+        elif lab == "ASSASSIN":
+            reward += float(r["assassin_wrong"])
+            stats["assassin"] += 1
+
+    # optional shaping (off by default)
+    reward += float(r.get("repeat_penalty", 0.0)) * 0.0
+    reward += float(r.get("brevity_bonus", 0.0)) * 0.0
+
+    return float(reward), stats
+
+
+================================================
+FILE: src/spymaster_prompt.py
+================================================
+from __future__ import annotations
+
+from typing import Dict, List, Any
+
+
+def build_spymaster_messages(
+    board_words: List[str],
+    labels: List[str],
+    revealed_mask: List[bool],
+    cfg: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    system = cfg.get("qwen", {}).get("system_spymaster", "You are the Spymaster in a Codenames-like game.")
+
+    words_lines = []
+    for i, w in enumerate(board_words):
+        tag = "REVEALED" if revealed_mask[i] else "HIDDEN"
+        words_lines.append(f"{i+1:02d}. {w} [{tag}]")
+
+    team_words = [w for w, lab, rev in zip(board_words, labels, revealed_mask) if (lab == "TEAM" and not rev)]
+    opp_words = [w for w, lab, rev in zip(board_words, labels, revealed_mask) if (lab == "OPP" and not rev)]
+    neu_words = [w for w, lab, rev in zip(board_words, labels, revealed_mask) if (lab == "NEU" and not rev)]
+    ass_words = [w for w, lab, rev in zip(board_words, labels, revealed_mask) if (lab == "ASSASSIN" and not rev)]
+
+    tau = cfg["constraints"]["tau_direct"]
+
+    user = f"""BOARD WORDS (25):
+
+BOARD WORDS (25):
+{chr(10).join(words_lines)}
+
+YOUR TARGETS (TEAM) — choose a clue that points to some of these:
+{", ".join(team_words)}
+
+DANGEROUS / FORBIDDEN (avoid leading the guesser to these):
+OPP: {", ".join(opp_words)}
+NEU: {", ".join(neu_words)}
+ASSASSIN: {", ".join(ass_words)}
+
+CONSTRAINTS:
+- Output exactly ONE clue word (single token-like word).
+- The clue must NOT be any board word.
+- Avoid direct semantic neighbors of TEAM words: the clue will be rejected if too similar (similarity >= {tau}).
+- Avoid substrings of board words and vice versa.
+
+GOAL:
+Produce an indirect but helpful clue that helps a frozen Guesser pick TEAM words while avoiding OPP/NEU/ASSASSIN.
+
+OUTPUT FORMAT (exactly):
+<think>
+...
+</think>
+CLUE: <one_word>
+NUM: <integer>
+
+Now produce your clue.
+"""
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+================================================
+FILE: src/train_lora_sft.py
+================================================
+from __future__ import annotations
+
+import argparse
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+import torch
+from torch.utils.data import Dataset
+
+from .utils import load_yaml, read_jsonl, ensure_dir, save_config_snapshot, save_run_meta, set_global_seed
+
+class SFTDataset(Dataset):
+    def __init__(self, records: List[Dict[str, Any]], tokenizer, max_len: int):
+        self.records = records
+        self.tok = tokenizer
+        self.max_len = max_len
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        r = self.records[idx]
+        prompt = r["prompt"]
+        completion = r["completion"]
+
+        # Tokenize prompt and completion separately so we can mask prompt loss.
+        p = self.tok(prompt, add_special_tokens=False)
+        c = self.tok(completion, add_special_tokens=False)
+
+        input_ids = p["input_ids"] + c["input_ids"] + [self.tok.eos_token_id]
+        # labels: -100 for prompt tokens, normal ids for completion + eos
+        labels = [-100] * len(p["input_ids"]) + c["input_ids"] + [self.tok.eos_token_id]
+
+        input_ids = input_ids[: self.max_len]
+        labels = labels[: self.max_len]
+
+        attn = [1] * len(input_ids)
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "attention_mask": torch.tensor(attn, dtype=torch.long),
+        }
+
+
+@dataclass
+class PadCollator:
+    tokenizer: Any
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # left-pad vs right-pad: use tokenizer padding side; default right-pad
+        input_ids = [b["input_ids"] for b in batch]
+        labels = [b["labels"] for b in batch]
+        attn = [b["attention_mask"] for b in batch]
+
+        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
+        attn = torch.nn.utils.rnn.pad_sequence(attn, batch_first=True, padding_value=0)
+
+        return {"input_ids": input_ids, "labels": labels, "attention_mask": attn}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    args = ap.parse_args()
+
+    cfg = load_yaml(args.config)
+    tcfg = cfg["training"]
+
+    set_global_seed(int(tcfg.get("seed", 0)))
+
+    # Load data
+    records = read_jsonl(cfg["paths"]["sft_turns_path"])
+    if not records:
+        raise RuntimeError("No SFT records found. Did generate_sft_data produce an empty filtered set?")
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
+    from peft import LoraConfig, get_peft_model
+
+    model_id = cfg["models"]["spymaster_model_id"]
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # dtype
+    torch_dtype = None
+    if bool(tcfg.get("bf16", False)) and torch.cuda.is_available():
+        torch_dtype = torch.bfloat16
+    elif bool(tcfg.get("fp16", False)) and torch.cuda.is_available():
+        torch_dtype = torch.float16
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch_dtype,
+    )
+
+    lora_cfg = LoraConfig(
+        r=int(tcfg["r"]),
+        lora_alpha=int(tcfg["alpha"]),
+        lora_dropout=float(tcfg["dropout"]),
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=tcfg.get("target_modules", None),
+    )
+    model = get_peft_model(model, lora_cfg)
+
+    max_len = int(tcfg["max_seq_len"])
+    ds = SFTDataset(records, tokenizer, max_len=max_len)
+    collator = PadCollator(tokenizer)
+
+    out_dir = ensure_dir(tcfg["output_adapter_dir"])
+
+    args_tr = TrainingArguments(
+        output_dir=str(out_dir),
+        per_device_train_batch_size=int(tcfg["batch_size"]),
+        gradient_accumulation_steps=int(tcfg["grad_accum"]),
+        num_train_epochs=float(tcfg["epochs"]),
+        learning_rate=float(tcfg["lr"]),
+        logging_steps=20,
+        save_steps=200,
+        save_total_limit=2,
+        report_to=[],
+        bf16=bool(tcfg.get("bf16", False)),
+        fp16=bool(tcfg.get("fp16", False)),
+        optim="adamw_torch",
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.03,
+        ddp_find_unused_parameters=False,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=args_tr,
+        train_dataset=ds,
+        data_collator=collator,
+        tokenizer=tokenizer,
+    )
+
+    trainer.train(resume_from_checkpoint=True)
+
+    # Save adapter
+    if trainer.is_world_process_zero():
+        m = trainer.model
+        if hasattr(m, "module"):  # DDP wrap
+            m = m.module
+        m.save_pretrained(str(out_dir))
+        tokenizer.save_pretrained(str(out_dir))
+
+    # Save config + run meta
+    if trainer.is_world_process_zero():
+        save_config_snapshot(cfg, out_dir)
+        save_run_meta(out_dir, command=["python", "-m", "src.train_lora_sft", "--config", args.config])
+
+    print(f"Saved LoRA adapter -> {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================
+FILE: src/utils.py
+================================================
+import json
+import os
+import random
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+import numpy as np
+import yaml
+
+
+def load_yaml(path: str | Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def ensure_dir(path: str | Path) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def read_jsonl(path: str | Path) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    return records
+
+
+def write_jsonl(path: str | Path, records: Iterable[Dict[str, Any]]) -> None:
+    path = Path(path)
+    ensure_dir(path.parent)
+    with open(path, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def set_global_seed(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
+
+
+def now_ts() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def try_get_git_hash() -> Optional[str]:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL)
+        return out.decode("utf-8").strip()
+    except Exception:
+        return None
+
+
+def save_config_snapshot(cfg: Dict[str, Any], out_dir: str | Path, filename: str = "config_snapshot.yaml") -> None:
+    out_dir = ensure_dir(out_dir)
+    p = out_dir / filename
+    with open(p, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+
+
+def save_run_meta(out_dir: str | Path, command: List[str] | None = None, extra: Dict[str, Any] | None = None) -> None:
+    out_dir = ensure_dir(out_dir)
+    meta: Dict[str, Any] = {
+        "timestamp": now_ts(),
+        "git_hash": try_get_git_hash(),
+        "command": command,
+    }
+    if extra:
+        meta.update(extra)
+    with open(out_dir / "run_meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+

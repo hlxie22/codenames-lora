@@ -1,3 +1,29 @@
+vocab:
+  lang: "en"
+  stop_n: 300
+  min_zipf: 3.0
+  max_zipf: 6.0
+  min_len: 3
+  max_len: 12
+  max_words: 30000
+  token_regex: "^[a-z]+$"
+  extra_banlist: null
+  manifest_path: "data/vocab_manifest.json"
+
+inference:
+  backend: "vllm"   # "hf" or "vllm"
+
+  vllm:
+    tensor_parallel_size: 2
+    gpu_memory_utilization: 0.90
+    max_model_len: 4096
+    dtype: "bfloat16"   # "auto" | "float16" | "bfloat16"
+    trust_remote_code: true
+
+    # If you want to run eval with your LoRA adapter in vLLM:
+    enable_lora: true
+    max_lora_rank: 64
+
 paths:
   data_dir: "data"
   outputs_dir: "outputs"
@@ -37,13 +63,12 @@ decoding:
   spymaster_temperature: 0.6
   spymaster_top_p: 0.95
   spymaster_top_k: 20
-  spymaster_max_new_tokens: 256
-  spymaster_max_new_tokens: 4096
+  spymaster_max_new_tokens: 2048
 
   guesser_temperature: 0.6
   guesser_top_p: 0.95
   guesser_top_k: 20
-  guesser_max_new_tokens: 4096
+  guesser_max_new_tokens: 2048
 
   n_candidates: 8
   max_resamples: 8

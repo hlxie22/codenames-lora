@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable, Union
 
 import numpy as np
 
@@ -13,6 +13,126 @@ class GenerationConfig:
     top_k: int | None = None
     max_new_tokens: int
 
+@runtime_checkable
+class TextGenerator(Protocol):
+    model_id: str
+
+    def format_chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        add_generation_prompt: bool = True,
+        enable_thinking: bool = True,
+    ) -> str: ...
+
+    def generate(
+        self,
+        prompt_or_messages: str | List[Dict[str, str]],
+        gen_cfg: GenerationConfig,
+        seed: Optional[int] = None,
+        *,
+        use_chat_template: bool = False,
+        enable_thinking: bool = True,
+    ) -> str: ...
+
+class VLLMTextGenerator:
+    """
+    Thin wrapper around vLLM offline inference.
+    """
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.90,
+        max_model_len: int | None = None,
+        dtype: str = "auto",
+        trust_remote_code: bool = True,
+        enable_lora: bool = False,
+        max_lora_rank: int = 64,
+    ):
+        from transformers import AutoTokenizer
+        from vllm import LLM
+
+        self.model_id = model_id
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            use_fast=True,
+            trust_remote_code=trust_remote_code,
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # vLLM engine (offline)
+        self.llm = LLM(
+            model=model_id,
+            tokenizer=model_id,
+            tensor_parallel_size=int(tensor_parallel_size),
+            gpu_memory_utilization=float(gpu_memory_utilization),
+            max_model_len=max_model_len,
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            enable_lora=bool(enable_lora),
+            max_lora_rank=int(max_lora_rank),
+        )
+
+        self._lora_request = None  # set by load_lora_on_generator()
+
+    def format_chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        add_generation_prompt: bool = True,
+        enable_thinking: bool = True,
+    ) -> str:
+        try:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+
+    def generate(
+        self,
+        prompt_or_messages: str | List[Dict[str, str]],
+        gen_cfg: GenerationConfig,
+        seed: Optional[int] = None,
+        *,
+        use_chat_template: bool = False,
+        enable_thinking: bool = True,
+    ) -> str:
+        from vllm import SamplingParams
+
+        if use_chat_template:
+            assert isinstance(prompt_or_messages, list)
+            prompt = self.format_chat(
+                prompt_or_messages,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        else:
+            assert isinstance(prompt_or_messages, str)
+            prompt = prompt_or_messages
+
+        # vLLM: max_tokens == your max_new_tokens
+        sp = SamplingParams(
+            temperature=float(gen_cfg.temperature),
+            top_p=float(gen_cfg.top_p),
+            top_k=int(gen_cfg.top_k) if gen_cfg.top_k is not None else -1,
+            max_tokens=int(gen_cfg.max_new_tokens),
+            seed=seed,
+        )
+
+        outs = self.llm.generate([prompt], sp, lora_request=self._lora_request)
+        # vLLM returns RequestOutput objects; generated text is output.outputs[0].text
+        return outs[0].outputs[0].text
 
 class HFTextGenerator:
     """
@@ -103,14 +223,33 @@ class HFTextGenerator:
         return self.tokenizer.decode(gen_ids, skip_special_tokens=True)
 
 
-def load_lora_on_generator(base_generator: HFTextGenerator, adapter_dir: str) -> HFTextGenerator:
+def load_lora_on_generator(base_generator: TextGenerator, adapter_dir: str) -> TextGenerator:
     """
-    Mutates base_generator.model to a PeftModel-wrapped model for inference.
+    HF path: wraps with PeftModel
+    vLLM path: sets a LoRARequest that will be used on each generate() call
     """
-    from peft import PeftModel
-    base_generator.model = PeftModel.from_pretrained(base_generator.model, adapter_dir)
-    base_generator.model.eval()
-    return base_generator
+    if isinstance(base_generator, HFTextGenerator):
+        from peft import PeftModel
+        base_generator.model = PeftModel.from_pretrained(base_generator.model, adapter_dir)
+        base_generator.model.eval()
+        return base_generator
+
+    if isinstance(base_generator, VLLMTextGenerator):
+        from vllm.lora.request import LoRARequest
+        # stable-ish ID (vLLM requires a globally unique int per adapter)
+        lora_int_id = abs(hash(adapter_dir)) % (2**31)
+        base_generator._lora_request = LoRARequest("codenames-lora", int(lora_int_id), adapter_dir)
+        return base_generator
+
+    raise TypeError(f"Unsupported generator type: {type(base_generator)}")
+
+
+def make_text_generator(model_id: str, cfg: Dict[str, Any]) -> TextGenerator:
+    backend = cfg.get("inference", {}).get("backend", "hf")
+    if backend == "vllm":
+        vcfg = cfg.get("inference", {}).get("vllm", {})
+        return VLLMTextGenerator(model_id, **vcfg)
+    return HFTextGenerator(model_id, device_map="auto")
 
 
 class Embedder:

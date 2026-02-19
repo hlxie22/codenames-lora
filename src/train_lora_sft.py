@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
 import torch
 from torch.utils.data import Dataset
 
-from .utils import load_yaml, read_jsonl, ensure_dir, save_config_snapshot, save_run_meta, set_global_seed
+from transformers.trainer_utils import get_last_checkpoint
 
+from .utils import load_yaml, read_jsonl, ensure_dir, save_config_snapshot, save_run_meta, set_global_seed
 
 class SFTDataset(Dataset):
     def __init__(self, records: List[Dict[str, Any]], tokenizer, max_len: int):
@@ -93,7 +95,6 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        device_map="auto",
         torch_dtype=torch_dtype,
     )
 
@@ -128,6 +129,7 @@ def main():
         optim="adamw_torch",
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
+        ddp_find_unused_parameters=False,
     )
 
     trainer = Trainer(
@@ -138,15 +140,21 @@ def main():
         tokenizer=tokenizer,
     )
 
-    trainer.train()
+    last_ckpt = get_last_checkpoint(str(out_dir))
+    trainer.train(resume_from_checkpoint=last_ckpt)
 
     # Save adapter
-    model.save_pretrained(str(out_dir))
-    tokenizer.save_pretrained(str(out_dir))
+    if trainer.is_world_process_zero():
+        m = trainer.model
+        if hasattr(m, "module"):  # DDP wrap
+            m = m.module
+        m.save_pretrained(str(out_dir))
+        tokenizer.save_pretrained(str(out_dir))
 
     # Save config + run meta
-    save_config_snapshot(cfg, out_dir)
-    save_run_meta(out_dir, command=["python", "-m", "src.train_lora_sft", "--config", args.config])
+    if trainer.is_world_process_zero():
+        save_config_snapshot(cfg, out_dir)
+        save_run_meta(out_dir, command=["python", "-m", "src.train_lora_sft", "--config", args.config])
 
     print(f"Saved LoRA adapter -> {out_dir}")
 
