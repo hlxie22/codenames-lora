@@ -34,6 +34,7 @@ paths:
   sft_turns_raw_path: "data/sft_turns_raw.jsonl"
 
 boards:
+  sft_max_train_boards: 500
   n_train_boards: 2000
   n_eval_boards: 400
   board_size: 25

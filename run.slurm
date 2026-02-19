@@ -11,7 +11,7 @@ set -euo pipefail
 
 mkdir -p logs
 
-module load miniforge/24.3.0-0
+module load miniforge/25.11.0-0
 
 # --- Activate conda ---
 source /orcd/software/core/001/pkg/miniforge/24.3.0-0/etc/profile.d/conda.sh
@@ -29,9 +29,9 @@ mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE"
 # --- Run experiment ---
 
 set -e
-python -m src.build_vocab --out data/vocab.txt --manifest data/vocab_manifest.json
-# python -m src.make_boards --config configs/default.yaml
-# python -m src.generate_sft_data --config configs/default.yaml
-# torchrun --standalone --nproc_per_node=2 -m src.train_lora_sft --config configs/default.yaml
-# python -m src.eval --config configs/default.yaml --mode baseline --out outputs/eval/baseline_run1
-# python -m src.eval --config configs/default.yaml --mode sft --out outputs/eval/sft_run1
+# python -m src.build_vocab --out data/vocab.txt --manifest data/vocab_manifest.json
+# python -m src.make_boards --config configs/default.yml
+python -m src.generate_sft_data --config configs/default.yml
+# torchrun --standalone --nproc_per_node=2 -m src.train_lora_sft --config configs/default.yml
+# python -m src.eval --config configs/default.yml --mode baseline --out outputs/eval/baseline_run1
+# python -m src.eval --config configs/default.yml --mode sft --out outputs/eval/sft_run1

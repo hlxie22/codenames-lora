@@ -2,7 +2,7 @@ Directory structure:
 └── codenames-lora/
     ├── .gitingestignore
     ├── configs/
-    │   ├── default.yaml
+    │   ├── default.yml
     │   └── environment.yml
     └── src/
         ├── __init__.py
@@ -26,8 +26,20 @@ FILE: .gitingestignore
 
 
 ================================================
-FILE: configs/default.yaml
+FILE: configs/default.yml
 ================================================
+vocab:
+  lang: "en"
+  stop_n: 300
+  min_zipf: 3.0
+  max_zipf: 6.0
+  min_len: 3
+  max_len: 12
+  max_words: 30000
+  token_regex: "^[a-z]+$"
+  extra_banlist: null
+  manifest_path: "data/vocab_manifest.json"
+
 inference:
   backend: "vllm"   # "hf" or "vllm"
 
@@ -52,6 +64,7 @@ paths:
   sft_turns_raw_path: "data/sft_turns_raw.jsonl"
 
 boards:
+  sft_max_train_boards: 500
   n_train_boards: 2000
   n_eval_boards: 400
   board_size: 25
@@ -133,13 +146,15 @@ FILE: configs/environment.yml
 ================================================
 name: codenames-lora
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
 
 dependencies:
   - python=3.10
   - pip
+  - git
+  - git-lfs
+  - setuptools
+  - wheel
 
   # core utilities
   - numpy>=1.26
@@ -148,38 +163,37 @@ dependencies:
   - regex
   - scipy
   - pandas
-  - sentencepiece
-  - protobuf
   - psutil
 
-  # PyTorch (GPU build). For CPU-only, remove pytorch-cuda and use pytorch-cpu (see note below).
-  - pytorch>=2.3
-  - torchvision
-  - torchaudio
-  - pytorch-cuda=12.1
-
-  # optional but handy if you ever git-clone HF models
-  - git
-  - git-lfs
+  # keep these on conda to avoid pip/conda duplication
+  - sentencepiece
+  - protobuf
 
   - pip:
-      - vllm>=0.6.4
-      
+      # PyTorch CUDA wheels (keep as EXTRA index so PyPI still works)
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.7.0
+      - torchvision==0.22.0
+      - torchaudio==2.7.0
+
+      # vLLM: pin to avoid pip grabbing latest (and trying to build from source)
+      - vllm==0.9.2
+
       # HF stack
-      - transformers>=4.45.0
+      - transformers==4.53.3
       - accelerate>=0.34.0
       - peft>=0.12.0
       - huggingface-hub>=0.25.0
       - safetensors>=0.4.3
       - tokenizers>=0.19.1
 
-      # embeddings (your Embedder will fall back to HF encoder if this isn't usable)
+      # embeddings
       - sentence-transformers>=3.0.0
 
       # vocab builder
       - wordfreq>=3.1.0
 
-      # tokenizer backend often used by newer Llama-family tokenizers
+      # tokenizer backend
       - tiktoken>=0.7.0
 
 
@@ -219,6 +233,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import yaml
 from pathlib import Path
 from typing import Iterable, List, Set, Tuple
 
@@ -267,6 +282,7 @@ def build_vocab(
     max_len: int,
     token_regex: str,
     extra_ban: Set[str],
+    max_words: int | None = None,
 ) -> Tuple[List[str], dict]:
     token_re = re.compile(token_regex)
 
@@ -318,9 +334,16 @@ def build_vocab(
 
     # deterministic ordering: more frequent first, then alpha
     kept.sort(key=lambda t: (-t[1], t[0]))
-    vocab = [w for (w, _) in kept]
 
+    n_pre_cap = len(kept)
+    if max_words is not None:
+        if int(max_words) <= 0:
+            raise ValueError(f"max_words must be > 0 (got {max_words})")
+        kept = kept[: int(max_words)]
+
+    vocab = [w for (w, _) in kept]
     zs = [z for (_, z) in kept]
+
     manifest = {
         "lang": lang,
         "stop_n": stop_n,
@@ -329,9 +352,12 @@ def build_vocab(
         "min_len": min_len,
         "max_len": max_len,
         "token_regex": token_regex,
+        "max_words": int(max_words) if max_words is not None else None,
         "counts": {
             "total_seen": n_total,
+            "kept_pre_cap": n_pre_cap,
             "kept": len(vocab),
+            "capped": max(0, n_pre_cap - len(vocab)),
             "filtered_stopwords": n_stop,
             "filtered_banned": n_banned,
             "filtered_badshape": n_badshape,
@@ -380,50 +406,101 @@ def write_manifest(path: str, manifest: dict) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
+def load_yaml(path: str | Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="data/vocab.txt", help="Output vocab path")
-    ap.add_argument("--manifest", default=None, help="Optional JSON manifest path")
+    # Internal defaults (used if neither CLI nor config provide values)
+    OUT_DEFAULT = "data/vocab.txt"
+    LANG_DEFAULT = "en"
+    STOP_N_DEFAULT = 300
+    MIN_ZIPF_DEFAULT = 3.0
+    MAX_ZIPF_DEFAULT = 6.0
+    MIN_LEN_DEFAULT = 3
+    MAX_LEN_DEFAULT = 12
+    TOKEN_REGEX_DEFAULT = r"^[a-z]+$"
 
-    ap.add_argument("--lang", default="en", help="Language code for wordfreq")
-    ap.add_argument("--stop-n", type=int, default=300, help="Remove top-N most frequent words as stopwords")
-    ap.add_argument("--min-zipf", type=float, default=3.0, help="Minimum Zipf frequency to keep")
-    ap.add_argument("--max-zipf", type=float, default=6.0, help="Maximum Zipf frequency to keep (drops ultra-common)")
-    ap.add_argument("--min-len", type=int, default=3, help="Minimum token length")
-    ap.add_argument("--max-len", type=int, default=12, help="Maximum token length")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=None, help="Optional YAML config path (e.g., configs/default.yaml)")
+
+    # If provided, CLI overrides config; if omitted, config (then defaults) are used.
+    ap.add_argument("--out", default=None, help="Output vocab path (overrides config paths.vocab_path)")
+    ap.add_argument("--manifest", default=None, help="Optional JSON manifest path (overrides config vocab.manifest_path)")
+
+    ap.add_argument("--lang", default=None, help="Language code for wordfreq (overrides config vocab.lang)")
+    ap.add_argument("--stop-n", type=int, default=None, help="Remove top-N most frequent words as stopwords")
+    ap.add_argument("--min-zipf", type=float, default=None, help="Minimum Zipf frequency to keep")
+    ap.add_argument("--max-zipf", type=float, default=None, help="Maximum Zipf frequency to keep (drops ultra-common)")
+    ap.add_argument("--min-len", type=int, default=None, help="Minimum token length")
+    ap.add_argument("--max-len", type=int, default=None, help="Maximum token length")
+    ap.add_argument(
+        "--max-words",
+        type=int,
+        default=None,
+        help="Optional cap on vocab size after filtering/sorting (top-N by Zipf). Overrides config vocab.max_words.",
+    )
     ap.add_argument(
         "--token-regex",
-        default=r"^[a-z]+$",
+        default=None,
         help="Regex a token must match (default keeps only lowercase alphabetic words).",
     )
     ap.add_argument(
         "--extra-banlist",
         default=None,
-        help="Optional path to a newline-separated banlist (lowercased). Lines starting with # are ignored.",
+        help="Optional path to a newline-separated banlist (overrides config vocab.extra_banlist).",
     )
 
     args = ap.parse_args()
 
-    extra_ban = load_extra_banlist(args.extra_banlist)
+    cfg = load_yaml(args.config) if args.config else {}
+    vcfg = cfg.get("vocab", {}) if isinstance(cfg, dict) else {}
+    pcfg = cfg.get("paths", {}) if isinstance(cfg, dict) else {}
 
-    vocab, manifest = build_vocab(
-        lang=args.lang,
-        stop_n=args.stop_n,
-        min_zipf=args.min_zipf,
-        max_zipf=args.max_zipf,
-        min_len=args.min_len,
-        max_len=args.max_len,
-        token_regex=args.token_regex,
-        extra_ban=extra_ban,
+    out_path = (
+        args.out
+        or pcfg.get("vocab_path")
+        or vcfg.get("out")
+        or OUT_DEFAULT
+    )
+    manifest_path = (
+        args.manifest
+        or vcfg.get("manifest_path")
+        or None
     )
 
-    write_vocab(args.out, vocab)
-    print(f"Wrote {len(vocab)} words -> {args.out}")
+    lang = args.lang or vcfg.get("lang") or LANG_DEFAULT
+    stop_n = args.stop_n if args.stop_n is not None else int(vcfg.get("stop_n", STOP_N_DEFAULT))
+    min_zipf = args.min_zipf if args.min_zipf is not None else float(vcfg.get("min_zipf", MIN_ZIPF_DEFAULT))
+    max_zipf = args.max_zipf if args.max_zipf is not None else float(vcfg.get("max_zipf", MAX_ZIPF_DEFAULT))
+    min_len = args.min_len if args.min_len is not None else int(vcfg.get("min_len", MIN_LEN_DEFAULT))
+    max_len = args.max_len if args.max_len is not None else int(vcfg.get("max_len", MAX_LEN_DEFAULT))
+    token_regex = args.token_regex or vcfg.get("token_regex") or TOKEN_REGEX_DEFAULT
+    max_words = args.max_words if args.max_words is not None else vcfg.get("max_words", None)
+    if max_words is not None:
+        max_words = int(max_words)
 
-    if args.manifest:
-        write_manifest(args.manifest, manifest)
-        print(f"Wrote manifest -> {args.manifest}")
+    extra_banlist_path = args.extra_banlist or vcfg.get("extra_banlist") or None
+    extra_ban = load_extra_banlist(extra_banlist_path)
+
+    vocab, manifest = build_vocab(
+        lang=lang,
+        stop_n=stop_n,
+        min_zipf=min_zipf,
+        max_zipf=max_zipf,
+        min_len=min_len,
+        max_len=max_len,
+        token_regex=token_regex,
+        extra_ban=extra_ban,
+        max_words=max_words,
+    )
+
+    write_vocab(out_path, vocab)
+    print(f"Wrote {len(vocab)} words -> {out_path}")
+
+    if manifest_path:
+        write_manifest(manifest_path, manifest)
+        print(f"Wrote manifest -> {manifest_path}")
     else:
         # quick console summary
         print(json.dumps(manifest["counts"], indent=2))
@@ -534,7 +611,72 @@ from .spymaster_prompt import build_spymaster_messages
 from .utils import load_yaml, read_jsonl, write_jsonl, ensure_dir, set_global_seed
 
 import re
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+def save_progress(
+    progress_path: str | Path,
+    *,
+    done: int,
+    total: int,
+    last_example_id: Optional[str] = None,
+    last_board_id: Optional[str] = None,
+    mean_reward: Optional[float] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    progress_path = Path(progress_path)
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload: Dict[str, Any] = {
+        "timestamp": now_iso(),
+        "done": int(done),
+        "total": int(total),
+        "pct": float(done / total) if total else 0.0,
+        "last_example_id": last_example_id,
+        "last_board_id": last_board_id,
+        "mean_reward_running": float(mean_reward) if mean_reward is not None else None,
+    }
+    if extra:
+        payload.update(extra)
+
+    tmp = progress_path.with_suffix(progress_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp, progress_path)  # atomic write
+
 _THINK_RE = re.compile(r"<think>\s*(.*?)\s*</think>", re.IGNORECASE | re.DOTALL)
+
+def load_done_example_ids(raw_path: str) -> set[str]:
+    """Return example_ids already present in an existing raw jsonl (for resume)."""
+    done = set()
+    if not raw_path or not os.path.exists(raw_path):
+        return done
+    with open(raw_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                eid = obj.get("example_id")
+                if eid:
+                    done.add(str(eid))
+            except Exception:
+                # if a partial/corrupt last line exists, ignore it
+                continue
+    return done
+
+def append_jsonl(path: str, obj: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 def extract_think_block(text: str) -> str:
     # Keep the model-produced think block if present; otherwise return "".
@@ -591,6 +733,11 @@ def main():
 
     boards = read_jsonl(cfg["paths"]["boards_train_path"])
 
+    maxb = cfg.get("boards", {}).get("sft_max_train_boards", None)
+    if maxb is not None:
+        boards = boards[: int(maxb)]
+        print(f"Using only first {len(boards)} train boards for SFT generation (boards.sft_max_train_boards={maxb}).")
+
     # Models
     spymaster = make_text_generator(cfg["models"]["spymaster_model_id"], cfg)
     guesser = make_text_generator(cfg["models"]["guesser_model_id"], cfg)
@@ -601,8 +748,22 @@ def main():
 
     n_candidates = int(cfg["decoding"]["n_candidates"])
 
-    raw_records: List[Dict[str, Any]] = []
+    raw_path = cfg["paths"].get("sft_turns_raw_path")  # we will append here during generation
+    done_ids = load_done_example_ids(raw_path) if raw_path else set()
+    if raw_path and done_ids:
+        print(f"Resuming: found {len(done_ids)} already-written examples in {raw_path}")
+
+    raw_path = cfg["paths"].get("sft_turns_raw_path")  
+    progress_path = Path(raw_path).with_suffix(".progress.json") if raw_path else None
+    progress_every = int(cfg.get("decoding", {}).get("progress_every", 50))
+
+    raw_records: List[Dict[str, Any]] = [] 
+
     for i, b in enumerate(boards):
+        example_id = f"turn_{i+1:06d}"
+        if raw_path and example_id in done_ids:
+            continue
+
         # seed per board for stability
         seed = int(b.get("seed", 0))
 
@@ -617,7 +778,6 @@ def main():
         )
         best = select_best_candidate(candidates)
 
-        # prompt must match exactly the spymaster prompt used in rollouts
         revealed = [False] * len(b["board_words"])
         msgs = build_spymaster_messages(b["board_words"], b["labels"], revealed, cfg)
 
@@ -632,15 +792,12 @@ def main():
         completion += f"CLUE: {best.clue}\nNUM: {best.num}\n"
 
         rec = {
-            "example_id": f"turn_{i+1:06d}",
+            "example_id": example_id,
             "board_id": b["board_id"],
             "prompt": prompt,
             "completion": completion,
             "reward": float(best.reward),
-            "stats": {
-                **best.stats,
-                "directness": float(best.directness),
-            },
+            "stats": {**best.stats, "directness": float(best.directness)},
             "clue_meta": {
                 "clue": best.clue,
                 "num": int(best.num),
@@ -648,26 +805,61 @@ def main():
                 "rejected_candidates": int(meta["rejected_total"]),
                 "rejection_counts": meta["rejection_counts"],
             },
-            "debug": {
-                "guess_words": best.guess_words,
-            },
+            "debug": {"guess_words": best.guess_words},
         }
+
+        # Write immediately (checkpoint)
+        if raw_path:
+            append_jsonl(raw_path, rec)
+            done_ids.add(example_id)
+
         raw_records.append(rec)
 
-        if (i + 1) % 50 == 0:
-            print(f"[{i+1}/{len(boards)}] mean_reward={np.mean([r['reward'] for r in raw_records]):.3f}")
+        append_jsonl(raw_path, rec)   # durable checkpoint
+        done_ids.add(example_id)      # update done set
+        raw_records.append(rec)      
 
-    # write raw
+        if progress_path and (len(done_ids) % progress_every == 0):
+            mean_r = float(np.mean([r["reward"] for r in raw_records])) if raw_records else None
+            save_progress(
+                progress_path,
+                done=len(done_ids),
+                total=len(boards),
+                last_example_id=rec["example_id"],
+                last_board_id=rec["board_id"],
+                mean_reward=mean_r,
+                extra={
+                    "n_candidates": int(n_candidates),
+                    "max_resamples": int(cfg["decoding"]["max_resamples"]),
+                },
+            )
+
+        if (len(done_ids) if raw_path else (i + 1)) % 50 == 0:
+            mean_r = float(np.mean([r["reward"] for r in raw_records])) if raw_records else 0.0
+            print(f"[done={len(done_ids) if raw_path else (i+1)}/{len(boards)}] mean_reward={mean_r:.3f}")
+
     raw_path = cfg["paths"].get("sft_turns_raw_path")
-    if raw_path:
-        write_jsonl(raw_path, raw_records)
-        print(f"Wrote raw SFT records -> {raw_path}")
 
-    # filter and write final
-    filtered = filter_examples(raw_records, cfg)
+    if raw_path and os.path.exists(raw_path):
+        raw_for_filter = read_jsonl(raw_path)
+    else:
+        raw_for_filter = raw_records
+
+    filtered = filter_examples(raw_for_filter, cfg)
     write_jsonl(cfg["paths"]["sft_turns_path"], filtered)
-    print(f"Filtered {len(filtered)}/{len(raw_records)} -> {cfg['paths']['sft_turns_path']}")
+    print(f"Filtered {len(filtered)}/{len(raw_for_filter)} -> {cfg['paths']['sft_turns_path']}")
 
+    if progress_path:
+        mean_r = float(np.mean([r["reward"] for r in raw_records])) if raw_records else None
+        save_progress(
+            progress_path,
+            done=len(done_ids),
+            total=len(boards),
+            last_example_id=None,
+            last_board_id=None,
+            mean_reward=mean_r,
+            extra={"status": "finished"},
+        )
 
 if __name__ == "__main__":
     main()
@@ -697,6 +889,9 @@ CLUE: {clue}
 NUM: {num}
 
 Return at least {num} guesses if possible.
+
+OUTPUT FORMAT (exactly):
+GUESSES: word1, word2, word3
 """
     return [
         {"role": "system", "content": system},
@@ -930,13 +1125,12 @@ from typing import Any, Dict, List, Optional, Protocol, runtime_checkable, Union
 
 import numpy as np
 
-
 @dataclass
 class GenerationConfig:
     temperature: float
     top_p: float
-    top_k: int | None = None
     max_new_tokens: int
+    top_k: int | None = None
 
 @runtime_checkable
 class TextGenerator(Protocol):
@@ -1656,6 +1850,8 @@ from typing import Any, Dict, List
 import torch
 from torch.utils.data import Dataset
 
+from transformers.trainer_utils import get_last_checkpoint
+
 from .utils import load_yaml, read_jsonl, ensure_dir, save_config_snapshot, save_run_meta, set_global_seed
 
 class SFTDataset(Dataset):
@@ -1786,7 +1982,8 @@ def main():
         tokenizer=tokenizer,
     )
 
-    trainer.train(resume_from_checkpoint=True)
+    last_ckpt = get_last_checkpoint(str(out_dir))
+    trainer.train(resume_from_checkpoint=last_ckpt)
 
     # Save adapter
     if trainer.is_world_process_zero():
@@ -1822,7 +2019,6 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import yaml
-
 
 def load_yaml(path: str | Path) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:

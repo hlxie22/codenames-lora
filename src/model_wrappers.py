@@ -5,13 +5,12 @@ from typing import Any, Dict, List, Optional, Protocol, runtime_checkable, Union
 
 import numpy as np
 
-
 @dataclass
 class GenerationConfig:
     temperature: float
     top_p: float
-    top_k: int | None = None
     max_new_tokens: int
+    top_k: int | None = None
 
 @runtime_checkable
 class TextGenerator(Protocol):
