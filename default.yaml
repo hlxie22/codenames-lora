@@ -1,0 +1,85 @@
+paths:
+  data_dir: "data"
+  outputs_dir: "outputs"
+  vocab_path: "data/vocab.txt"
+  boards_train_path: "data/boards_train.jsonl"
+  boards_eval_path: "data/boards_eval.jsonl"
+  sft_turns_path: "data/sft_turns.jsonl"
+  sft_turns_raw_path: "data/sft_turns_raw.jsonl"
+
+boards:
+  n_train_boards: 2000
+  n_eval_boards: 400
+  board_size: 25
+  n_team: 9
+  n_opp: 8
+  n_neu: 7
+  n_assassin: 1
+  seed_train: 123
+  seed_eval: 456
+  allow_duplicates: false
+  avoid_repeat_boards_within_split: true
+  avoid_repeat_boards_across_splits: true
+
+models:
+  spymaster_model_id: "Qwen/Qwen3-8B"
+  guesser_model_id: "Qwen/Qwen3-8B"
+  embedding_model_id: "sentence-transformers/all-MiniLM-L6-v2"
+
+qwen:
+  use_chat_template: true
+  enable_thinking_spymaster: true
+  enable_thinking_guesser: true
+  system_spymaster: "You are the Spymaster in a Codenames-like game."
+  system_guesser: "You are the Guesser in a Codenames-like game."
+
+decoding:
+  spymaster_temperature: 0.6
+  spymaster_top_p: 0.95
+  spymaster_top_k: 20
+  spymaster_max_new_tokens: 256
+  spymaster_max_new_tokens: 4096
+
+  guesser_temperature: 0.6
+  guesser_top_p: 0.95
+  guesser_top_k: 20
+  guesser_max_new_tokens: 4096
+
+  n_candidates: 8
+  max_resamples: 8
+
+constraints:
+  single_word_only: true
+  ban_board_words: true
+  ban_substrings: true
+  tau_direct: 0.52
+  directness_metric: "cosine"
+
+reward:
+  team_correct: 1.0
+  opp_wrong: -1.0
+  neu_wrong: -0.5
+  assassin_wrong: -3.0
+  repeat_penalty: 0.0
+  brevity_bonus: 0.0
+
+filtering:
+  mode: "rule_based"   # "top_percent" or "rule_based"
+  top_percent: 0.4
+  min_team_correct: 2
+  require_no_assassin: true
+
+training:
+  seed: 999
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  lr: 2.0e-4
+  epochs: 2
+  batch_size: 2
+  grad_accum: 8
+  max_seq_len: 4096
+  output_adapter_dir: "outputs/sft/lora_spymaster"
+  bf16: true
+  fp16: false
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]  # typical for Llama-like
