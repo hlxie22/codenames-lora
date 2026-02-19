@@ -1,12 +1,14 @@
 name: codenames-lora
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
 
 dependencies:
   - python=3.10
   - pip
+  - git
+  - git-lfs
+  - setuptools
+  - wheel
 
   # core utilities
   - numpy>=1.26
@@ -15,23 +17,22 @@ dependencies:
   - regex
   - scipy
   - pandas
-  - sentencepiece
-  - protobuf
   - psutil
 
-  # PyTorch (GPU build). For CPU-only, remove pytorch-cuda and use pytorch-cpu (see note below).
-  - pytorch>=2.3
-  - torchvision
-  - torchaudio
-  - pytorch-cuda=12.1
-
-  # optional but handy if you ever git-clone HF models
-  - git
-  - git-lfs
+  # keep these on conda to avoid pip/conda duplication
+  - sentencepiece
+  - protobuf
 
   - pip:
-      - vllm>=0.6.4
-      
+      # PyTorch CUDA wheels (keep as EXTRA index so PyPI still works)
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.7.0
+      - torchvision==0.22.0
+      - torchaudio==2.7.0
+
+      # vLLM: pin to avoid pip grabbing latest (and trying to build from source)
+      - vllm==0.9.2
+
       # HF stack
       - transformers>=4.45.0
       - accelerate>=0.34.0
@@ -40,11 +41,11 @@ dependencies:
       - safetensors>=0.4.3
       - tokenizers>=0.19.1
 
-      # embeddings (your Embedder will fall back to HF encoder if this isn't usable)
+      # embeddings
       - sentence-transformers>=3.0.0
 
       # vocab builder
       - wordfreq>=3.1.0
 
-      # tokenizer backend often used by newer Llama-family tokenizers
+      # tokenizer backend
       - tiktoken>=0.7.0
