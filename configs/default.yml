@@ -13,14 +13,16 @@ vocab:
 inference:
   backend: "vllm"   # "hf" or "vllm"
 
+  num_processes: 2
+  batch_size: 12
+
   vllm:
-    tensor_parallel_size: 2
+    tensor_parallel_size: 1
     gpu_memory_utilization: 0.90
     max_model_len: 4096
     dtype: "bfloat16"   # "auto" | "float16" | "bfloat16"
     trust_remote_code: true
 
-    # If you want to run eval with your LoRA adapter in vLLM:
     enable_lora: true
     max_lora_rank: 64
 
@@ -61,6 +63,8 @@ qwen:
   system_guesser: "You are the Guesser in a Codenames-like game."
 
 decoding:
+  progress_every: 100
+
   spymaster_temperature: 0.6
   spymaster_top_p: 0.95
   spymaster_top_k: 20
@@ -108,4 +112,4 @@ training:
   output_adapter_dir: "outputs/sft/lora_spymaster"
   bf16: true
   fp16: false
-  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]  # typical for Llama-like
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]

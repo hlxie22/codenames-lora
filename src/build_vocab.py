@@ -25,9 +25,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import yaml
 from pathlib import Path
 from typing import Iterable, List, Set, Tuple
+
+from .utils import load_yaml
 
 from wordfreq import iter_wordlist, top_n_list, zipf_frequency
 
@@ -197,10 +198,6 @@ def write_manifest(path: str, manifest: dict) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-def load_yaml(path: str | Path) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
 
 def main():
     # Internal defaults (used if neither CLI nor config provide values)

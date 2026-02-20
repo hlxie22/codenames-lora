@@ -133,6 +133,32 @@ class VLLMTextGenerator:
         # vLLM returns RequestOutput objects; generated text is output.outputs[0].text
         return outs[0].outputs[0].text
 
+    def generate_batch(
+        self,
+        prompts: List[str],
+        gen_cfg: GenerationConfig,
+        seeds: Optional[List[Optional[int]]] = None,
+    ) -> List[str]:
+        from vllm import SamplingParams
+
+        if seeds is None:
+            seeds = [None] * len(prompts)
+        assert len(seeds) == len(prompts)
+
+        sps = [
+            SamplingParams(
+                temperature=float(gen_cfg.temperature),
+                top_p=float(gen_cfg.top_p),
+                top_k=int(gen_cfg.top_k) if gen_cfg.top_k is not None else -1,
+                max_tokens=int(gen_cfg.max_new_tokens),
+                seed=sd,
+            )
+            for sd in seeds
+        ]
+
+        outs = self.llm.generate(prompts, sps, lora_request=self._lora_request)
+        return [o.outputs[0].text for o in outs]
+
 class HFTextGenerator:
     """
     Thin wrapper around transformers generation for reproducible calls.

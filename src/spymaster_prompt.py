@@ -23,8 +23,7 @@ def build_spymaster_messages(
 
     tau = cfg["constraints"]["tau_direct"]
 
-    user = f"""BOARD WORDS (25):
-
+    user = f"""
 BOARD WORDS (25):
 {chr(10).join(words_lines)}
 
