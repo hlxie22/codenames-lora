@@ -82,6 +82,7 @@ constraints:
   single_word_only: true
   ban_board_words: true
   ban_substrings: true
+  enable_directness_check: false
   tau_direct: 0.52
   directness_metric: "cosine"
 

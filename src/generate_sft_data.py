@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import numpy as np
 
@@ -13,7 +13,7 @@ from .mp_utils import launch_children, is_child_process, child_shard_info
 from .prompting import render_prompt
 from .rollout import run_turns_batched
 from .spymaster_prompt import build_spymaster_messages
-from .utils import load_yaml, read_jsonl, set_global_seed, write_jsonl, append_jsonl, save_progress
+from .utils import load_yaml, read_jsonl, set_global_seed, write_jsonl, save_progress
 
 
 # -------------------------
@@ -119,7 +119,6 @@ def main():
                     f"Usually you want tensor_parallel_size=1 when using multiple processes."
                 )
 
-        # mp_utils.launch_children(module, argv, num_procs)
         launch_children("src.generate_sft_data", ["--config", args.config], num_procs)
 
         base_raw_path = cfg.get("paths", {}).get("sft_turns_raw_path")
@@ -155,9 +154,12 @@ def main():
     spymaster = gen
     guesser = gen
 
-    # Embedder
-    device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
-    embedder = Embedder(cfg["models"]["embedding_model_id"], device=device)
+    # Embedder (OPTIONAL via constraints.enable_directness_check)
+    use_embed = bool(cfg.get("constraints", {}).get("enable_directness_check", True))
+    embedder = None
+    if use_embed:
+        device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+        embedder = Embedder(cfg["models"]["embedding_model_id"], device=device)
 
     n_candidates = int(cfg["decoding"]["n_candidates"])
     progress_every = int(cfg.get("decoding", {}).get("progress_every", 50))
@@ -177,75 +179,105 @@ def main():
 
     progress_path = raw_path.with_suffix(raw_path.suffix + ".progress.json")
 
-    raw_records: List[Dict[str, Any]] = []
+    # -------------------------
+    # Buffered writer (NO fsync-per-line)
+    # -------------------------
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    f_raw = open(raw_path, "a", encoding="utf-8")
+    writes_since_flush = 0
+    FLUSH_EVERY = 200  # tune to taste
 
-    for start in range(0, len(boards), max(1, batch_size)):
-        batch = boards[start : start + max(1, batch_size)]
+    # Track running reward without storing all records
+    running_sum = 0.0
+    running_n = 0
 
-        bests, metas = run_turns_batched(
-            batch,
-            spymaster,
-            guesser,
-            embedder,
-            cfg,
-            n_candidates=n_candidates,
-        )
+    try:
+        for start in range(0, len(boards), max(1, batch_size)):
+            batch = boards[start : start + max(1, batch_size)]
 
-        for b, best, meta in zip(batch, bests, metas):
-            example_id = b["board_id"]
-            if example_id in done_ids:
-                continue
+            bests, metas = run_turns_batched(
+                batch,
+                spymaster,
+                guesser,
+                embedder,  # may be None if you applied the optional-embedder change in rules/rollout
+                cfg,
+                n_candidates=n_candidates,
+            )
 
-            revealed = [False] * len(b["board_words"])
-            msgs = build_spymaster_messages(b["board_words"], b["labels"], revealed, cfg)
+            for b, best, meta in zip(batch, bests, metas):
+                example_id = b["board_id"]
+                if example_id in done_ids:
+                    continue
 
-            # Centralized prompt rendering (no duplicated chat-template/thinking logic)
-            prompt = render_prompt(spymaster, msgs, cfg, role="spymaster")
+                revealed = [False] * len(b["board_words"])
+                msgs = build_spymaster_messages(b["board_words"], b["labels"], revealed, cfg)
 
-            think_block = extract_think_block(best.raw_spymaster_text)
-            completion = ""
-            if think_block:
-                completion += think_block + "\n"
-            completion += f"CLUE: {best.clue}\nNUM: {best.num}\n"
+                # Centralized prompt rendering (no duplicated chat-template/thinking logic)
+                prompt = render_prompt(spymaster, msgs, cfg, role="spymaster")
 
-            rec = {
-                "example_id": example_id,
-                "board_id": b["board_id"],
-                "prompt": prompt,
-                "completion": completion,
-                "reward": float(best.reward),
-                "stats": {**best.stats, "directness": float(best.directness)},
-                "clue_meta": {
-                    "clue": best.clue,
-                    "num": int(best.num),
-                    "valid": bool(best.valid),
-                    "rejected_candidates": int(meta["rejected_total"]),
-                    "rejection_counts": meta["rejection_counts"],
-                },
-                "debug": {"guess_words": best.guess_words},
-            }
+                think_block = extract_think_block(best.raw_spymaster_text)
+                completion = ""
+                if think_block:
+                    completion += think_block + "\n"
+                completion += f"CLUE: {best.clue}\nNUM: {best.num}\n"
 
-            append_jsonl(raw_path, rec)
-            done_ids.add(example_id)
-            raw_records.append(rec)
-
-            if len(done_ids) % progress_every == 0:
-                mean_r = float(np.mean([r["reward"] for r in raw_records])) if raw_records else None
-                save_progress(
-                    progress_path,
-                    done=len(done_ids),
-                    total=len(boards),
-                    last_example_id=rec["example_id"],
-                    last_board_id=rec["board_id"],
-                    mean_reward=mean_r,
-                    extra={
-                        "n_candidates": int(n_candidates),
-                        "max_resamples": int(cfg["decoding"]["max_resamples"]),
-                        "batch_size": int(batch_size),
-                        "shard_id": int(shard_id),
-                        "num_shards": int(num_shards),
+                rec = {
+                    "example_id": example_id,
+                    "board_id": b["board_id"],
+                    "prompt": prompt,
+                    "completion": completion,
+                    "reward": float(best.reward),
+                    "stats": {**best.stats, "directness": float(best.directness)},
+                    "clue_meta": {
+                        "clue": best.clue,
+                        "num": int(best.num),
+                        "valid": bool(best.valid),
+                        "rejected_candidates": int(meta["rejected_total"]),
+                        "rejection_counts": meta["rejection_counts"],
                     },
-                )
+                    "debug": {"guess_words": best.guess_words},
+                }
+
+                f_raw.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                writes_since_flush += 1
+                if writes_since_flush >= FLUSH_EVERY:
+                    f_raw.flush()
+                    writes_since_flush = 0
+
+                done_ids.add(example_id)
+
+                running_sum += float(best.reward)
+                running_n += 1
+
+                if len(done_ids) % progress_every == 0:
+                    mean_r = (running_sum / running_n) if running_n else None
+                    save_progress(
+                        progress_path,
+                        done=len(done_ids),
+                        total=len(boards),
+                        last_example_id=rec["example_id"],
+                        last_board_id=rec["board_id"],
+                        mean_reward=mean_r,
+                        extra={
+                            "n_candidates": int(n_candidates),
+                            "max_resamples": int(cfg["decoding"]["max_resamples"]),
+                            "batch_size": int(batch_size),
+                            "shard_id": int(shard_id),
+                            "num_shards": int(num_shards),
+                        },
+                    )
+
+        f_raw.flush()
+
+    finally:
+        try:
+            f_raw.flush()
+        except Exception:
+            pass
+        try:
+            f_raw.close()
+        except Exception:
+            pass
 
     # Child workers stop here; master will merge + filter.
     if is_child_process() and num_shards > 1:
@@ -253,13 +285,12 @@ def main():
         return
 
     # Single-process mode: filter and write final file
-    raw_for_filter = read_jsonl(raw_path) if raw_path.exists() else raw_records
-
+    raw_for_filter = read_jsonl(raw_path) if raw_path.exists() else []
     filtered = filter_examples(raw_for_filter, cfg)
     write_jsonl(cfg["paths"]["sft_turns_path"], filtered)
     print(f"Filtered {len(filtered)}/{len(raw_for_filter)} -> {cfg['paths']['sft_turns_path']}")
 
-    mean_r = float(np.mean([r["reward"] for r in raw_records])) if raw_records else None
+    mean_r = (running_sum / running_n) if running_n else None
     save_progress(
         progress_path,
         done=len(done_ids),

@@ -165,8 +165,11 @@ def main():
         guesser = make_text_generator(g_id, cfg)
 
     # Embedder
-    device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
-    embedder = Embedder(cfg["models"]["embedding_model_id"], device=device)
+    use_embed = bool(cfg.get("constraints", {}).get("enable_directness_check", True))
+    embedder = None
+    if use_embed:
+        device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+        embedder = Embedder(cfg["models"]["embedding_model_id"], device=device)
 
     # Evaluate
     per_board: List[Dict[str, Any]] = []

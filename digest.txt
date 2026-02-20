@@ -116,6 +116,7 @@ constraints:
   single_word_only: true
   ban_board_words: true
   ban_substrings: true
+  enable_directness_check: false
   tau_direct: 0.52
   directness_metric: "cosine"
 
@@ -685,8 +686,11 @@ def main():
         guesser = make_text_generator(g_id, cfg)
 
     # Embedder
-    device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
-    embedder = Embedder(cfg["models"]["embedding_model_id"], device=device)
+    use_embed = bool(cfg.get("constraints", {}).get("enable_directness_check", True))
+    embedder = None
+    if use_embed:
+        device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+        embedder = Embedder(cfg["models"]["embedding_model_id"], device=device)
 
     # Evaluate
     per_board: List[Dict[str, Any]] = []
@@ -783,7 +787,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import numpy as np
 
@@ -793,7 +797,7 @@ from .mp_utils import launch_children, is_child_process, child_shard_info
 from .prompting import render_prompt
 from .rollout import run_turns_batched
 from .spymaster_prompt import build_spymaster_messages
-from .utils import load_yaml, read_jsonl, set_global_seed, write_jsonl, append_jsonl, save_progress
+from .utils import load_yaml, read_jsonl, set_global_seed, write_jsonl, save_progress
 
 
 # -------------------------
@@ -899,7 +903,6 @@ def main():
                     f"Usually you want tensor_parallel_size=1 when using multiple processes."
                 )
 
-        # mp_utils.launch_children(module, argv, num_procs)
         launch_children("src.generate_sft_data", ["--config", args.config], num_procs)
 
         base_raw_path = cfg.get("paths", {}).get("sft_turns_raw_path")
@@ -935,9 +938,12 @@ def main():
     spymaster = gen
     guesser = gen
 
-    # Embedder
-    device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
-    embedder = Embedder(cfg["models"]["embedding_model_id"], device=device)
+    # Embedder (OPTIONAL via constraints.enable_directness_check)
+    use_embed = bool(cfg.get("constraints", {}).get("enable_directness_check", True))
+    embedder = None
+    if use_embed:
+        device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+        embedder = Embedder(cfg["models"]["embedding_model_id"], device=device)
 
     n_candidates = int(cfg["decoding"]["n_candidates"])
     progress_every = int(cfg.get("decoding", {}).get("progress_every", 50))
@@ -957,75 +963,105 @@ def main():
 
     progress_path = raw_path.with_suffix(raw_path.suffix + ".progress.json")
 
-    raw_records: List[Dict[str, Any]] = []
+    # -------------------------
+    # Buffered writer (NO fsync-per-line)
+    # -------------------------
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    f_raw = open(raw_path, "a", encoding="utf-8")
+    writes_since_flush = 0
+    FLUSH_EVERY = 200  # tune to taste
 
-    for start in range(0, len(boards), max(1, batch_size)):
-        batch = boards[start : start + max(1, batch_size)]
+    # Track running reward without storing all records
+    running_sum = 0.0
+    running_n = 0
 
-        bests, metas = run_turns_batched(
-            batch,
-            spymaster,
-            guesser,
-            embedder,
-            cfg,
-            n_candidates=n_candidates,
-        )
+    try:
+        for start in range(0, len(boards), max(1, batch_size)):
+            batch = boards[start : start + max(1, batch_size)]
 
-        for b, best, meta in zip(batch, bests, metas):
-            example_id = b["board_id"]
-            if example_id in done_ids:
-                continue
+            bests, metas = run_turns_batched(
+                batch,
+                spymaster,
+                guesser,
+                embedder,  # may be None if you applied the optional-embedder change in rules/rollout
+                cfg,
+                n_candidates=n_candidates,
+            )
 
-            revealed = [False] * len(b["board_words"])
-            msgs = build_spymaster_messages(b["board_words"], b["labels"], revealed, cfg)
+            for b, best, meta in zip(batch, bests, metas):
+                example_id = b["board_id"]
+                if example_id in done_ids:
+                    continue
 
-            # Centralized prompt rendering (no duplicated chat-template/thinking logic)
-            prompt = render_prompt(spymaster, msgs, cfg, role="spymaster")
+                revealed = [False] * len(b["board_words"])
+                msgs = build_spymaster_messages(b["board_words"], b["labels"], revealed, cfg)
 
-            think_block = extract_think_block(best.raw_spymaster_text)
-            completion = ""
-            if think_block:
-                completion += think_block + "\n"
-            completion += f"CLUE: {best.clue}\nNUM: {best.num}\n"
+                # Centralized prompt rendering (no duplicated chat-template/thinking logic)
+                prompt = render_prompt(spymaster, msgs, cfg, role="spymaster")
 
-            rec = {
-                "example_id": example_id,
-                "board_id": b["board_id"],
-                "prompt": prompt,
-                "completion": completion,
-                "reward": float(best.reward),
-                "stats": {**best.stats, "directness": float(best.directness)},
-                "clue_meta": {
-                    "clue": best.clue,
-                    "num": int(best.num),
-                    "valid": bool(best.valid),
-                    "rejected_candidates": int(meta["rejected_total"]),
-                    "rejection_counts": meta["rejection_counts"],
-                },
-                "debug": {"guess_words": best.guess_words},
-            }
+                think_block = extract_think_block(best.raw_spymaster_text)
+                completion = ""
+                if think_block:
+                    completion += think_block + "\n"
+                completion += f"CLUE: {best.clue}\nNUM: {best.num}\n"
 
-            append_jsonl(raw_path, rec)
-            done_ids.add(example_id)
-            raw_records.append(rec)
-
-            if len(done_ids) % progress_every == 0:
-                mean_r = float(np.mean([r["reward"] for r in raw_records])) if raw_records else None
-                save_progress(
-                    progress_path,
-                    done=len(done_ids),
-                    total=len(boards),
-                    last_example_id=rec["example_id"],
-                    last_board_id=rec["board_id"],
-                    mean_reward=mean_r,
-                    extra={
-                        "n_candidates": int(n_candidates),
-                        "max_resamples": int(cfg["decoding"]["max_resamples"]),
-                        "batch_size": int(batch_size),
-                        "shard_id": int(shard_id),
-                        "num_shards": int(num_shards),
+                rec = {
+                    "example_id": example_id,
+                    "board_id": b["board_id"],
+                    "prompt": prompt,
+                    "completion": completion,
+                    "reward": float(best.reward),
+                    "stats": {**best.stats, "directness": float(best.directness)},
+                    "clue_meta": {
+                        "clue": best.clue,
+                        "num": int(best.num),
+                        "valid": bool(best.valid),
+                        "rejected_candidates": int(meta["rejected_total"]),
+                        "rejection_counts": meta["rejection_counts"],
                     },
-                )
+                    "debug": {"guess_words": best.guess_words},
+                }
+
+                f_raw.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                writes_since_flush += 1
+                if writes_since_flush >= FLUSH_EVERY:
+                    f_raw.flush()
+                    writes_since_flush = 0
+
+                done_ids.add(example_id)
+
+                running_sum += float(best.reward)
+                running_n += 1
+
+                if len(done_ids) % progress_every == 0:
+                    mean_r = (running_sum / running_n) if running_n else None
+                    save_progress(
+                        progress_path,
+                        done=len(done_ids),
+                        total=len(boards),
+                        last_example_id=rec["example_id"],
+                        last_board_id=rec["board_id"],
+                        mean_reward=mean_r,
+                        extra={
+                            "n_candidates": int(n_candidates),
+                            "max_resamples": int(cfg["decoding"]["max_resamples"]),
+                            "batch_size": int(batch_size),
+                            "shard_id": int(shard_id),
+                            "num_shards": int(num_shards),
+                        },
+                    )
+
+        f_raw.flush()
+
+    finally:
+        try:
+            f_raw.flush()
+        except Exception:
+            pass
+        try:
+            f_raw.close()
+        except Exception:
+            pass
 
     # Child workers stop here; master will merge + filter.
     if is_child_process() and num_shards > 1:
@@ -1033,13 +1069,12 @@ def main():
         return
 
     # Single-process mode: filter and write final file
-    raw_for_filter = read_jsonl(raw_path) if raw_path.exists() else raw_records
-
+    raw_for_filter = read_jsonl(raw_path) if raw_path.exists() else []
     filtered = filter_examples(raw_for_filter, cfg)
     write_jsonl(cfg["paths"]["sft_turns_path"], filtered)
     print(f"Filtered {len(filtered)}/{len(raw_for_filter)} -> {cfg['paths']['sft_turns_path']}")
 
-    mean_r = float(np.mean([r["reward"] for r in raw_records])) if raw_records else None
+    mean_r = (running_sum / running_n) if running_n else None
     save_progress(
         progress_path,
         done=len(done_ids),
@@ -1787,7 +1822,6 @@ from .rules import is_valid_clue, normalize_word, score_turn
 from .spymaster_prompt import build_spymaster_messages
 from .guesser_prompt import build_guesser_messages
 
-
 # -------------------------
 # Parsing helpers
 # -------------------------
@@ -1866,7 +1900,7 @@ def run_one_candidate(
     board_record: Dict[str, Any],
     spymaster: TextGenerator,
     guesser: TextGenerator,
-    embedder: Embedder,
+    embedder: Optional[Embedder],
     cfg: Dict[str, Any],
     seed: Optional[int] = None,
 ) -> CandidateResult:
@@ -1960,7 +1994,7 @@ def run_turn(
     board_record: Dict[str, Any],
     spymaster: TextGenerator,
     guesser: TextGenerator,
-    embedder: Embedder,
+    embedder: Optional[Embedder],
     cfg: Dict[str, Any],
     n_candidates: int = 1,
     seed: Optional[int] = None,
@@ -2032,7 +2066,7 @@ def run_turns_batched(
     boards_batch: List[Dict[str, Any]],
     spymaster: TextGenerator,
     guesser: TextGenerator,
-    embedder: Embedder,
+    embedder: Optional[Embedder],
     cfg: Dict[str, Any],
     *,
     n_candidates: int,
@@ -2252,6 +2286,8 @@ def looks_like_word_token(clue: str) -> bool:
 
 
 def directness_score(clue: str, target_words: List[str], embedder: Embedder) -> float:
+    if embedder is None:
+        return 0.0
     cvec = embedder.embed(clue)
     sims = []
     for t in target_words:
@@ -2264,7 +2300,7 @@ def is_valid_clue(
     clue: str,
     board_words: List[str],
     target_words: List[str],
-    embedder: Embedder,
+    embedder: Optional[Embedder],
     cfg: Dict[str, Any],
 ) -> Tuple[bool, str, float]:
     cons = cfg["constraints"]
@@ -2281,6 +2317,10 @@ def is_valid_clue(
 
     if cons.get("ban_substrings", True) and violates_substring_ban(clue, board_words):
         return False, "substring", 0.0
+
+    # Optional embedding-based directness constraint
+    if not bool(cons.get("enable_directness_check", True)):
+        return True, "ok", 0.0
 
     d = directness_score(clue, target_words, embedder)
     if d >= float(cons["tau_direct"]):
@@ -2396,42 +2436,33 @@ FILE: src/train_lora_sft.py
 from __future__ import annotations
 
 import argparse
-import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
 from torch.utils.data import Dataset
-
 from transformers.trainer_utils import get_last_checkpoint
 
 from .utils import load_yaml, read_jsonl, ensure_dir, save_config_snapshot, save_run_meta, set_global_seed
 
+
 class SFTDataset(Dataset):
-    def __init__(self, records: List[Dict[str, Any]], tokenizer, max_len: int):
-        self.records = records
-        self.tok = tokenizer
-        self.max_len = max_len
+    """
+    Dataset backed by pre-tokenized examples:
+      item = {"input_ids": List[int], "labels": List[int]}
+    """
+
+    def __init__(self, tokenized: List[Dict[str, Any]]):
+        self.items = tokenized
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.items)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        r = self.records[idx]
-        prompt = r["prompt"]
-        completion = r["completion"]
-
-        # Tokenize prompt and completion separately so we can mask prompt loss.
-        p = self.tok(prompt, add_special_tokens=False)
-        c = self.tok(completion, add_special_tokens=False)
-
-        input_ids = p["input_ids"] + c["input_ids"] + [self.tok.eos_token_id]
-        # labels: -100 for prompt tokens, normal ids for completion + eos
-        labels = [-100] * len(p["input_ids"]) + c["input_ids"] + [self.tok.eos_token_id]
-
-        input_ids = input_ids[: self.max_len]
-        labels = labels[: self.max_len]
-
+        ex = self.items[idx]
+        input_ids = ex["input_ids"]
+        labels = ex["labels"]
         attn = [1] * len(input_ids)
 
         return {
@@ -2446,16 +2477,63 @@ class PadCollator:
     tokenizer: Any
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        # left-pad vs right-pad: use tokenizer padding side; default right-pad
         input_ids = [b["input_ids"] for b in batch]
         labels = [b["labels"] for b in batch]
         attn = [b["attention_mask"] for b in batch]
 
-        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
         labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
         attn = torch.nn.utils.rnn.pad_sequence(attn, batch_first=True, padding_value=0)
 
         return {"input_ids": input_ids, "labels": labels, "attention_mask": attn}
+
+
+def _load_or_build_tokcache(
+    *,
+    cache_path: Path,
+    records: List[Dict[str, Any]],
+    tokenizer,
+    model_id: str,
+    max_len: int,
+) -> List[Dict[str, Any]]:
+    """
+    Cache format:
+      {"model_id": str, "max_len": int, "tokenized": [{"input_ids": [...], "labels": [...]}, ...]}
+    """
+    if cache_path.exists():
+        obj = torch.load(cache_path, map_location="cpu")
+        if (
+            isinstance(obj, dict)
+            and obj.get("model_id") == model_id
+            and int(obj.get("max_len", -1)) == int(max_len)
+            and isinstance(obj.get("tokenized"), list)
+        ):
+            print(f"Loaded tokenization cache -> {cache_path}")
+            return obj["tokenized"]
+
+    # Build cache
+    tokenized: List[Dict[str, Any]] = []
+    eos = tokenizer.eos_token_id
+
+    for r in records:
+        p = tokenizer(r["prompt"], add_special_tokens=False)["input_ids"]
+        c = tokenizer(r["completion"], add_special_tokens=False)["input_ids"]
+
+        input_ids = p + c + [eos]
+        labels = [-100] * len(p) + c + [eos]
+
+        input_ids = input_ids[:max_len]
+        labels = labels[:max_len]
+
+        tokenized.append({"input_ids": input_ids, "labels": labels})
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"model_id": model_id, "max_len": int(max_len), "tokenized": tokenized}, cache_path)
+    print(f"Saved tokenization cache -> {cache_path}")
+
+    return tokenized
 
 
 def main():
@@ -2465,7 +2543,6 @@ def main():
 
     cfg = load_yaml(args.config)
     tcfg = cfg["training"]
-
     set_global_seed(int(tcfg.get("seed", 0)))
 
     # Load data
@@ -2503,11 +2580,26 @@ def main():
     )
     model = get_peft_model(model, lora_cfg)
 
-    max_len = int(tcfg["max_seq_len"])
-    ds = SFTDataset(records, tokenizer, max_len=max_len)
-    collator = PadCollator(tokenizer)
-
     out_dir = ensure_dir(tcfg["output_adapter_dir"])
+
+    # -------------------------
+    # Pre-tokenize once + cache
+    # -------------------------
+    max_len = int(tcfg["max_seq_len"])
+    # Put cache next to the SFT file so it follows the dataset
+    sft_path = Path(cfg["paths"]["sft_turns_path"])
+    cache_path = sft_path.with_suffix(sft_path.suffix + f".tokcache.maxlen{max_len}.pt")
+
+    tokenized = _load_or_build_tokcache(
+        cache_path=cache_path,
+        records=records,
+        tokenizer=tokenizer,
+        model_id=model_id,
+        max_len=max_len,
+    )
+
+    ds = SFTDataset(tokenized)
+    collator = PadCollator(tokenizer)
 
     args_tr = TrainingArguments(
         output_dir=str(out_dir),
@@ -2546,8 +2638,7 @@ def main():
         m.save_pretrained(str(out_dir))
         tokenizer.save_pretrained(str(out_dir))
 
-    # Save config + run meta
-    if trainer.is_world_process_zero():
+        # Save config + run meta
         save_config_snapshot(cfg, out_dir)
         save_run_meta(out_dir, command=["python", "-m", "src.train_lora_sft", "--config", args.config])
 

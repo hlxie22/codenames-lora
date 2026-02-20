@@ -1,42 +1,33 @@
 from __future__ import annotations
 
 import argparse
-import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
 from torch.utils.data import Dataset
-
 from transformers.trainer_utils import get_last_checkpoint
 
 from .utils import load_yaml, read_jsonl, ensure_dir, save_config_snapshot, save_run_meta, set_global_seed
 
+
 class SFTDataset(Dataset):
-    def __init__(self, records: List[Dict[str, Any]], tokenizer, max_len: int):
-        self.records = records
-        self.tok = tokenizer
-        self.max_len = max_len
+    """
+    Dataset backed by pre-tokenized examples:
+      item = {"input_ids": List[int], "labels": List[int]}
+    """
+
+    def __init__(self, tokenized: List[Dict[str, Any]]):
+        self.items = tokenized
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.items)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        r = self.records[idx]
-        prompt = r["prompt"]
-        completion = r["completion"]
-
-        # Tokenize prompt and completion separately so we can mask prompt loss.
-        p = self.tok(prompt, add_special_tokens=False)
-        c = self.tok(completion, add_special_tokens=False)
-
-        input_ids = p["input_ids"] + c["input_ids"] + [self.tok.eos_token_id]
-        # labels: -100 for prompt tokens, normal ids for completion + eos
-        labels = [-100] * len(p["input_ids"]) + c["input_ids"] + [self.tok.eos_token_id]
-
-        input_ids = input_ids[: self.max_len]
-        labels = labels[: self.max_len]
-
+        ex = self.items[idx]
+        input_ids = ex["input_ids"]
+        labels = ex["labels"]
         attn = [1] * len(input_ids)
 
         return {
@@ -51,16 +42,63 @@ class PadCollator:
     tokenizer: Any
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        # left-pad vs right-pad: use tokenizer padding side; default right-pad
         input_ids = [b["input_ids"] for b in batch]
         labels = [b["labels"] for b in batch]
         attn = [b["attention_mask"] for b in batch]
 
-        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
         labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
         attn = torch.nn.utils.rnn.pad_sequence(attn, batch_first=True, padding_value=0)
 
         return {"input_ids": input_ids, "labels": labels, "attention_mask": attn}
+
+
+def _load_or_build_tokcache(
+    *,
+    cache_path: Path,
+    records: List[Dict[str, Any]],
+    tokenizer,
+    model_id: str,
+    max_len: int,
+) -> List[Dict[str, Any]]:
+    """
+    Cache format:
+      {"model_id": str, "max_len": int, "tokenized": [{"input_ids": [...], "labels": [...]}, ...]}
+    """
+    if cache_path.exists():
+        obj = torch.load(cache_path, map_location="cpu")
+        if (
+            isinstance(obj, dict)
+            and obj.get("model_id") == model_id
+            and int(obj.get("max_len", -1)) == int(max_len)
+            and isinstance(obj.get("tokenized"), list)
+        ):
+            print(f"Loaded tokenization cache -> {cache_path}")
+            return obj["tokenized"]
+
+    # Build cache
+    tokenized: List[Dict[str, Any]] = []
+    eos = tokenizer.eos_token_id
+
+    for r in records:
+        p = tokenizer(r["prompt"], add_special_tokens=False)["input_ids"]
+        c = tokenizer(r["completion"], add_special_tokens=False)["input_ids"]
+
+        input_ids = p + c + [eos]
+        labels = [-100] * len(p) + c + [eos]
+
+        input_ids = input_ids[:max_len]
+        labels = labels[:max_len]
+
+        tokenized.append({"input_ids": input_ids, "labels": labels})
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"model_id": model_id, "max_len": int(max_len), "tokenized": tokenized}, cache_path)
+    print(f"Saved tokenization cache -> {cache_path}")
+
+    return tokenized
 
 
 def main():
@@ -70,7 +108,6 @@ def main():
 
     cfg = load_yaml(args.config)
     tcfg = cfg["training"]
-
     set_global_seed(int(tcfg.get("seed", 0)))
 
     # Load data
@@ -108,11 +145,26 @@ def main():
     )
     model = get_peft_model(model, lora_cfg)
 
-    max_len = int(tcfg["max_seq_len"])
-    ds = SFTDataset(records, tokenizer, max_len=max_len)
-    collator = PadCollator(tokenizer)
-
     out_dir = ensure_dir(tcfg["output_adapter_dir"])
+
+    # -------------------------
+    # Pre-tokenize once + cache
+    # -------------------------
+    max_len = int(tcfg["max_seq_len"])
+    # Put cache next to the SFT file so it follows the dataset
+    sft_path = Path(cfg["paths"]["sft_turns_path"])
+    cache_path = sft_path.with_suffix(sft_path.suffix + f".tokcache.maxlen{max_len}.pt")
+
+    tokenized = _load_or_build_tokcache(
+        cache_path=cache_path,
+        records=records,
+        tokenizer=tokenizer,
+        model_id=model_id,
+        max_len=max_len,
+    )
+
+    ds = SFTDataset(tokenized)
+    collator = PadCollator(tokenizer)
 
     args_tr = TrainingArguments(
         output_dir=str(out_dir),
@@ -151,8 +203,7 @@ def main():
         m.save_pretrained(str(out_dir))
         tokenizer.save_pretrained(str(out_dir))
 
-    # Save config + run meta
-    if trainer.is_world_process_zero():
+        # Save config + run meta
         save_config_snapshot(cfg, out_dir)
         save_run_meta(out_dir, command=["python", "-m", "src.train_lora_sft", "--config", args.config])
 

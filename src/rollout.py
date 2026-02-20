@@ -11,7 +11,6 @@ from .rules import is_valid_clue, normalize_word, score_turn
 from .spymaster_prompt import build_spymaster_messages
 from .guesser_prompt import build_guesser_messages
 
-
 # -------------------------
 # Parsing helpers
 # -------------------------
@@ -90,7 +89,7 @@ def run_one_candidate(
     board_record: Dict[str, Any],
     spymaster: TextGenerator,
     guesser: TextGenerator,
-    embedder: Embedder,
+    embedder: Optional[Embedder],
     cfg: Dict[str, Any],
     seed: Optional[int] = None,
 ) -> CandidateResult:
@@ -184,7 +183,7 @@ def run_turn(
     board_record: Dict[str, Any],
     spymaster: TextGenerator,
     guesser: TextGenerator,
-    embedder: Embedder,
+    embedder: Optional[Embedder],
     cfg: Dict[str, Any],
     n_candidates: int = 1,
     seed: Optional[int] = None,
@@ -256,7 +255,7 @@ def run_turns_batched(
     boards_batch: List[Dict[str, Any]],
     spymaster: TextGenerator,
     guesser: TextGenerator,
-    embedder: Embedder,
+    embedder: Optional[Embedder],
     cfg: Dict[str, Any],
     *,
     n_candidates: int,

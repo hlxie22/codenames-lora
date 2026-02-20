@@ -45,6 +45,8 @@ def looks_like_word_token(clue: str) -> bool:
 
 
 def directness_score(clue: str, target_words: List[str], embedder: Embedder) -> float:
+    if embedder is None:
+        return 0.0
     cvec = embedder.embed(clue)
     sims = []
     for t in target_words:
@@ -57,7 +59,7 @@ def is_valid_clue(
     clue: str,
     board_words: List[str],
     target_words: List[str],
-    embedder: Embedder,
+    embedder: Optional[Embedder],
     cfg: Dict[str, Any],
 ) -> Tuple[bool, str, float]:
     cons = cfg["constraints"]
@@ -74,6 +76,10 @@ def is_valid_clue(
 
     if cons.get("ban_substrings", True) and violates_substring_ban(clue, board_words):
         return False, "substring", 0.0
+
+    # Optional embedding-based directness constraint
+    if not bool(cons.get("enable_directness_check", True)):
+        return True, "ok", 0.0
 
     d = directness_score(clue, target_words, embedder)
     if d >= float(cons["tau_direct"]):
