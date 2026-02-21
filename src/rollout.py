@@ -1,8 +1,9 @@
+# src/rollout.py
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, overload, Literal
 
 from .gen_cfg import guesser_gen_cfg, spymaster_gen_cfg
 from .model_wrappers import Embedder, TextGenerator
@@ -251,6 +252,7 @@ def select_best_candidate(candidates: List[CandidateResult]) -> CandidateResult:
 # Batched rollout (shared by eval + SFT generation)
 # -------------------------
 
+@overload
 def run_turns_batched(
     boards_batch: List[Dict[str, Any]],
     spymaster: TextGenerator,
@@ -259,22 +261,54 @@ def run_turns_batched(
     cfg: Dict[str, Any],
     *,
     n_candidates: int,
-) -> Tuple[List[CandidateResult], List[Dict[str, Any]]]:
+    return_candidates: Literal[False] = False,
+) -> Tuple[List[CandidateResult], List[Dict[str, Any]]]: ...
+
+@overload
+def run_turns_batched(
+    boards_batch: List[Dict[str, Any]],
+    spymaster: TextGenerator,
+    guesser: TextGenerator,
+    embedder: Optional[Embedder],
+    cfg: Dict[str, Any],
+    *,
+    n_candidates: int,
+    return_candidates: Literal[True],
+) -> Tuple[List[CandidateResult], List[Dict[str, Any]], List[List[CandidateResult]]]: ...
+
+
+def run_turns_batched(
+    boards_batch: List[Dict[str, Any]],
+    spymaster: TextGenerator,
+    guesser: TextGenerator,
+    embedder: Optional[Embedder],
+    cfg: Dict[str, Any],
+    *,
+    n_candidates: int,
+    return_candidates: bool = False,
+) -> Any:
     """
-    Returns:
+    Returns (default):
       - best CandidateResult per board
       - meta per board: rejected_total + rejection_counts (matching run_turn)
-    Falls back to sequential if generator doesn't support generate_batch.
+
+    If return_candidates=True:
+      - also returns all candidates per board (length == n_candidates)
+        so you can analyze variance across candidates.
     """
     # Sequential fallback if no batch API
     if not (hasattr(spymaster, "generate_batch") and hasattr(guesser, "generate_batch")):
         bests: List[CandidateResult] = []
         metas: List[Dict[str, Any]] = []
+        all_cands: List[List[CandidateResult]] = []
         for b in boards_batch:
             seed = int(b.get("seed", 0))
             cands, meta = run_turn(b, spymaster, guesser, embedder, cfg, n_candidates=n_candidates, seed=seed)
+            all_cands.append(cands)
             bests.append(select_best_candidate(cands))
             metas.append(meta)
+        if return_candidates:
+            return bests, metas, all_cands
         return bests, metas
 
     sp_gen = spymaster_gen_cfg(cfg)
@@ -355,7 +389,15 @@ def run_turns_batched(
                 txt = last_text.get(bi, "")
                 s_used = last_seed.get(bi, seeds0[bi] + ci * 1000)
                 clue, num = parse_spymaster_output(txt)
-                got[bi] = (clue or "", int(num) if num is not None else 0, False, "exhausted", 0.0, txt, s_used)
+                got[bi] = (
+                    clue or "",
+                    int(num) if num is not None else 0,
+                    False,
+                    "exhausted",
+                    0.0,
+                    txt,
+                    s_used,
+                )
 
         # Batched guesser for valid ones only
         valid_bis = [bi for bi in range(len(boards_batch)) if got[bi][2]]  # type: ignore[index]
@@ -422,4 +464,7 @@ def run_turns_batched(
         {"rejected_total": rej_total_per_board[i], "rejection_counts": rej_counts_per_board[i]}
         for i in range(len(boards_batch))
     ]
+
+    if return_candidates:
+        return bests, metas, all_candidates_per_board
     return bests, metas

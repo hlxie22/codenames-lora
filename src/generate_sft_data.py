@@ -1,3 +1,4 @@
+# src/generate_sft_data.py
 from __future__ import annotations
 
 import argparse
@@ -191,20 +192,25 @@ def main():
     running_sum = 0.0
     running_n = 0
 
+    # NOTE: To keep files small, we do NOT store raw texts for each candidate by default.
+    # Flip this to True if you explicitly want the raw model outputs per candidate.
+    INCLUDE_RAW_TEXTS = False
+
     try:
         for start in range(0, len(boards), max(1, batch_size)):
             batch = boards[start : start + max(1, batch_size)]
 
-            bests, metas = run_turns_batched(
+            bests, metas, all_cands = run_turns_batched(
                 batch,
                 spymaster,
                 guesser,
-                embedder,  # may be None if you applied the optional-embedder change in rules/rollout
+                embedder,  # may be None if directness check disabled
                 cfg,
                 n_candidates=n_candidates,
+                return_candidates=True,  # <-- variance logging
             )
 
-            for b, best, meta in zip(batch, bests, metas):
+            for b, best, meta, cands in zip(batch, bests, metas, all_cands):
                 example_id = b["board_id"]
                 if example_id in done_ids:
                     continue
@@ -221,6 +227,40 @@ def main():
                     completion += think_block + "\n"
                 completion += f"CLUE: {best.clue}\nNUM: {best.num}\n"
 
+                # Best candidate index (object identity should match; fallback to value match)
+                best_idx = None
+                for j, c in enumerate(cands):
+                    if c is best:
+                        best_idx = j
+                        break
+                if best_idx is None:
+                    for j, c in enumerate(cands):
+                        if (
+                            c.clue == best.clue
+                            and int(c.num) == int(best.num)
+                            and float(c.reward) == float(best.reward)
+                            and bool(c.valid) == bool(best.valid)
+                        ):
+                            best_idx = j
+                            break
+
+                cand_payload: List[Dict[str, Any]] = []
+                for c in cands:
+                    cd: Dict[str, Any] = {
+                        "clue": c.clue,
+                        "num": int(c.num),
+                        "valid": bool(c.valid),
+                        "rejection_reason": c.rejection_reason,
+                        "directness": float(c.directness),
+                        "reward": float(c.reward),
+                        "stats": c.stats,
+                        "guess_words": c.guess_words,
+                    }
+                    if INCLUDE_RAW_TEXTS:
+                        cd["raw_spymaster_text"] = c.raw_spymaster_text
+                        cd["raw_guesser_text"] = c.raw_guesser_text
+                    cand_payload.append(cd)
+
                 rec = {
                     "example_id": example_id,
                     "board_id": b["board_id"],
@@ -236,6 +276,9 @@ def main():
                         "rejection_counts": meta["rejection_counts"],
                     },
                     "debug": {"guess_words": best.guess_words},
+                    # NEW: variance logging
+                    "best_candidate_idx": best_idx,
+                    "candidates": cand_payload,
                 }
 
                 f_raw.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -264,6 +307,7 @@ def main():
                             "batch_size": int(batch_size),
                             "shard_id": int(shard_id),
                             "num_shards": int(num_shards),
+                            "include_raw_texts": bool(INCLUDE_RAW_TEXTS),
                         },
                     )
 

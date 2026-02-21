@@ -69,12 +69,12 @@ decoding:
   spymaster_temperature: 0.6
   spymaster_top_p: 0.95
   spymaster_top_k: 20
-  spymaster_max_new_tokens: 1024
+  spymaster_max_new_tokens: 4096
 
   guesser_temperature: 0.6
   guesser_top_p: 0.95
   guesser_top_k: 20
-  guesser_max_new_tokens: 1024
+  guesser_max_new_tokens: 2048
 
   n_candidates: 8
   max_resamples: 8
