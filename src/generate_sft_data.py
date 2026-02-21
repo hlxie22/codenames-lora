@@ -180,12 +180,12 @@ def main():
     progress_path = raw_path.with_suffix(raw_path.suffix + ".progress.json")
 
     # -------------------------
-    # Buffered writer (NO fsync-per-line)
+    # Buffered writer
     # -------------------------
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     f_raw = open(raw_path, "a", encoding="utf-8")
     writes_since_flush = 0
-    FLUSH_EVERY = 200  # tune to taste
+    FLUSH_EVERY = int(cfg.get("decoding", {}).get("flush_every", 10))
 
     # Track running reward without storing all records
     running_sum = 0.0

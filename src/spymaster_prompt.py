@@ -38,7 +38,6 @@ ASSASSIN: {", ".join(ass_words)}
 CONSTRAINTS:
 - Output exactly ONE clue word (single token-like word).
 - The clue must NOT be any board word.
-- Avoid direct semantic neighbors of TEAM words: the clue will be rejected if too similar (similarity >= {tau}).
 - Avoid substrings of board words and vice versa.
 
 GOAL:
