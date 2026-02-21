@@ -97,21 +97,21 @@ qwen:
   system_guesser: "You are the Guesser in a Codenames-like game."
 
 decoding:
-  progress_every: 100
+  progress_every: 20
   flush_every: 10
 
   spymaster_temperature: 0.6
   spymaster_top_p: 0.95
   spymaster_top_k: 20
-  spymaster_max_new_tokens: 2048
+  spymaster_max_new_tokens: 4096
 
   guesser_temperature: 0.6
   guesser_top_p: 0.95
   guesser_top_k: 20
   guesser_max_new_tokens: 2048
 
-  n_candidates: 8
-  max_resamples: 8
+  n_candidates: 3
+  max_resamples: 4
 
 constraints:
   single_word_only: true
@@ -783,6 +783,7 @@ def guesser_gen_cfg(cfg) -> GenerationConfig:
 ================================================
 FILE: src/generate_sft_data.py
 ================================================
+# src/generate_sft_data.py
 from __future__ import annotations
 
 import argparse
@@ -976,20 +977,25 @@ def main():
     running_sum = 0.0
     running_n = 0
 
+    # NOTE: To keep files small, we do NOT store raw texts for each candidate by default.
+    # Flip this to True if you explicitly want the raw model outputs per candidate.
+    INCLUDE_RAW_TEXTS = False
+
     try:
         for start in range(0, len(boards), max(1, batch_size)):
             batch = boards[start : start + max(1, batch_size)]
 
-            bests, metas = run_turns_batched(
+            bests, metas, all_cands = run_turns_batched(
                 batch,
                 spymaster,
                 guesser,
-                embedder,  # may be None if you applied the optional-embedder change in rules/rollout
+                embedder,  # may be None if directness check disabled
                 cfg,
                 n_candidates=n_candidates,
+                return_candidates=True,  # <-- variance logging
             )
 
-            for b, best, meta in zip(batch, bests, metas):
+            for b, best, meta, cands in zip(batch, bests, metas, all_cands):
                 example_id = b["board_id"]
                 if example_id in done_ids:
                     continue
@@ -1006,6 +1012,40 @@ def main():
                     completion += think_block + "\n"
                 completion += f"CLUE: {best.clue}\nNUM: {best.num}\n"
 
+                # Best candidate index (object identity should match; fallback to value match)
+                best_idx = None
+                for j, c in enumerate(cands):
+                    if c is best:
+                        best_idx = j
+                        break
+                if best_idx is None:
+                    for j, c in enumerate(cands):
+                        if (
+                            c.clue == best.clue
+                            and int(c.num) == int(best.num)
+                            and float(c.reward) == float(best.reward)
+                            and bool(c.valid) == bool(best.valid)
+                        ):
+                            best_idx = j
+                            break
+
+                cand_payload: List[Dict[str, Any]] = []
+                for c in cands:
+                    cd: Dict[str, Any] = {
+                        "clue": c.clue,
+                        "num": int(c.num),
+                        "valid": bool(c.valid),
+                        "rejection_reason": c.rejection_reason,
+                        "directness": float(c.directness),
+                        "reward": float(c.reward),
+                        "stats": c.stats,
+                        "guess_words": c.guess_words,
+                    }
+                    if INCLUDE_RAW_TEXTS:
+                        cd["raw_spymaster_text"] = c.raw_spymaster_text
+                        cd["raw_guesser_text"] = c.raw_guesser_text
+                    cand_payload.append(cd)
+
                 rec = {
                     "example_id": example_id,
                     "board_id": b["board_id"],
@@ -1021,6 +1061,9 @@ def main():
                         "rejection_counts": meta["rejection_counts"],
                     },
                     "debug": {"guess_words": best.guess_words},
+                    # NEW: variance logging
+                    "best_candidate_idx": best_idx,
+                    "candidates": cand_payload,
                 }
 
                 f_raw.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -1049,6 +1092,7 @@ def main():
                             "batch_size": int(batch_size),
                             "shard_id": int(shard_id),
                             "num_shards": int(num_shards),
+                            "include_raw_texts": bool(INCLUDE_RAW_TEXTS),
                         },
                     )
 
@@ -1810,11 +1854,12 @@ def render_prompt(generator, messages: List[Dict[str, str]], cfg: Dict[str, Any]
 ================================================
 FILE: src/rollout.py
 ================================================
+# src/rollout.py
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, overload, Literal
 
 from .gen_cfg import guesser_gen_cfg, spymaster_gen_cfg
 from .model_wrappers import Embedder, TextGenerator
@@ -2063,6 +2108,7 @@ def select_best_candidate(candidates: List[CandidateResult]) -> CandidateResult:
 # Batched rollout (shared by eval + SFT generation)
 # -------------------------
 
+@overload
 def run_turns_batched(
     boards_batch: List[Dict[str, Any]],
     spymaster: TextGenerator,
@@ -2071,22 +2117,54 @@ def run_turns_batched(
     cfg: Dict[str, Any],
     *,
     n_candidates: int,
-) -> Tuple[List[CandidateResult], List[Dict[str, Any]]]:
+    return_candidates: Literal[False] = False,
+) -> Tuple[List[CandidateResult], List[Dict[str, Any]]]: ...
+
+@overload
+def run_turns_batched(
+    boards_batch: List[Dict[str, Any]],
+    spymaster: TextGenerator,
+    guesser: TextGenerator,
+    embedder: Optional[Embedder],
+    cfg: Dict[str, Any],
+    *,
+    n_candidates: int,
+    return_candidates: Literal[True],
+) -> Tuple[List[CandidateResult], List[Dict[str, Any]], List[List[CandidateResult]]]: ...
+
+
+def run_turns_batched(
+    boards_batch: List[Dict[str, Any]],
+    spymaster: TextGenerator,
+    guesser: TextGenerator,
+    embedder: Optional[Embedder],
+    cfg: Dict[str, Any],
+    *,
+    n_candidates: int,
+    return_candidates: bool = False,
+) -> Any:
     """
-    Returns:
+    Returns (default):
       - best CandidateResult per board
       - meta per board: rejected_total + rejection_counts (matching run_turn)
-    Falls back to sequential if generator doesn't support generate_batch.
+
+    If return_candidates=True:
+      - also returns all candidates per board (length == n_candidates)
+        so you can analyze variance across candidates.
     """
     # Sequential fallback if no batch API
     if not (hasattr(spymaster, "generate_batch") and hasattr(guesser, "generate_batch")):
         bests: List[CandidateResult] = []
         metas: List[Dict[str, Any]] = []
+        all_cands: List[List[CandidateResult]] = []
         for b in boards_batch:
             seed = int(b.get("seed", 0))
             cands, meta = run_turn(b, spymaster, guesser, embedder, cfg, n_candidates=n_candidates, seed=seed)
+            all_cands.append(cands)
             bests.append(select_best_candidate(cands))
             metas.append(meta)
+        if return_candidates:
+            return bests, metas, all_cands
         return bests, metas
 
     sp_gen = spymaster_gen_cfg(cfg)
@@ -2167,7 +2245,15 @@ def run_turns_batched(
                 txt = last_text.get(bi, "")
                 s_used = last_seed.get(bi, seeds0[bi] + ci * 1000)
                 clue, num = parse_spymaster_output(txt)
-                got[bi] = (clue or "", int(num) if num is not None else 0, False, "exhausted", 0.0, txt, s_used)
+                got[bi] = (
+                    clue or "",
+                    int(num) if num is not None else 0,
+                    False,
+                    "exhausted",
+                    0.0,
+                    txt,
+                    s_used,
+                )
 
         # Batched guesser for valid ones only
         valid_bis = [bi for bi in range(len(boards_batch)) if got[bi][2]]  # type: ignore[index]
@@ -2234,6 +2320,9 @@ def run_turns_batched(
         {"rejected_total": rej_total_per_board[i], "rejection_counts": rej_counts_per_board[i]}
         for i in range(len(boards_batch))
     ]
+
+    if return_candidates:
+        return bests, metas, all_candidates_per_board
     return bests, metas
 
 

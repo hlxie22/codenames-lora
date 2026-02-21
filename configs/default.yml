@@ -63,7 +63,7 @@ qwen:
   system_guesser: "You are the Guesser in a Codenames-like game."
 
 decoding:
-  progress_every: 100
+  progress_every: 20
   flush_every: 10
 
   spymaster_temperature: 0.6
@@ -76,8 +76,8 @@ decoding:
   guesser_top_k: 20
   guesser_max_new_tokens: 2048
 
-  n_candidates: 8
-  max_resamples: 8
+  n_candidates: 3
+  max_resamples: 4
 
 constraints:
   single_word_only: true

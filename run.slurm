@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-mkdir -p logs   
+mkdir -p logs
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0")"
 REQUEUE_SENT=0
@@ -32,8 +32,13 @@ handle_usr1() {
   scontrol requeue "$SLURM_JOB_ID"
   rc=$?
   if (( rc != 0 )); then
-    echo "[$(date)] requeue failed (rc=$rc) -> resubmitting with dependency"
-    sbatch --dependency=afterany:"$SLURM_JOB_ID" "$SCRIPT_PATH"
+    echo "[$(date)] requeue failed (rc=$rc) -> resubmitting with dependency (append to original logs)"
+    # Fallback: new job id, but force logs to append to the ORIGINAL job's log files
+    sbatch --dependency=afterany:"$SLURM_JOB_ID" \
+          --open-mode=append \
+          --output="logs/%x-${SLURM_JOB_ID}.out" \
+          --error="logs/%x-${SLURM_JOB_ID}.err" \
+          "$SCRIPT_PATH"
   fi
 
   # Ask your workload to stop gracefully so it exits before walltime.
