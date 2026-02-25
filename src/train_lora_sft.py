@@ -101,6 +101,27 @@ def _load_or_build_tokcache(
     return tokenized
 
 
+def _disable_kv_cache(model: Any) -> None:
+    """
+    Disable KV cache during training to reduce VRAM usage.
+    For decoder-only LMs, use_cache is useful for generation, not for teacher-forced training.
+    """
+    try:
+        if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+            model.config.use_cache = False
+    except Exception:
+        pass
+
+    # PEFT wrappers sometimes expose the underlying model as base_model/model
+    for attr in ("base_model", "model", "module"):
+        try:
+            m = getattr(model, attr, None)
+            if m is not None and hasattr(m, "config") and hasattr(m.config, "use_cache"):
+                m.config.use_cache = False
+        except Exception:
+            continue
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -135,6 +156,9 @@ def main():
         torch_dtype=torch_dtype,
     )
 
+    # --- disable KV cache during training ---
+    _disable_kv_cache(model)
+
     lora_cfg = LoraConfig(
         r=int(tcfg["r"]),
         lora_alpha=int(tcfg["alpha"]),
@@ -144,6 +168,9 @@ def main():
         target_modules=tcfg.get("target_modules", None),
     )
     model = get_peft_model(model, lora_cfg)
+
+    # --- disable KV cache again after wrapping ---
+    _disable_kv_cache(model)
 
     out_dir = ensure_dir(tcfg["output_adapter_dir"])
 

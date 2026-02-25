@@ -96,10 +96,9 @@ reward:
   brevity_bonus: 0.0
 
 filtering:
-  mode: "rule_based"   # "top_percent" or "rule_based"
-  top_percent: 0.4
-  min_team_correct: 2
+  mode: "rule_based"
   require_no_assassin: true
+  min_reward: 3.0
 
 training:
   seed: 999

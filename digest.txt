@@ -30,7 +30,7 @@ FILE: run.slurm
 #!/bin/bash
 #SBATCH --job-name=codenames
 #SBATCH --gres=gpu:2
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=06:00:00
 #SBATCH --requeue
@@ -38,90 +38,24 @@ FILE: run.slurm
 #SBATCH --open-mode=append           # keep logs across requeues (same job id)
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
-#SBATCH --mail-type=NONE             # disable Slurm mails (prevents requeue spam)
+
+# Slurm email (controller-side)
+#SBATCH --mail-user=henryxie@college.harvard.edu
+#SBATCH --mail-type=END,FAIL         # omit REQUEUE to avoid requeue spam
 
 set -euo pipefail
 
+# IMPORTANT: logs/ must exist at *submit time* for the SBATCH --output/--error paths.
+# Run: mkdir -p logs   (before: sbatch this_script.sh)
 mkdir -p logs
-
-# ====== CONFIG: put your email here (in the file) ======
-MAIL_TO="henryxie@college.harvard.edu"
-MAIL_SUBJECT_PREFIX="Codenames Job Done"
-# =======================================================
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0")"
 
-# If we ever fall back to "resubmit with dependency", keep a stable ID for logs + email context.
+# Stable ID for log naming if we fall back to "resubmit with dependency"
 ORIG_JOB_ID="${ORIG_JOB_ID:-${SLURM_JOB_ID:-unknown}}"
 
 REQUEUE_SENT=0
 MAIN_PID=""
-START_TIME="$(date --iso-8601=seconds 2>/dev/null || date)"
-
-send_mail() {
-  local subject="$1"
-  local body="$2"
-
-  if [[ -z "$MAIL_TO" ]]; then
-    echo "[$(date)] MAIL_TO empty; skipping completion email."
-    return 0
-  fi
-
-  if command -v mail >/dev/null 2>&1; then
-    printf "%s\n" "$body" | mail -s "$subject" "$MAIL_TO"
-  elif command -v mailx >/dev/null 2>&1; then
-    printf "%s\n" "$body" | mailx -s "$subject" "$MAIL_TO"
-  elif command -v sendmail >/dev/null 2>&1; then
-    {
-      echo "To: $MAIL_TO"
-      echo "Subject: $subject"
-      echo
-      printf "%s\n" "$body"
-    } | sendmail -t
-  else
-    echo "[$(date)] No mail/mailx/sendmail found; cannot send completion email."
-    return 1
-  fi
-}
-
-on_exit() {
-  local rc=$?
-  local end_time
-  end_time="$(date --iso-8601=seconds 2>/dev/null || date)"
-
-  # If we requeued/resubmitted, do NOT email.
-  if (( REQUEUE_SENT == 1 )); then
-    echo "[$(date)] Exiting due to requeue/resubmit; not sending completion email."
-    return 0
-  fi
-
-  local out_log="logs/${SLURM_JOB_NAME:-job}-${ORIG_JOB_ID}.out"
-  local err_log="logs/${SLURM_JOB_NAME:-job}-${ORIG_JOB_ID}.err"
-
-  local subject="${MAIL_SUBJECT_PREFIX} ${SLURM_JOB_NAME:-job} (${ORIG_JOB_ID}) completed (rc=${rc})"
-  local body
-  body=$(
-    cat <<EOF
-Job completed (not requeued).
-
-Job name:   ${SLURM_JOB_NAME:-unknown}
-Orig jobid: ${ORIG_JOB_ID}
-This jobid: ${SLURM_JOB_ID:-unknown}
-User:       ${USER:-unknown}
-Node(s):    ${SLURM_NODELIST:-unknown}
-Start:      ${START_TIME}
-End:        ${end_time}
-Exit code:  ${rc}
-
-Logs (appended across retries if applicable):
-  OUT: ${out_log}
-  ERR: ${err_log}
-EOF
-  )
-
-  send_mail "$subject" "$body" || true
-}
-trap on_exit EXIT
 
 handle_usr1() {
   # prevent double-trigger in the same run
@@ -138,7 +72,6 @@ handle_usr1() {
   rc=$?
   if (( rc != 0 )); then
     echo "[$(date)] requeue failed (rc=$rc) -> resubmitting with dependency (append to original logs)"
-    # Fallback: new job id, but force logs to append to the ORIGINAL job's log files
     sbatch --dependency=afterany:"$SLURM_JOB_ID" \
           --export=ALL,ORIG_JOB_ID="$ORIG_JOB_ID" \
           --open-mode=append \
@@ -165,7 +98,6 @@ handle_usr1() {
 
   exit 0
 }
-
 trap handle_usr1 USR1
 
 module load miniforge/25.11.0-0
@@ -185,7 +117,7 @@ mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE"
 # --- Run experiment ---
 # Run workload in its own session so we can kill the whole group on USR1 (torchrun-friendly)
 set +e
-setsid python -m src.generate_sft_data --config configs/default.yml &
+setsid torchrun --nproc_per_node=2 -m src.train_lora_sft --config configs/default.yml &
 MAIN_PID=$!
 wait "$MAIN_PID"
 RC=$?
@@ -301,10 +233,9 @@ reward:
   brevity_bonus: 0.0
 
 filtering:
-  mode: "rule_based"   # "top_percent" or "rule_based"
-  top_percent: 0.4
-  min_team_correct: 2
+  mode: "rule_based"
   require_no_assassin: true
+  min_reward: 3.0
 
 training:
   seed: 999
@@ -960,7 +891,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -1000,12 +931,21 @@ def load_done_example_ids(raw_path: str | Path) -> set[str]:
     return done
 
 
+def _try_load_progress(progress_path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if progress_path.exists():
+            return json.loads(progress_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return None
+
+
 def extract_think_block(text: str) -> str:
     # Keep the model-produced think block if present; otherwise return "".
     lo = text.lower().rfind("<think>")
     hi = text.lower().rfind("</think>")
     if lo != -1 and hi != -1 and hi > lo:
-        return text[lo : hi + len("</think>")].strip()
+        return text[lo: hi + len("</think>")].strip()
     # Sometimes you might only see </think>; keep everything up to it as "thinking".
     if hi != -1:
         return text[: hi + len("</think>")].strip()
@@ -1023,17 +963,27 @@ def filter_examples(records: List[Dict[str, Any]], cfg: Dict[str, Any]) -> List[
     if not records:
         return []
 
+    min_reward = fcfg.get("min_reward", None)
+    min_reward = float(min_reward) if min_reward is not None else None
+
+    def passes_min_reward(r: Dict[str, Any]) -> bool:
+        if min_reward is None:
+            return True
+        return float(r.get("reward", 0.0)) >= min_reward
+
     if mode == "top_percent":
         top_p = float(fcfg["top_percent"])
         rewards = np.array([r["reward"] for r in records], dtype=np.float32)
         thr = float(np.quantile(rewards, 1.0 - top_p))
-        return [r for r in records if float(r["reward"]) >= thr]
+        return [r for r in records if float(r["reward"]) >= thr and passes_min_reward(r)]
 
     if mode == "rule_based":
         min_team = int(fcfg.get("min_team_correct", 0))
         require_no_assassin = bool(fcfg.get("require_no_assassin", False))
         kept = []
         for r in records:
+            if not passes_min_reward(r):
+                continue
             st = r.get("stats", {})
             if int(st.get("n_team", 0)) < min_team:
                 continue
@@ -1106,6 +1056,134 @@ def main():
         boards = [b for i, b in enumerate(boards) if (i % num_shards) == shard_id]
         print(f"[shard {shard_id}/{num_shards}] boards={len(boards)}")
 
+    # IMPORTANT: per-shard total is defined BEFORE resume filtering
+    shard_total = len(boards)
+
+    # Paths (use per-shard raw file to avoid concurrent appends)
+    base_raw_path = cfg.get("paths", {}).get("sft_turns_raw_path")
+    if not base_raw_path:
+        raise RuntimeError("paths.sft_turns_raw_path must be set")
+
+    raw_path = Path(base_raw_path)
+    if num_shards > 1:
+        raw_path = shard_path_append_to_suffix(raw_path, shard_id, num_shards)
+
+    progress_path = raw_path.with_suffix(raw_path.suffix + ".progress.json")
+
+    # Resume: detect already-written examples
+    done_ids = load_done_example_ids(raw_path)
+    if done_ids:
+        # CRITICAL FIX:
+        # Skip compute for already-done boards BEFORE calling run_turns_batched
+        before = len(boards)
+        boards = [b for b in boards if str(b.get("board_id")) not in done_ids]
+        after = len(boards)
+        print(
+            f"[shard {shard_id}/{num_shards}] Resuming: found {len(done_ids)} already-written examples in {raw_path}. "
+            f"Remaining={after} (was {before}), shard_total={shard_total}."
+        )
+    else:
+        print(f"[shard {shard_id}/{num_shards}] Starting fresh: shard_total={shard_total} -> {raw_path}")
+
+    # Refresh / initialize progress at startup so timestamp updates even before new writes
+    prev_prog = _try_load_progress(progress_path) or {}
+    prev_mean = prev_prog.get("mean_reward_running", None)
+    prev_done = prev_prog.get("done", None)
+
+    # Running mean reward of BEST (one per board)
+    running_sum = 0.0
+    running_n = 0
+
+    # Running stats for best-of-N uplift vs average candidate
+    uplift_sum = 0.0
+    uplift_n = 0
+    cand_avg_sum = 0.0
+    cand_std_sum = 0.0
+    cand_valid_frac_sum = 0.0
+
+    # Valid-only variants
+    uplift_valid_sum = 0.0
+    uplift_valid_n = 0
+    cand_avg_valid_sum = 0.0
+
+    # If prior progress is consistent with what we found, carry forward mean approx
+    try:
+        if prev_mean is not None and prev_done is not None and int(prev_done) == len(done_ids):
+            running_n = int(prev_done)
+            running_sum = float(prev_mean) * float(prev_done)
+
+            # Carry forward uplift stats if they exist in the progress file.
+            prev_cand_avg = prev_prog.get("mean_candidate_reward_running", None)
+            prev_uplift = prev_prog.get("mean_best_minus_avg_reward_running", None)
+            prev_cand_std = prev_prog.get("candidate_reward_std_running", None)
+            prev_valid_frac = prev_prog.get("candidate_valid_frac_running", None)
+
+            if prev_cand_avg is not None and prev_uplift is not None:
+                uplift_n = int(prev_done)
+                cand_avg_sum = float(prev_cand_avg) * float(prev_done)
+                uplift_sum = float(prev_uplift) * float(prev_done)
+
+            if prev_cand_std is not None:
+                cand_std_sum = float(prev_cand_std) * float(prev_done)
+
+            if prev_valid_frac is not None:
+                cand_valid_frac_sum = float(prev_valid_frac) * float(prev_done)
+
+            prev_cand_avg_valid = prev_prog.get("mean_candidate_reward_valid_running", None)
+            prev_uplift_valid = prev_prog.get("mean_best_minus_avg_reward_valid_running", None)
+            prev_uplift_valid_done = prev_prog.get("uplift_valid_done", None)
+            if (
+                prev_cand_avg_valid is not None
+                and prev_uplift_valid is not None
+                and prev_uplift_valid_done is not None
+            ):
+                uplift_valid_n = int(prev_uplift_valid_done)
+                cand_avg_valid_sum = float(prev_cand_avg_valid) * float(uplift_valid_n)
+                uplift_valid_sum = float(prev_uplift_valid) * float(uplift_valid_n)
+    except Exception:
+        running_sum = 0.0
+        running_n = 0
+
+        uplift_sum = 0.0
+        uplift_n = 0
+        cand_avg_sum = 0.0
+        cand_std_sum = 0.0
+        cand_valid_frac_sum = 0.0
+
+        uplift_valid_sum = 0.0
+        uplift_valid_n = 0
+        cand_avg_valid_sum = 0.0
+
+    save_progress(
+        progress_path,
+        done=len(done_ids),
+        total=shard_total,
+        last_example_id=prev_prog.get("last_example_id"),
+        last_board_id=prev_prog.get("last_board_id"),
+        mean_reward=(running_sum / running_n) if running_n else None,
+        extra={
+            "status": "running",
+            "n_candidates": int(cfg["decoding"]["n_candidates"]),
+            "max_resamples": int(cfg["decoding"]["max_resamples"]),
+            "batch_size": int(batch_size),
+            "shard_id": int(shard_id),
+            "num_shards": int(num_shards),
+            "include_raw_texts": False,
+
+            # best-of-N vs avg candidate stats (running)
+            "uplift_done": int(uplift_n),
+            "mean_candidate_reward_running": (cand_avg_sum / uplift_n) if uplift_n else None,
+            "mean_best_minus_avg_reward_running": (uplift_sum / uplift_n) if uplift_n else None,
+            "candidate_reward_std_running": (cand_std_sum / uplift_n) if uplift_n else None,
+            "candidate_valid_frac_running": (cand_valid_frac_sum / uplift_n) if uplift_n else None,
+
+            # valid-only variant
+            "uplift_valid_done": int(uplift_valid_n),
+            "mean_candidate_reward_valid_running": (cand_avg_valid_sum / uplift_valid_n) if uplift_valid_n else None,
+            "mean_best_minus_avg_reward_valid_running": (uplift_valid_sum / uplift_valid_n) if uplift_valid_n else None,
+        },
+    )
+
     # Models
     gen = make_text_generator(cfg["models"]["spymaster_model_id"], cfg)
     spymaster = gen
@@ -1121,21 +1199,6 @@ def main():
     n_candidates = int(cfg["decoding"]["n_candidates"])
     progress_every = int(cfg.get("decoding", {}).get("progress_every", 50))
 
-    # Paths (use per-shard raw file to avoid concurrent appends)
-    base_raw_path = cfg.get("paths", {}).get("sft_turns_raw_path")
-    if not base_raw_path:
-        raise RuntimeError("paths.sft_turns_raw_path must be set")
-
-    raw_path = Path(base_raw_path)
-    if num_shards > 1:
-        raw_path = shard_path_append_to_suffix(raw_path, shard_id, num_shards)
-
-    done_ids = load_done_example_ids(raw_path)
-    if done_ids:
-        print(f"[shard {shard_id}/{num_shards}] Resuming: found {len(done_ids)} already-written examples in {raw_path}")
-
-    progress_path = raw_path.with_suffix(raw_path.suffix + ".progress.json")
-
     # -------------------------
     # Buffered writer
     # -------------------------
@@ -1144,128 +1207,187 @@ def main():
     writes_since_flush = 0
     FLUSH_EVERY = int(cfg.get("decoding", {}).get("flush_every", 10))
 
-    # Track running reward without storing all records
-    running_sum = 0.0
-    running_n = 0
-
     # NOTE: To keep files small, we do NOT store raw texts for each candidate by default.
-    # Flip this to True if you explicitly want the raw model outputs per candidate.
     INCLUDE_RAW_TEXTS = False
 
     try:
-        for start in range(0, len(boards), max(1, batch_size)):
-            batch = boards[start : start + max(1, batch_size)]
+        # If everything is already done, exit quickly but still mark progress
+        if not boards and len(done_ids) >= shard_total:
+            print(f"[shard {shard_id}/{num_shards}] Nothing to do: done={len(done_ids)}/{shard_total}")
+        else:
+            for start in range(0, len(boards), max(1, batch_size)):
+                batch = boards[start: start + max(1, batch_size)]
 
-            bests, metas, all_cands = run_turns_batched(
-                batch,
-                spymaster,
-                guesser,
-                embedder,  # may be None if directness check disabled
-                cfg,
-                n_candidates=n_candidates,
-                return_candidates=True,  # <-- variance logging
-            )
+                # With the resume fix, batch should contain only not-yet-done examples.
+                bests, metas, all_cands = run_turns_batched(
+                    batch,
+                    spymaster,
+                    guesser,
+                    embedder,  # may be None if directness check disabled
+                    cfg,
+                    n_candidates=n_candidates,
+                    return_candidates=True,  # <-- variance logging
+                )
 
-            for b, best, meta, cands in zip(batch, bests, metas, all_cands):
-                example_id = b["board_id"]
-                if example_id in done_ids:
-                    continue
+                for b, best, meta, cands in zip(batch, bests, metas, all_cands):
+                    example_id = str(b["board_id"])
+                    # Safety check (should rarely hit after filtering)
+                    if example_id in done_ids:
+                        continue
 
-                revealed = [False] * len(b["board_words"])
-                msgs = build_spymaster_messages(b["board_words"], b["labels"], revealed, cfg)
+                    revealed = [False] * len(b["board_words"])
+                    msgs = build_spymaster_messages(b["board_words"], b["labels"], revealed, cfg)
 
-                # Centralized prompt rendering (no duplicated chat-template/thinking logic)
-                prompt = render_prompt(spymaster, msgs, cfg, role="spymaster")
+                    # Centralized prompt rendering (no duplicated chat-template/thinking logic)
+                    prompt = render_prompt(spymaster, msgs, cfg, role="spymaster")
 
-                think_block = extract_think_block(best.raw_spymaster_text)
-                completion = ""
-                if think_block:
-                    completion += think_block + "\n"
-                completion += f"CLUE: {best.clue}\nNUM: {best.num}\n"
+                    think_block = extract_think_block(best.raw_spymaster_text)
+                    completion = ""
+                    if think_block:
+                        completion += think_block + "\n"
+                    completion += f"CLUE: {best.clue}\nNUM: {best.num}\n"
 
-                # Best candidate index (object identity should match; fallback to value match)
-                best_idx = None
-                for j, c in enumerate(cands):
-                    if c is best:
-                        best_idx = j
-                        break
-                if best_idx is None:
+                    # Best candidate index (object identity should match; fallback to value match)
+                    best_idx = None
                     for j, c in enumerate(cands):
-                        if (
-                            c.clue == best.clue
-                            and int(c.num) == int(best.num)
-                            and float(c.reward) == float(best.reward)
-                            and bool(c.valid) == bool(best.valid)
-                        ):
+                        if c is best:
                             best_idx = j
                             break
+                    if best_idx is None:
+                        for j, c in enumerate(cands):
+                            if (
+                                c.clue == best.clue
+                                and int(c.num) == int(best.num)
+                                and float(c.reward) == float(best.reward)
+                                and bool(c.valid) == bool(best.valid)
+                            ):
+                                best_idx = j
+                                break
 
-                cand_payload: List[Dict[str, Any]] = []
-                for c in cands:
-                    cd: Dict[str, Any] = {
-                        "clue": c.clue,
-                        "num": int(c.num),
-                        "valid": bool(c.valid),
-                        "rejection_reason": c.rejection_reason,
-                        "directness": float(c.directness),
-                        "reward": float(c.reward),
-                        "stats": c.stats,
-                        "guess_words": c.guess_words,
-                    }
-                    if INCLUDE_RAW_TEXTS:
-                        cd["raw_spymaster_text"] = c.raw_spymaster_text
-                        cd["raw_guesser_text"] = c.raw_guesser_text
-                    cand_payload.append(cd)
+                    # --- best-of-N uplift stats for this example ---
+                    cand_rewards = [float(c.reward) for c in cands] if cands else []
+                    avg_all = float(np.mean(cand_rewards)) if cand_rewards else 0.0
+                    std_all = float(np.std(cand_rewards)) if cand_rewards else 0.0
+                    uplift_all = float(best.reward) - float(avg_all)
 
-                rec = {
-                    "example_id": example_id,
-                    "board_id": b["board_id"],
-                    "prompt": prompt,
-                    "completion": completion,
-                    "reward": float(best.reward),
-                    "stats": {**best.stats, "directness": float(best.directness)},
-                    "clue_meta": {
-                        "clue": best.clue,
-                        "num": int(best.num),
-                        "valid": bool(best.valid),
-                        "rejected_candidates": int(meta["rejected_total"]),
-                        "rejection_counts": meta["rejection_counts"],
-                    },
-                    "debug": {"guess_words": best.guess_words},
-                    # NEW: variance logging
-                    "best_candidate_idx": best_idx,
-                    "candidates": cand_payload,
-                }
+                    valid_rewards = [float(c.reward) for c in cands if bool(getattr(c, "valid", False))] if cands else []
+                    avg_valid = float(np.mean(valid_rewards)) if valid_rewards else None
+                    uplift_valid = (float(best.reward) - float(avg_valid)) if avg_valid is not None else None
 
-                f_raw.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                writes_since_flush += 1
-                if writes_since_flush >= FLUSH_EVERY:
-                    f_raw.flush()
-                    writes_since_flush = 0
-
-                done_ids.add(example_id)
-
-                running_sum += float(best.reward)
-                running_n += 1
-
-                if len(done_ids) % progress_every == 0:
-                    mean_r = (running_sum / running_n) if running_n else None
-                    save_progress(
-                        progress_path,
-                        done=len(done_ids),
-                        total=len(boards),
-                        last_example_id=rec["example_id"],
-                        last_board_id=rec["board_id"],
-                        mean_reward=mean_r,
-                        extra={
-                            "n_candidates": int(n_candidates),
-                            "max_resamples": int(cfg["decoding"]["max_resamples"]),
-                            "batch_size": int(batch_size),
-                            "shard_id": int(shard_id),
-                            "num_shards": int(num_shards),
-                            "include_raw_texts": bool(INCLUDE_RAW_TEXTS),
-                        },
+                    valid_frac = (
+                        float(np.mean([1.0 if bool(getattr(c, "valid", False)) else 0.0 for c in cands]))
+                        if cands else 0.0
                     )
+
+                    cand_payload: List[Dict[str, Any]] = []
+                    for c in cands:
+                        cd: Dict[str, Any] = {
+                            "clue": c.clue,
+                            "num": int(c.num),
+                            "valid": bool(c.valid),
+                            "rejection_reason": c.rejection_reason,
+                            "directness": float(c.directness),
+                            "reward": float(c.reward),
+                            "stats": c.stats,
+                            "guess_words": c.guess_words,
+                        }
+                        if INCLUDE_RAW_TEXTS:
+                            cd["raw_spymaster_text"] = c.raw_spymaster_text
+                            cd["raw_guesser_text"] = c.raw_guesser_text
+                        cand_payload.append(cd)
+
+                    rec = {
+                        "example_id": example_id,
+                        "board_id": str(b["board_id"]),
+                        "prompt": prompt,
+                        "completion": completion,
+                        "reward": float(best.reward),
+                        "stats": {**best.stats, "directness": float(best.directness)},
+                        "clue_meta": {
+                            "clue": best.clue,
+                            "num": int(best.num),
+                            "valid": bool(best.valid),
+                            "rejected_candidates": int(meta["rejected_total"]),
+                            "rejection_counts": meta["rejection_counts"],
+                        },
+                        "debug": {"guess_words": best.guess_words},
+                        # variance logging
+                        "best_candidate_idx": best_idx,
+                        "candidates": cand_payload,
+
+                        # per-example best-of-N uplift fields
+                        "candidate_reward_mean": float(avg_all),
+                        "candidate_reward_std": float(std_all),
+                        "candidate_valid_frac": float(valid_frac),
+                        "best_minus_avg_reward": float(uplift_all),
+                        "candidate_reward_mean_valid": float(avg_valid) if avg_valid is not None else None,
+                        "best_minus_avg_reward_valid": float(uplift_valid) if uplift_valid is not None else None,
+                    }
+
+                    f_raw.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    writes_since_flush += 1
+                    if writes_since_flush >= FLUSH_EVERY:
+                        f_raw.flush()
+                        writes_since_flush = 0
+
+                    done_ids.add(example_id)
+
+                    # Update running best reward mean
+                    running_sum += float(best.reward)
+                    running_n += 1
+
+                    # Update running uplift stats
+                    cand_avg_sum += float(avg_all)
+                    cand_std_sum += float(std_all)
+                    cand_valid_frac_sum += float(valid_frac)
+                    uplift_sum += float(uplift_all)
+                    uplift_n += 1
+
+                    if avg_valid is not None and uplift_valid is not None:
+                        cand_avg_valid_sum += float(avg_valid)
+                        uplift_valid_sum += float(uplift_valid)
+                        uplift_valid_n += 1
+
+                    if len(done_ids) % progress_every == 0:
+                        mean_r = (running_sum / running_n) if running_n else None
+
+                        mean_cand = (cand_avg_sum / uplift_n) if uplift_n else None
+                        mean_uplift = (uplift_sum / uplift_n) if uplift_n else None
+                        mean_std = (cand_std_sum / uplift_n) if uplift_n else None
+                        mean_vfrac = (cand_valid_frac_sum / uplift_n) if uplift_n else None
+
+                        mean_cand_valid = (cand_avg_valid_sum / uplift_valid_n) if uplift_valid_n else None
+                        mean_uplift_valid = (uplift_valid_sum / uplift_valid_n) if uplift_valid_n else None
+
+                        save_progress(
+                            progress_path,
+                            done=len(done_ids),
+                            total=shard_total,  # keep per-shard total stable across resume
+                            last_example_id=rec["example_id"],
+                            last_board_id=rec["board_id"],
+                            mean_reward=mean_r,
+                            extra={
+                                "n_candidates": int(n_candidates),
+                                "max_resamples": int(cfg["decoding"]["max_resamples"]),
+                                "batch_size": int(batch_size),
+                                "shard_id": int(shard_id),
+                                "num_shards": int(num_shards),
+                                "include_raw_texts": bool(INCLUDE_RAW_TEXTS),
+                                "status": "running",
+
+                                # best-of-N vs avg stats (running)
+                                "uplift_done": int(uplift_n),
+                                "mean_candidate_reward_running": mean_cand,
+                                "mean_best_minus_avg_reward_running": mean_uplift,
+                                "candidate_reward_std_running": mean_std,
+                                "candidate_valid_frac_running": mean_vfrac,
+
+                                # valid-only variant
+                                "uplift_valid_done": int(uplift_valid_n),
+                                "mean_candidate_reward_valid_running": mean_cand_valid,
+                                "mean_best_minus_avg_reward_valid_running": mean_uplift_valid,
+                            },
+                        )
 
         f_raw.flush()
 
@@ -1282,6 +1404,38 @@ def main():
     # Child workers stop here; master will merge + filter.
     if is_child_process() and num_shards > 1:
         print(f"[shard {shard_id}/{num_shards}] done; skipping global filter/merge (master will handle).")
+
+        mean_r = (running_sum / running_n) if running_n else None
+
+        mean_cand = (cand_avg_sum / uplift_n) if uplift_n else None
+        mean_uplift = (uplift_sum / uplift_n) if uplift_n else None
+        mean_std = (cand_std_sum / uplift_n) if uplift_n else None
+        mean_vfrac = (cand_valid_frac_sum / uplift_n) if uplift_n else None
+
+        mean_cand_valid = (cand_avg_valid_sum / uplift_valid_n) if uplift_valid_n else None
+        mean_uplift_valid = (uplift_valid_sum / uplift_valid_n) if uplift_valid_n else None
+
+        save_progress(
+            progress_path,
+            done=len(done_ids),
+            total=shard_total,
+            last_example_id=prev_prog.get("last_example_id"),
+            last_board_id=prev_prog.get("last_board_id"),
+            mean_reward=mean_r,
+            extra={
+                "status": "finished_shard",
+
+                "uplift_done": int(uplift_n),
+                "mean_candidate_reward_running": mean_cand,
+                "mean_best_minus_avg_reward_running": mean_uplift,
+                "candidate_reward_std_running": mean_std,
+                "candidate_valid_frac_running": mean_vfrac,
+
+                "uplift_valid_done": int(uplift_valid_n),
+                "mean_candidate_reward_valid_running": mean_cand_valid,
+                "mean_best_minus_avg_reward_valid_running": mean_uplift_valid,
+            },
+        )
         return
 
     # Single-process mode: filter and write final file
@@ -1291,14 +1445,35 @@ def main():
     print(f"Filtered {len(filtered)}/{len(raw_for_filter)} -> {cfg['paths']['sft_turns_path']}")
 
     mean_r = (running_sum / running_n) if running_n else None
+
+    mean_cand = (cand_avg_sum / uplift_n) if uplift_n else None
+    mean_uplift = (uplift_sum / uplift_n) if uplift_n else None
+    mean_std = (cand_std_sum / uplift_n) if uplift_n else None
+    mean_vfrac = (cand_valid_frac_sum / uplift_n) if uplift_n else None
+
+    mean_cand_valid = (cand_avg_valid_sum / uplift_valid_n) if uplift_valid_n else None
+    mean_uplift_valid = (uplift_valid_sum / uplift_valid_n) if uplift_valid_n else None
+
     save_progress(
         progress_path,
         done=len(done_ids),
-        total=len(boards),
+        total=shard_total,
         last_example_id=None,
         last_board_id=None,
         mean_reward=mean_r,
-        extra={"status": "finished"},
+        extra={
+            "status": "finished",
+
+            "uplift_done": int(uplift_n),
+            "mean_candidate_reward_running": mean_cand,
+            "mean_best_minus_avg_reward_running": mean_uplift,
+            "candidate_reward_std_running": mean_std,
+            "candidate_valid_frac_running": mean_vfrac,
+
+            "uplift_valid_done": int(uplift_valid_n),
+            "mean_candidate_reward_valid_running": mean_cand_valid,
+            "mean_best_minus_avg_reward_valid_running": mean_uplift_valid,
+        },
     )
 
 

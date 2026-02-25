@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -58,7 +58,7 @@ def extract_think_block(text: str) -> str:
     lo = text.lower().rfind("<think>")
     hi = text.lower().rfind("</think>")
     if lo != -1 and hi != -1 and hi > lo:
-        return text[lo : hi + len("</think>")].strip()
+        return text[lo: hi + len("</think>")].strip()
     # Sometimes you might only see </think>; keep everything up to it as "thinking".
     if hi != -1:
         return text[: hi + len("</think>")].strip()
@@ -76,17 +76,27 @@ def filter_examples(records: List[Dict[str, Any]], cfg: Dict[str, Any]) -> List[
     if not records:
         return []
 
+    min_reward = fcfg.get("min_reward", None)
+    min_reward = float(min_reward) if min_reward is not None else None
+
+    def passes_min_reward(r: Dict[str, Any]) -> bool:
+        if min_reward is None:
+            return True
+        return float(r.get("reward", 0.0)) >= min_reward
+
     if mode == "top_percent":
         top_p = float(fcfg["top_percent"])
         rewards = np.array([r["reward"] for r in records], dtype=np.float32)
         thr = float(np.quantile(rewards, 1.0 - top_p))
-        return [r for r in records if float(r["reward"]) >= thr]
+        return [r for r in records if float(r["reward"]) >= thr and passes_min_reward(r)]
 
     if mode == "rule_based":
         min_team = int(fcfg.get("min_team_correct", 0))
         require_no_assassin = bool(fcfg.get("require_no_assassin", False))
         kept = []
         for r in records:
+            if not passes_min_reward(r):
+                continue
             st = r.get("stats", {})
             if int(st.get("n_team", 0)) < min_team:
                 continue
@@ -192,17 +202,70 @@ def main():
     prev_prog = _try_load_progress(progress_path) or {}
     prev_mean = prev_prog.get("mean_reward_running", None)
     prev_done = prev_prog.get("done", None)
+
+    # Running mean reward of BEST (one per board)
     running_sum = 0.0
     running_n = 0
+
+    # Running stats for best-of-N uplift vs average candidate
+    uplift_sum = 0.0
+    uplift_n = 0
+    cand_avg_sum = 0.0
+    cand_std_sum = 0.0
+    cand_valid_frac_sum = 0.0
+
+    # Valid-only variants
+    uplift_valid_sum = 0.0
+    uplift_valid_n = 0
+    cand_avg_valid_sum = 0.0
 
     # If prior progress is consistent with what we found, carry forward mean approx
     try:
         if prev_mean is not None and prev_done is not None and int(prev_done) == len(done_ids):
             running_n = int(prev_done)
             running_sum = float(prev_mean) * float(prev_done)
+
+            # Carry forward uplift stats if they exist in the progress file.
+            prev_cand_avg = prev_prog.get("mean_candidate_reward_running", None)
+            prev_uplift = prev_prog.get("mean_best_minus_avg_reward_running", None)
+            prev_cand_std = prev_prog.get("candidate_reward_std_running", None)
+            prev_valid_frac = prev_prog.get("candidate_valid_frac_running", None)
+
+            if prev_cand_avg is not None and prev_uplift is not None:
+                uplift_n = int(prev_done)
+                cand_avg_sum = float(prev_cand_avg) * float(prev_done)
+                uplift_sum = float(prev_uplift) * float(prev_done)
+
+            if prev_cand_std is not None:
+                cand_std_sum = float(prev_cand_std) * float(prev_done)
+
+            if prev_valid_frac is not None:
+                cand_valid_frac_sum = float(prev_valid_frac) * float(prev_done)
+
+            prev_cand_avg_valid = prev_prog.get("mean_candidate_reward_valid_running", None)
+            prev_uplift_valid = prev_prog.get("mean_best_minus_avg_reward_valid_running", None)
+            prev_uplift_valid_done = prev_prog.get("uplift_valid_done", None)
+            if (
+                prev_cand_avg_valid is not None
+                and prev_uplift_valid is not None
+                and prev_uplift_valid_done is not None
+            ):
+                uplift_valid_n = int(prev_uplift_valid_done)
+                cand_avg_valid_sum = float(prev_cand_avg_valid) * float(uplift_valid_n)
+                uplift_valid_sum = float(prev_uplift_valid) * float(uplift_valid_n)
     except Exception:
         running_sum = 0.0
         running_n = 0
+
+        uplift_sum = 0.0
+        uplift_n = 0
+        cand_avg_sum = 0.0
+        cand_std_sum = 0.0
+        cand_valid_frac_sum = 0.0
+
+        uplift_valid_sum = 0.0
+        uplift_valid_n = 0
+        cand_avg_valid_sum = 0.0
 
     save_progress(
         progress_path,
@@ -219,6 +282,18 @@ def main():
             "shard_id": int(shard_id),
             "num_shards": int(num_shards),
             "include_raw_texts": False,
+
+            # best-of-N vs avg candidate stats (running)
+            "uplift_done": int(uplift_n),
+            "mean_candidate_reward_running": (cand_avg_sum / uplift_n) if uplift_n else None,
+            "mean_best_minus_avg_reward_running": (uplift_sum / uplift_n) if uplift_n else None,
+            "candidate_reward_std_running": (cand_std_sum / uplift_n) if uplift_n else None,
+            "candidate_valid_frac_running": (cand_valid_frac_sum / uplift_n) if uplift_n else None,
+
+            # valid-only variant
+            "uplift_valid_done": int(uplift_valid_n),
+            "mean_candidate_reward_valid_running": (cand_avg_valid_sum / uplift_valid_n) if uplift_valid_n else None,
+            "mean_best_minus_avg_reward_valid_running": (uplift_valid_sum / uplift_valid_n) if uplift_valid_n else None,
         },
     )
 
@@ -254,7 +329,7 @@ def main():
             print(f"[shard {shard_id}/{num_shards}] Nothing to do: done={len(done_ids)}/{shard_total}")
         else:
             for start in range(0, len(boards), max(1, batch_size)):
-                batch = boards[start : start + max(1, batch_size)]
+                batch = boards[start: start + max(1, batch_size)]
 
                 # With the resume fix, batch should contain only not-yet-done examples.
                 bests, metas, all_cands = run_turns_batched(
@@ -302,6 +377,21 @@ def main():
                                 best_idx = j
                                 break
 
+                    # --- best-of-N uplift stats for this example ---
+                    cand_rewards = [float(c.reward) for c in cands] if cands else []
+                    avg_all = float(np.mean(cand_rewards)) if cand_rewards else 0.0
+                    std_all = float(np.std(cand_rewards)) if cand_rewards else 0.0
+                    uplift_all = float(best.reward) - float(avg_all)
+
+                    valid_rewards = [float(c.reward) for c in cands if bool(getattr(c, "valid", False))] if cands else []
+                    avg_valid = float(np.mean(valid_rewards)) if valid_rewards else None
+                    uplift_valid = (float(best.reward) - float(avg_valid)) if avg_valid is not None else None
+
+                    valid_frac = (
+                        float(np.mean([1.0 if bool(getattr(c, "valid", False)) else 0.0 for c in cands]))
+                        if cands else 0.0
+                    )
+
                     cand_payload: List[Dict[str, Any]] = []
                     for c in cands:
                         cd: Dict[str, Any] = {
@@ -337,6 +427,14 @@ def main():
                         # variance logging
                         "best_candidate_idx": best_idx,
                         "candidates": cand_payload,
+
+                        # per-example best-of-N uplift fields
+                        "candidate_reward_mean": float(avg_all),
+                        "candidate_reward_std": float(std_all),
+                        "candidate_valid_frac": float(valid_frac),
+                        "best_minus_avg_reward": float(uplift_all),
+                        "candidate_reward_mean_valid": float(avg_valid) if avg_valid is not None else None,
+                        "best_minus_avg_reward_valid": float(uplift_valid) if uplift_valid is not None else None,
                     }
 
                     f_raw.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -347,11 +445,33 @@ def main():
 
                     done_ids.add(example_id)
 
+                    # Update running best reward mean
                     running_sum += float(best.reward)
                     running_n += 1
 
+                    # Update running uplift stats
+                    cand_avg_sum += float(avg_all)
+                    cand_std_sum += float(std_all)
+                    cand_valid_frac_sum += float(valid_frac)
+                    uplift_sum += float(uplift_all)
+                    uplift_n += 1
+
+                    if avg_valid is not None and uplift_valid is not None:
+                        cand_avg_valid_sum += float(avg_valid)
+                        uplift_valid_sum += float(uplift_valid)
+                        uplift_valid_n += 1
+
                     if len(done_ids) % progress_every == 0:
                         mean_r = (running_sum / running_n) if running_n else None
+
+                        mean_cand = (cand_avg_sum / uplift_n) if uplift_n else None
+                        mean_uplift = (uplift_sum / uplift_n) if uplift_n else None
+                        mean_std = (cand_std_sum / uplift_n) if uplift_n else None
+                        mean_vfrac = (cand_valid_frac_sum / uplift_n) if uplift_n else None
+
+                        mean_cand_valid = (cand_avg_valid_sum / uplift_valid_n) if uplift_valid_n else None
+                        mean_uplift_valid = (uplift_valid_sum / uplift_valid_n) if uplift_valid_n else None
+
                         save_progress(
                             progress_path,
                             done=len(done_ids),
@@ -367,6 +487,18 @@ def main():
                                 "num_shards": int(num_shards),
                                 "include_raw_texts": bool(INCLUDE_RAW_TEXTS),
                                 "status": "running",
+
+                                # best-of-N vs avg stats (running)
+                                "uplift_done": int(uplift_n),
+                                "mean_candidate_reward_running": mean_cand,
+                                "mean_best_minus_avg_reward_running": mean_uplift,
+                                "candidate_reward_std_running": mean_std,
+                                "candidate_valid_frac_running": mean_vfrac,
+
+                                # valid-only variant
+                                "uplift_valid_done": int(uplift_valid_n),
+                                "mean_candidate_reward_valid_running": mean_cand_valid,
+                                "mean_best_minus_avg_reward_valid_running": mean_uplift_valid,
                             },
                         )
 
@@ -385,8 +517,17 @@ def main():
     # Child workers stop here; master will merge + filter.
     if is_child_process() and num_shards > 1:
         print(f"[shard {shard_id}/{num_shards}] done; skipping global filter/merge (master will handle).")
-        # Mark finished for this shard
+
         mean_r = (running_sum / running_n) if running_n else None
+
+        mean_cand = (cand_avg_sum / uplift_n) if uplift_n else None
+        mean_uplift = (uplift_sum / uplift_n) if uplift_n else None
+        mean_std = (cand_std_sum / uplift_n) if uplift_n else None
+        mean_vfrac = (cand_valid_frac_sum / uplift_n) if uplift_n else None
+
+        mean_cand_valid = (cand_avg_valid_sum / uplift_valid_n) if uplift_valid_n else None
+        mean_uplift_valid = (uplift_valid_sum / uplift_valid_n) if uplift_valid_n else None
+
         save_progress(
             progress_path,
             done=len(done_ids),
@@ -394,7 +535,19 @@ def main():
             last_example_id=prev_prog.get("last_example_id"),
             last_board_id=prev_prog.get("last_board_id"),
             mean_reward=mean_r,
-            extra={"status": "finished_shard"},
+            extra={
+                "status": "finished_shard",
+
+                "uplift_done": int(uplift_n),
+                "mean_candidate_reward_running": mean_cand,
+                "mean_best_minus_avg_reward_running": mean_uplift,
+                "candidate_reward_std_running": mean_std,
+                "candidate_valid_frac_running": mean_vfrac,
+
+                "uplift_valid_done": int(uplift_valid_n),
+                "mean_candidate_reward_valid_running": mean_cand_valid,
+                "mean_best_minus_avg_reward_valid_running": mean_uplift_valid,
+            },
         )
         return
 
@@ -405,6 +558,15 @@ def main():
     print(f"Filtered {len(filtered)}/{len(raw_for_filter)} -> {cfg['paths']['sft_turns_path']}")
 
     mean_r = (running_sum / running_n) if running_n else None
+
+    mean_cand = (cand_avg_sum / uplift_n) if uplift_n else None
+    mean_uplift = (uplift_sum / uplift_n) if uplift_n else None
+    mean_std = (cand_std_sum / uplift_n) if uplift_n else None
+    mean_vfrac = (cand_valid_frac_sum / uplift_n) if uplift_n else None
+
+    mean_cand_valid = (cand_avg_valid_sum / uplift_valid_n) if uplift_valid_n else None
+    mean_uplift_valid = (uplift_valid_sum / uplift_valid_n) if uplift_valid_n else None
+
     save_progress(
         progress_path,
         done=len(done_ids),
@@ -412,7 +574,19 @@ def main():
         last_example_id=None,
         last_board_id=None,
         mean_reward=mean_r,
-        extra={"status": "finished"},
+        extra={
+            "status": "finished",
+
+            "uplift_done": int(uplift_n),
+            "mean_candidate_reward_running": mean_cand,
+            "mean_best_minus_avg_reward_running": mean_uplift,
+            "candidate_reward_std_running": mean_std,
+            "candidate_valid_frac_running": mean_vfrac,
+
+            "uplift_valid_done": int(uplift_valid_n),
+            "mean_candidate_reward_valid_running": mean_cand_valid,
+            "mean_best_minus_avg_reward_valid_running": mean_uplift_valid,
+        },
     )
 
 

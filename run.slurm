@@ -9,90 +9,24 @@
 #SBATCH --open-mode=append           # keep logs across requeues (same job id)
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
-#SBATCH --mail-type=NONE             # disable Slurm mails (prevents requeue spam)
+
+# Slurm email (controller-side)
+#SBATCH --mail-user=henryxie@college.harvard.edu
+#SBATCH --mail-type=END,FAIL         # omit REQUEUE to avoid requeue spam
 
 set -euo pipefail
 
+# IMPORTANT: logs/ must exist at *submit time* for the SBATCH --output/--error paths.
+# Run: mkdir -p logs   (before: sbatch this_script.sh)
 mkdir -p logs
-
-# ====== CONFIG: put your email here (in the file) ======
-MAIL_TO="henryxie@college.harvard.edu"
-MAIL_SUBJECT_PREFIX="Codenames Job Done"
-# =======================================================
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0")"
 
-# If we ever fall back to "resubmit with dependency", keep a stable ID for logs + email context.
+# Stable ID for log naming if we fall back to "resubmit with dependency"
 ORIG_JOB_ID="${ORIG_JOB_ID:-${SLURM_JOB_ID:-unknown}}"
 
 REQUEUE_SENT=0
 MAIN_PID=""
-START_TIME="$(date --iso-8601=seconds 2>/dev/null || date)"
-
-send_mail() {
-  local subject="$1"
-  local body="$2"
-
-  if [[ -z "$MAIL_TO" ]]; then
-    echo "[$(date)] MAIL_TO empty; skipping completion email."
-    return 0
-  fi
-
-  if command -v mail >/dev/null 2>&1; then
-    printf "%s\n" "$body" | mail -s "$subject" "$MAIL_TO"
-  elif command -v mailx >/dev/null 2>&1; then
-    printf "%s\n" "$body" | mailx -s "$subject" "$MAIL_TO"
-  elif command -v sendmail >/dev/null 2>&1; then
-    {
-      echo "To: $MAIL_TO"
-      echo "Subject: $subject"
-      echo
-      printf "%s\n" "$body"
-    } | sendmail -t
-  else
-    echo "[$(date)] No mail/mailx/sendmail found; cannot send completion email."
-    return 1
-  fi
-}
-
-on_exit() {
-  local rc=$?
-  local end_time
-  end_time="$(date --iso-8601=seconds 2>/dev/null || date)"
-
-  # If we requeued/resubmitted, do NOT email.
-  if (( REQUEUE_SENT == 1 )); then
-    echo "[$(date)] Exiting due to requeue/resubmit; not sending completion email."
-    return 0
-  fi
-
-  local out_log="logs/${SLURM_JOB_NAME:-job}-${ORIG_JOB_ID}.out"
-  local err_log="logs/${SLURM_JOB_NAME:-job}-${ORIG_JOB_ID}.err"
-
-  local subject="${MAIL_SUBJECT_PREFIX} ${SLURM_JOB_NAME:-job} (${ORIG_JOB_ID}) completed (rc=${rc})"
-  local body
-  body=$(
-    cat <<EOF
-Job completed (not requeued).
-
-Job name:   ${SLURM_JOB_NAME:-unknown}
-Orig jobid: ${ORIG_JOB_ID}
-This jobid: ${SLURM_JOB_ID:-unknown}
-User:       ${USER:-unknown}
-Node(s):    ${SLURM_NODELIST:-unknown}
-Start:      ${START_TIME}
-End:        ${end_time}
-Exit code:  ${rc}
-
-Logs (appended across retries if applicable):
-  OUT: ${out_log}
-  ERR: ${err_log}
-EOF
-  )
-
-  send_mail "$subject" "$body" || true
-}
-trap on_exit EXIT
 
 handle_usr1() {
   # prevent double-trigger in the same run
@@ -109,7 +43,6 @@ handle_usr1() {
   rc=$?
   if (( rc != 0 )); then
     echo "[$(date)] requeue failed (rc=$rc) -> resubmitting with dependency (append to original logs)"
-    # Fallback: new job id, but force logs to append to the ORIGINAL job's log files
     sbatch --dependency=afterany:"$SLURM_JOB_ID" \
           --export=ALL,ORIG_JOB_ID="$ORIG_JOB_ID" \
           --open-mode=append \
@@ -136,7 +69,6 @@ handle_usr1() {
 
   exit 0
 }
-
 trap handle_usr1 USR1
 
 module load miniforge/25.11.0-0
@@ -156,7 +88,7 @@ mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE"
 # --- Run experiment ---
 # Run workload in its own session so we can kill the whole group on USR1 (torchrun-friendly)
 set +e
-setsid python -m src.generate_sft_data --config configs/default.yml &
+setsid torchrun --nproc_per_node=2 -m src.train_lora_sft --config configs/default.yml &
 MAIN_PID=$!
 wait "$MAIN_PID"
 RC=$?
