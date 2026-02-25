@@ -169,9 +169,11 @@ def main():
     )
     model = get_peft_model(model, lora_cfg)
 
-    # --- disable KV cache again after wrapping ---
-    _disable_kv_cache(model)
+    if torch_dtype is not None:
+        model = model.to(dtype=torch_dtype)
 
+    # disable KV cache again after wrapping
+    _disable_kv_cache(model)
     out_dir = ensure_dir(tcfg["output_adapter_dir"])
 
     # -------------------------

@@ -109,7 +109,7 @@ training:
   epochs: 2
   batch_size: 2
   grad_accum: 8
-  max_seq_len: 4096
+  max_seq_len: 2048
   output_adapter_dir: "outputs/sft/lora_spymaster"
   bf16: true
   fp16: false
