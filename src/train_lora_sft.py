@@ -155,7 +155,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch_dtype,
-        attn_implementation="kernels-community/flash-attn2",
+        attn_implementation="flash_attention_2",
     )
 
     # --- disable KV cache during training ---

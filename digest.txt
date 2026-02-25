@@ -299,7 +299,9 @@ dependencies:
       - huggingface-hub>=0.25.0
       - safetensors>=0.4.3
       - tokenizers>=0.19.1
+      
       - kernels
+      - flash-attn --no-build-isolation
 
       # embeddings
       - sentence-transformers>=3.0.0
@@ -3027,7 +3029,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch_dtype,
-        attn_implementation="kernels-community/flash-attn2",
+        attn_implementation="flash_attention_2",
     )
 
     # --- disable KV cache during training ---
