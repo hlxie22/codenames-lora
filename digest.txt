@@ -117,7 +117,8 @@ mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE"
 # --- Run experiment ---
 # Run workload in its own session so we can kill the whole group on USR1 (torchrun-friendly)
 set +e
-setsid torchrun --nproc_per_node=2 -m src.train_lora_sft --config configs/default.yml &
+setsid torchrun --standalone --nnodes=1 --nproc_per_node=2 \
+  -m src.train_lora_sft --config configs/default.yml &
 MAIN_PID=$!
 wait "$MAIN_PID"
 RC=$?
@@ -298,6 +299,7 @@ dependencies:
       - huggingface-hub>=0.25.0
       - safetensors>=0.4.3
       - tokenizers>=0.19.1
+      - kernels
 
       # embeddings
       - sentence-transformers>=3.0.0
@@ -3021,9 +3023,11 @@ def main():
     elif bool(tcfg.get("fp16", False)) and torch.cuda.is_available():
         torch_dtype = torch.float16
 
+    # FlashAttention via HF Kernels Hub
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch_dtype,
+        attn_implementation="kernels-community/flash-attn2",
     )
 
     # --- disable KV cache during training ---

@@ -151,9 +151,11 @@ def main():
     elif bool(tcfg.get("fp16", False)) and torch.cuda.is_available():
         torch_dtype = torch.float16
 
+    # FlashAttention via HF Kernels Hub
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch_dtype,
+        attn_implementation="kernels-community/flash-attn2",
     )
 
     # --- disable KV cache during training ---

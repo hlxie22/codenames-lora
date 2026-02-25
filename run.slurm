@@ -88,7 +88,8 @@ mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE"
 # --- Run experiment ---
 # Run workload in its own session so we can kill the whole group on USR1 (torchrun-friendly)
 set +e
-setsid torchrun --nproc_per_node=2 -m src.train_lora_sft --config configs/default.yml &
+setsid torchrun --standalone --nnodes=1 --nproc_per_node=2 \
+  -m src.train_lora_sft --config configs/default.yml &
 MAIN_PID=$!
 wait "$MAIN_PID"
 RC=$?
