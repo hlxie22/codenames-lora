@@ -114,3 +114,7 @@ training:
   bf16: true
   fp16: false
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+  attn_implementation: "sdpa"
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false

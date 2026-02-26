@@ -1,6 +1,8 @@
+# src/train_lora_sft.py
 from __future__ import annotations
 
 import argparse
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
@@ -9,7 +11,14 @@ import torch
 from torch.utils.data import Dataset
 from transformers.trainer_utils import get_last_checkpoint
 
-from .utils import load_yaml, read_jsonl, ensure_dir, save_config_snapshot, save_run_meta, set_global_seed
+from .utils import (
+    load_yaml,
+    read_jsonl,
+    ensure_dir,
+    save_config_snapshot,
+    save_run_meta,
+    set_global_seed,
+)
 
 
 class SFTDataset(Dataset):
@@ -78,7 +87,6 @@ def _load_or_build_tokcache(
             print(f"Loaded tokenization cache -> {cache_path}")
             return obj["tokenized"]
 
-    # Build cache
     tokenized: List[Dict[str, Any]] = []
     eos = tokenizer.eos_token_id
 
@@ -97,14 +105,13 @@ def _load_or_build_tokcache(
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"model_id": model_id, "max_len": int(max_len), "tokenized": tokenized}, cache_path)
     print(f"Saved tokenization cache -> {cache_path}")
-
     return tokenized
 
 
 def _disable_kv_cache(model: Any) -> None:
     """
     Disable KV cache during training to reduce VRAM usage.
-    For decoder-only LMs, use_cache is useful for generation, not for teacher-forced training.
+    For decoder-only LMs, use_cache is useful for generation, not teacher-forced training.
     """
     try:
         if hasattr(model, "config") and hasattr(model.config, "use_cache"):
@@ -112,7 +119,6 @@ def _disable_kv_cache(model: Any) -> None:
     except Exception:
         pass
 
-    # PEFT wrappers sometimes expose the underlying model as base_model/model
     for attr in ("base_model", "model", "module"):
         try:
             m = getattr(model, attr, None)
@@ -120,6 +126,61 @@ def _disable_kv_cache(model: Any) -> None:
                 m.config.use_cache = False
         except Exception:
             continue
+
+
+def _normalize_attn_impl(raw: Any) -> str | None:
+    """
+    Transformers expects one of: eager, sdpa, flex_attention, flash_attention_2, flash_attention_3.
+    Back-compat: map old kernels hub identifiers to the supported string.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    low = s.lower()
+
+    # Back-compat mapping (your old setting)
+    if low in {"kernels-community/flash-attn2", "flash-attn2", "flash_attn2", "flashattn2"}:
+        return "flash_attention_2"
+    if low in {"kernels-community/flash-attn3", "flash-attn3", "flash_attn3", "flashattn3"}:
+        return "flash_attention_3"
+
+    if low in {"auto", "none", "null"}:
+        return None
+
+    # Pass-through for valid values
+    allowed = {"eager", "sdpa", "flex_attention", "flash_attention_2", "flash_attention_3"}
+    if s in allowed:
+        return s
+    if low in allowed:
+        # preserve canonical lowercase form
+        return low
+
+    print(f"[warn] Unknown training.attn_implementation={s!r}; omitting attn_implementation.")
+    return None
+
+
+def _enable_gradient_checkpointing(model: Any, gc_kwargs: Dict[str, Any] | None) -> None:
+    """
+    Enable GC with compatibility across Transformers versions.
+    Also ensures inputs require grads (important for PEFT+GC on some models).
+    """
+    try:
+        if gc_kwargs is not None:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gc_kwargs)
+        else:
+            model.gradient_checkpointing_enable()
+    except TypeError:
+        # older signature: no kwargs
+        model.gradient_checkpointing_enable()
+
+    # PEFT + checkpointing often needs this for a grad path
+    try:
+        model.enable_input_require_grads()
+    except Exception:
+        pass
 
 
 def main():
@@ -130,6 +191,12 @@ def main():
     cfg = load_yaml(args.config)
     tcfg = cfg["training"]
     set_global_seed(int(tcfg.get("seed", 0)))
+
+    # -------- Gradient checkpointing config --------
+    gc_enabled = bool(tcfg.get("gradient_checkpointing", False))
+    gc_kwargs = None
+    if gc_enabled:
+        gc_kwargs = {"use_reentrant": bool(tcfg.get("gradient_checkpointing_use_reentrant", False))}
 
     # Load data
     records = read_jsonl(cfg["paths"]["sft_turns_path"])
@@ -151,16 +218,24 @@ def main():
     elif bool(tcfg.get("fp16", False)) and torch.cuda.is_available():
         torch_dtype = torch.float16
 
-    # FlashAttention via HF Kernels Hub
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch_dtype,
-        attn_implementation="flash_attention_2",
-    )
+    # Attention implementation (fixes your earlier crash)
+    attn_impl = _normalize_attn_impl(tcfg.get("attn_implementation", "sdpa"))
 
-    # --- disable KV cache during training ---
+    # Build model
+    model_kwargs: Dict[str, Any] = {"torch_dtype": torch_dtype}
+    if attn_impl is not None:
+        model_kwargs["attn_implementation"] = attn_impl
+
+    model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+
+    # Disable KV cache for training (and for gradient checkpointing)
     _disable_kv_cache(model)
 
+    # Enable gradient checkpointing on the base model (before PEFT wrap)
+    if gc_enabled:
+        _enable_gradient_checkpointing(model, gc_kwargs)
+
+    # LoRA
     lora_cfg = LoraConfig(
         r=int(tcfg["r"]),
         lora_alpha=int(tcfg["alpha"]),
@@ -174,15 +249,17 @@ def main():
     if torch_dtype is not None:
         model = model.to(dtype=torch_dtype)
 
-    # disable KV cache again after wrapping
+    # Disable KV cache again after wrapping + re-enable GC (some wrappers/models need it)
     _disable_kv_cache(model)
+    if gc_enabled:
+        _enable_gradient_checkpointing(model, gc_kwargs)
+
     out_dir = ensure_dir(tcfg["output_adapter_dir"])
 
     # -------------------------
     # Pre-tokenize once + cache
     # -------------------------
     max_len = int(tcfg["max_seq_len"])
-    # Put cache next to the SFT file so it follows the dataset
     sft_path = Path(cfg["paths"]["sft_turns_path"])
     cache_path = sft_path.with_suffix(sft_path.suffix + f".tokcache.maxlen{max_len}.pt")
 
@@ -197,7 +274,8 @@ def main():
     ds = SFTDataset(tokenized)
     collator = PadCollator(tokenizer)
 
-    args_tr = TrainingArguments(
+    # TrainingArguments: be compatible across versions wrt gradient_checkpointing_kwargs
+    ta_kwargs: Dict[str, Any] = dict(
         output_dir=str(out_dir),
         per_device_train_batch_size=int(tcfg["batch_size"]),
         gradient_accumulation_steps=int(tcfg["grad_accum"]),
@@ -213,7 +291,19 @@ def main():
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
         ddp_find_unused_parameters=False,
+        gradient_checkpointing=gc_enabled,
     )
+
+    # Only pass gradient_checkpointing_kwargs if TrainingArguments supports it
+    try:
+        sig = inspect.signature(TrainingArguments.__init__)
+        if gc_enabled and gc_kwargs is not None and "gradient_checkpointing_kwargs" in sig.parameters:
+            ta_kwargs["gradient_checkpointing_kwargs"] = gc_kwargs
+    except Exception:
+        # If signature introspection fails, just don't pass kwargs
+        pass
+
+    args_tr = TrainingArguments(**ta_kwargs)
 
     trainer = Trainer(
         model=model,
@@ -224,7 +314,7 @@ def main():
     )
 
     last_ckpt = get_last_checkpoint(str(out_dir))
-    trainer.train(resume_from_checkpoint=last_ckpt)
+    trainer.train(resume_from_checkpoint=last_ckpt if last_ckpt else None)
 
     # Save adapter
     if trainer.is_world_process_zero():
