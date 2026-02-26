@@ -96,3 +96,17 @@ RC=$?
 set -e
 
 exit "$RC"
+
+# set +e
+
+# setsid bash -lc "
+#   python -m src.eval --config configs/default.yml --mode baseline --out outputs/eval/baseline &&
+#   python -m src.eval --config configs/default.yml --mode sft      --out outputs/eval/sft
+# " &
+# MAIN_PID=$!
+
+# wait "$MAIN_PID"
+# RC=$?
+# set -e
+
+# exit "$RC"
