@@ -106,7 +106,7 @@ training:
   alpha: 32
   dropout: 0.05
   lr: 2.0e-4
-  epochs: 2
+  epochs: 10
   batch_size: 2
   grad_accum: 8
   max_seq_len: 2048
@@ -118,3 +118,17 @@ training:
   attn_implementation: "sdpa"
   gradient_checkpointing: true
   gradient_checkpointing_use_reentrant: false
+
+epoch_eval:
+  gsm8k_n: 30
+  gsm8k_max_new_tokens: 2048
+
+  humaneval_n: 20
+  humaneval_max_new_tokens: 2048
+  humaneval_timeout_s: 3
+
+  wikitext_n: 50
+  wikitext_block_size: 512
+  wikitext_max_blocks: 80
+
+  codenames_n_boards: 50

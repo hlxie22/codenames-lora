@@ -20,6 +20,16 @@ from .utils import (
     set_global_seed,
 )
 
+from transformers import TrainerCallback
+from .epoch_eval import (
+    load_probe_samples,
+    eval_gsm8k,
+    eval_humaneval,
+    eval_wikitext2_ppl,
+    eval_codenames_subset,
+    plot_epoch_history,
+)
+
 
 class SFTDataset(Dataset):
     """
@@ -182,6 +192,164 @@ def _enable_gradient_checkpointing(model: Any, gc_kwargs: Dict[str, Any] | None)
     except Exception:
         pass
 
+class EpochEvalCallback(TrainerCallback):
+    """
+    - Collects train loss / grad norm from on_log()
+    - Runs GSM8K, HumanEval, WikiText-2 PPL, and Codenames subset eval at on_epoch_end()
+    - Appends results to metrics_history.jsonl and rewrites plots
+    """
+    def __init__(self, cfg: Dict[str, Any], out_dir: Path):
+        self.cfg = cfg
+        self.out_dir = out_dir
+        self.eval_dir = out_dir / "epoch_eval"
+        self.history_path = self.eval_dir / "metrics_history.jsonl"
+        self.plots_dir = self.eval_dir / "plots"
+
+        # per-epoch log accumulation
+        self._epoch_losses: List[float] = []
+        self._epoch_grad_norms: List[float] = []
+
+        self._ema: Optional[float] = None
+        self._ema_beta = 0.7  # epoch-level EMA smoothing
+
+        # loaded once
+        self.samples = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+
+        self.eval_dir.mkdir(parents=True, exist_ok=True)
+        self.plots_dir.mkdir(parents=True, exist_ok=True)
+
+        # probe sample sizes (you can tune these)
+        seed = int(self.cfg["training"].get("seed", 0)) + 12345
+        self.samples = load_probe_samples(
+            seed=seed,
+            gsm8k_n=int(self.cfg.get("epoch_eval", {}).get("gsm8k_n", 50)),
+            humaneval_n=int(self.cfg.get("epoch_eval", {}).get("humaneval_n", 20)),
+            wikitext_n=int(self.cfg.get("epoch_eval", {}).get("wikitext_n", 50)),
+        )
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        if not logs:
+            return
+        # Trainer typically logs "loss" frequently
+        if "loss" in logs:
+            try:
+                self._epoch_losses.append(float(logs["loss"]))
+            except Exception:
+                pass
+        # grad_norm is only present if your Trainer/logging emits it
+        if "grad_norm" in logs:
+            try:
+                self._epoch_grad_norms.append(float(logs["grad_norm"]))
+            except Exception:
+                pass
+
+    def _append_history(self, row: Dict[str, Any]) -> None:
+        self.history_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.history_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        if self.samples is None:
+            return
+
+        model = kwargs.get("model", None)
+        tokenizer = kwargs.get("tokenizer", None)
+        if model is None or tokenizer is None:
+            return
+
+        # unwrap DDP
+        if hasattr(model, "module"):
+            model = model.module
+
+        device = model.device if hasattr(model, "device") else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Temporarily enable use_cache for faster generation (optional)
+        orig_use_cache = None
+        try:
+            if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+                orig_use_cache = model.config.use_cache
+                model.config.use_cache = True
+        except Exception:
+            pass
+
+        # ---- train loss aggregation (from logs) ----
+        loss_mean = float(sum(self._epoch_losses) / max(1, len(self._epoch_losses))) if self._epoch_losses else float("nan")
+        self._epoch_losses.clear()
+
+        if self._ema is None or math.isnan(self._ema):
+            self._ema = loss_mean
+        else:
+            self._ema = self._ema_beta * self._ema + (1.0 - self._ema_beta) * loss_mean
+
+        grad_mean = float(sum(self._epoch_grad_norms) / max(1, len(self._epoch_grad_norms))) if self._epoch_grad_norms else float("nan")
+        self._epoch_grad_norms.clear()
+
+        # ---- run probe evals ----
+        # Keep these small so epoch end stays quick.
+        gsm = eval_gsm8k(
+            model=model,
+            tokenizer=tokenizer,
+            samples=self.samples.gsm8k,
+            device=device,
+            max_new_tokens=int(self.cfg.get("epoch_eval", {}).get("gsm8k_max_new_tokens", 384)),
+        )
+        he = eval_humaneval(
+            model=model,
+            tokenizer=tokenizer,
+            samples=self.samples.humaneval,
+            device=device,
+            max_new_tokens=int(self.cfg.get("epoch_eval", {}).get("humaneval_max_new_tokens", 384)),
+            timeout_s=int(self.cfg.get("epoch_eval", {}).get("humaneval_timeout_s", 3)),
+        )
+        wt = eval_wikitext2_ppl(
+            model=model,
+            tokenizer=tokenizer,
+            texts=self.samples.wikitext,
+            device=device,
+            block_size=int(self.cfg.get("epoch_eval", {}).get("wikitext_block_size", 512)),
+            max_blocks=int(self.cfg.get("epoch_eval", {}).get("wikitext_max_blocks", 80)),
+        )
+
+        cn = eval_codenames_subset(
+            cfg=self.cfg,
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            n_boards=int(self.cfg.get("epoch_eval", {}).get("codenames_n_boards", 100)),
+            seed=int(self.cfg["training"].get("seed", 0)) + 999,
+        )
+
+        # restore cache
+        try:
+            if orig_use_cache is not None and hasattr(model, "config") and hasattr(model.config, "use_cache"):
+                model.config.use_cache = orig_use_cache
+        except Exception:
+            pass
+
+        row = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "epoch": float(state.epoch) if state.epoch is not None else None,
+
+            "train_loss_epoch_mean": loss_mean,
+            "train_loss_epoch_ema": float(self._ema) if self._ema is not None else None,
+            "grad_norm_epoch_mean": grad_mean if not math.isnan(grad_mean) else None,
+
+            **gsm,
+            **he,
+            **wt,
+            **cn,
+        }
+
+        self._append_history(row)
+        plot_epoch_history(self.history_path, self.plots_dir)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -312,6 +480,9 @@ def main():
         data_collator=collator,
         tokenizer=tokenizer,
     )
+
+    # Add epoch-end evaluation + plotting
+    trainer.add_callback(EpochEvalCallback(cfg, out_dir))
 
     last_ckpt = get_last_checkpoint(str(out_dir))
     trainer.train(resume_from_checkpoint=last_ckpt if last_ckpt else None)
