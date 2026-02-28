@@ -120,15 +120,15 @@ training:
   gradient_checkpointing_use_reentrant: false
 
 epoch_eval:
-  gsm8k_n: 30
+  gsm8k_n: 10
   gsm8k_max_new_tokens: 2048
 
-  humaneval_n: 20
+  humaneval_n: 10
   humaneval_max_new_tokens: 2048
   humaneval_timeout_s: 3
 
-  wikitext_n: 50
+  wikitext_n: 20
   wikitext_block_size: 512
   wikitext_max_blocks: 80
 
-  codenames_n_boards: 50
+  codenames_n_boards: 20
