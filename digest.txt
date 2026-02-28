@@ -4122,6 +4122,7 @@ class EpochEvalCallback(TrainerCallback):
         self.eval_dir = out_dir / "epoch_eval"
         self.history_path = self.eval_dir / "metrics_history.jsonl"
         self.plots_dir = self.eval_dir / "plots"
+        self._tok = None
 
         # per-epoch log accumulation
         self._epoch_losses: List[float] = []
@@ -4148,6 +4149,8 @@ class EpochEvalCallback(TrainerCallback):
             humaneval_n=int(self.cfg.get("epoch_eval", {}).get("humaneval_n", 20)),
             wikitext_n=int(self.cfg.get("epoch_eval", {}).get("wikitext_n", 50)),
         )
+
+        self._tok = kwargs.get("tokenizer") or kwargs.get("processing_class") or self._tok
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not state.is_world_process_zero:
@@ -4179,7 +4182,7 @@ class EpochEvalCallback(TrainerCallback):
             return
 
         model = kwargs.get("model", None)
-        tokenizer = kwargs.get("tokenizer", None)
+        tokenizer = self._tok or kwargs.get("tokenizer") or kwargs.get("processing_class")
         if model is None or tokenizer is None:
             return
 
