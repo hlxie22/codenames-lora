@@ -1,1 +1,3 @@
 # /run.slurm
+/data/
+/outputs/

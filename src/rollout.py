@@ -1,4 +1,3 @@
-# src/rollout.py
 from __future__ import annotations
 
 import re
@@ -7,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple, overload, Literal
 
 from .gen_cfg import guesser_gen_cfg, spymaster_gen_cfg
 from .model_wrappers import Embedder, TextGenerator
-from .prompting import render_prompt
+from .prompting import render_prompt, generate_from_messages
 from .rules import is_valid_clue, normalize_word, score_turn
 from .spymaster_prompt import build_spymaster_messages
 from .guesser_prompt import build_guesser_messages
@@ -105,18 +104,16 @@ def run_one_candidate(
     sp_msgs = build_spymaster_messages(board_words, labels, revealed_mask, cfg)
     sp_gen = spymaster_gen_cfg(cfg)
 
-    use_chat = bool(cfg.get("qwen", {}).get("use_chat_template", False))
-    sp_think = bool(cfg.get("qwen", {}).get("enable_thinking_spymaster", True))
-
-    sp_text = spymaster.generate(
-        sp_msgs if use_chat else sp_msgs[-1]["content"],
+    sp_text = generate_from_messages(
+        spymaster,
+        sp_msgs,
         sp_gen,
+        cfg,
+        role="spymaster",
         seed=seed,
-        use_chat_template=use_chat,
-        enable_thinking=sp_think,
     )
-    clue, num = parse_spymaster_output(sp_text)
 
+    clue, num = parse_spymaster_output(sp_text)
     if clue is None or num is None:
         return CandidateResult(
             clue=clue or "",
@@ -149,14 +146,14 @@ def run_one_candidate(
     # --- guesser
     g_msgs = build_guesser_messages(board_words, revealed_mask, clue, int(num), cfg)
     g_gen = guesser_gen_cfg(cfg)
-    g_think = bool(cfg.get("qwen", {}).get("enable_thinking_guesser", True))
 
-    g_text = guesser.generate(
-        g_msgs if use_chat else g_msgs[-1]["content"],
+    g_text = generate_from_messages(
+        guesser,
+        g_msgs,
         g_gen,
+        cfg,
+        role="guesser",
         seed=seed,
-        use_chat_template=use_chat,
-        enable_thinking=g_think,
     )
 
     guesses_raw = parse_guesser_output(g_text)
@@ -215,7 +212,6 @@ def run_turn(
             rejection_counts[res.rejection_reason] = rejection_counts.get(res.rejection_reason, 0) + 1
 
         if got is None:
-            # record the last invalid result if we never got a valid one
             got = last_res if last_res is not None else CandidateResult(
                 clue="",
                 num=0,
@@ -263,6 +259,7 @@ def run_turns_batched(
     n_candidates: int,
     return_candidates: Literal[False] = False,
 ) -> Tuple[List[CandidateResult], List[Dict[str, Any]]]: ...
+
 
 @overload
 def run_turns_batched(
@@ -344,9 +341,7 @@ def run_turns_batched(
     rej_total_per_board: List[int] = [0 for _ in boards_batch]
 
     for ci in range(n_candidates):
-        # tuple: (clue, num, is_valid, reason, directness, raw_spymaster_text, used_seed)
         got: List[Optional[Tuple[str, int, bool, str, float, str, int]]] = [None] * len(boards_batch)
-
         pending = list(range(len(boards_batch)))
         last_text: Dict[int, str] = {}
         last_seed: Dict[int, int] = {}

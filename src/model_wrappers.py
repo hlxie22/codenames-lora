@@ -1,9 +1,42 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable, Union
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 import numpy as np
+
+
+# -------------------------
+# One canonical chat-template helper
+# -------------------------
+
+def apply_chat_template(
+    tokenizer: Any,
+    messages: List[Dict[str, str]],
+    *,
+    add_generation_prompt: bool = True,
+    enable_thinking: bool = True,
+) -> str:
+    """
+    Centralized compatibility wrapper for tokenizer.apply_chat_template signature drift.
+
+    Some tokenizers (e.g., Qwen3) accept enable_thinking=...
+    Others do not. This wrapper tries with enable_thinking and falls back cleanly.
+    """
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+
 
 @dataclass
 class GenerationConfig:
@@ -11,6 +44,7 @@ class GenerationConfig:
     top_p: float
     max_new_tokens: int
     top_k: int | None = None
+
 
 @runtime_checkable
 class TextGenerator(Protocol):
@@ -34,10 +68,12 @@ class TextGenerator(Protocol):
         enable_thinking: bool = True,
     ) -> str: ...
 
+
 class VLLMTextGenerator:
     """
     Thin wrapper around vLLM offline inference.
     """
+
     def __init__(
         self,
         model_id: str,
@@ -84,19 +120,12 @@ class VLLMTextGenerator:
         add_generation_prompt: bool = True,
         enable_thinking: bool = True,
     ) -> str:
-        try:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-                enable_thinking=enable_thinking,
-            )
-        except TypeError:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-            )
+        return apply_chat_template(
+            self.tokenizer,
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        )
 
     def generate(
         self,
@@ -120,7 +149,6 @@ class VLLMTextGenerator:
             assert isinstance(prompt_or_messages, str)
             prompt = prompt_or_messages
 
-        # vLLM: max_tokens == your max_new_tokens
         sp = SamplingParams(
             temperature=float(gen_cfg.temperature),
             top_p=float(gen_cfg.top_p),
@@ -130,7 +158,6 @@ class VLLMTextGenerator:
         )
 
         outs = self.llm.generate([prompt], sp, lora_request=self._lora_request)
-        # vLLM returns RequestOutput objects; generated text is output.outputs[0].text
         return outs[0].outputs[0].text
 
     def generate_batch(
@@ -159,13 +186,16 @@ class VLLMTextGenerator:
         outs = self.llm.generate(prompts, sps, lora_request=self._lora_request)
         return [o.outputs[0].text for o in outs]
 
+
 class HFTextGenerator:
     """
     Thin wrapper around transformers generation for reproducible calls.
     """
+
     def __init__(self, model_id: str, device_map: str = "auto", torch_dtype: str | None = None):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         import torch
+
         self.model_id = model_id
 
         dtype = None
@@ -190,20 +220,12 @@ class HFTextGenerator:
         add_generation_prompt: bool = True,
         enable_thinking: bool = True,
     ) -> str:
-        # Qwen3 supports enable_thinking in apply_chat_template; fall back if tokenizer doesn't accept it.
-        try:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-                enable_thinking=enable_thinking,
-            )
-        except TypeError:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-            )
+        return apply_chat_template(
+            self.tokenizer,
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        )
 
     def generate(
         self,
@@ -255,13 +277,14 @@ def load_lora_on_generator(base_generator: TextGenerator, adapter_dir: str) -> T
     """
     if isinstance(base_generator, HFTextGenerator):
         from peft import PeftModel
+
         base_generator.model = PeftModel.from_pretrained(base_generator.model, adapter_dir)
         base_generator.model.eval()
         return base_generator
 
     if isinstance(base_generator, VLLMTextGenerator):
         from vllm.lora.request import LoRARequest
-        # stable-ish ID (vLLM requires a globally unique int per adapter)
+
         lora_int_id = abs(hash(adapter_dir)) % (2**31)
         base_generator._lora_request = LoRARequest("codenames-lora", int(lora_int_id), adapter_dir)
         return base_generator
@@ -282,6 +305,7 @@ class Embedder:
     Embeds single tokens/words/short strings with caching.
     Uses sentence-transformers if available; otherwise uses a HF encoder with mean pooling.
     """
+
     def __init__(self, model_id: str, device: str = "cpu"):
         self.model_id = model_id
         self.device = device
@@ -292,15 +316,15 @@ class Embedder:
         self._hf_tok = None
         self._hf_model = None
 
-        # Prefer sentence-transformers if installed and model_id looks like one
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
+
             self._st_model = SentenceTransformer(model_id, device=device)
             self._mode = "st"
         except Exception:
             self._mode = "hf"
             from transformers import AutoModel, AutoTokenizer
-            import torch
+
             self._hf_tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
             self._hf_model = AutoModel.from_pretrained(model_id)
             self._hf_model.to(device)
@@ -314,17 +338,16 @@ class Embedder:
         if self._mode == "st":
             vec = np.asarray(self._st_model.encode([text], normalize_embeddings=True)[0], dtype=np.float32)
         else:
-            # HF encoder mean pooling
             import torch
+
             assert self._hf_tok is not None and self._hf_model is not None
             with torch.no_grad():
                 toks = self._hf_tok([text], return_tensors="pt", padding=True, truncation=True).to(self.device)
                 out = self._hf_model(**toks)
-                last = out.last_hidden_state  # (B,T,H)
-                mask = toks["attention_mask"].unsqueeze(-1)  # (B,T,1)
+                last = out.last_hidden_state
+                mask = toks["attention_mask"].unsqueeze(-1)
                 pooled = (last * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
                 vec = pooled[0].detach().cpu().numpy().astype(np.float32)
-                # normalize
                 n = np.linalg.norm(vec) + 1e-12
                 vec = vec / n
 

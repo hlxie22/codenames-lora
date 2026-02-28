@@ -8,6 +8,7 @@ Directory structure:
     └── src/
         ├── __init__.py
         ├── build_vocab.py
+        ├── chat_formatting.py
         ├── epoch_eval.py
         ├── eval.py
         ├── gen_cfg.py
@@ -22,6 +23,7 @@ Directory structure:
         ├── rollout.py
         ├── rules.py
         ├── spymaster_prompt.py
+        ├── think_utils.py
         ├── train_lora_sft.py
         └── utils.py
 
@@ -146,35 +148,37 @@ CLEAN="${CLEAN:-0}"
 # exit "$RC"
 
 # Run workload in its own session so we can kill the whole group on USR1 (torchrun-friendly)
-# set +e
-# setsid torchrun --standalone --nnodes=1 --nproc_per_node=2 \
-#   -m src.train_lora_sft --config configs/default.yml &
-# MAIN_PID=$!
-# wait "$MAIN_PID"
-# RC=$?
-# set -e
-
-# exit "$RC"
-
 set +e
-
-setsid bash -lc "
-  python -m src.eval --config configs/default.yml --mode baseline --out outputs/eval/baseline &&
-  python -m src.eval --config configs/default.yml --mode sft      --out outputs/eval/sft
-" &
+setsid torchrun --standalone --nnodes=1 --nproc_per_node=2 \
+  -m src.train_lora_sft --config configs/default.yml &
 MAIN_PID=$!
-
 wait "$MAIN_PID"
 RC=$?
 set -e
 
 exit "$RC"
 
+# set +e
+
+# setsid bash -lc "
+#   python -m src.eval --config configs/default.yml --mode baseline --out outputs/eval/baseline &&
+#   python -m src.eval --config configs/default.yml --mode sft      --out outputs/eval/sft
+# " &
+# MAIN_PID=$!
+
+# wait "$MAIN_PID"
+# RC=$?
+# set -e
+
+# exit "$RC"
+
 
 ================================================
 FILE: .gitingestignore
 ================================================
 # /run.slurm
+/data/
+/outputs/
 
 
 ================================================
@@ -288,7 +292,7 @@ training:
   alpha: 32
   dropout: 0.05
   lr: 2.0e-4
-  epochs: 2
+  epochs: 10
   batch_size: 2
   grad_accum: 8
   max_seq_len: 2048
@@ -330,6 +334,7 @@ dependencies:
   - git-lfs
   - setuptools
   - wheel
+  - matplotlib
 
   # core utilities
   - numpy>=1.26
@@ -686,6 +691,55 @@ if __name__ == "__main__":
 
 
 ================================================
+FILE: src/chat_formatting.py
+================================================
+# src/chat_formatting.py
+from __future__ import annotations
+
+from typing import Any, Dict, List, Literal
+
+Role = Literal["spymaster", "guesser", "generic"]
+
+
+def cfg_use_chat_template(cfg: Dict[str, Any]) -> bool:
+    return bool(cfg.get("qwen", {}).get("use_chat_template", False))
+
+
+def cfg_enable_thinking(cfg: Dict[str, Any], role: Role) -> bool:
+    q = cfg.get("qwen", {}) or {}
+    if role == "spymaster":
+        return bool(q.get("enable_thinking_spymaster", True))
+    if role == "guesser":
+        return bool(q.get("enable_thinking_guesser", True))
+    return bool(q.get("enable_thinking", True))
+
+
+def apply_chat_template(
+    tokenizer: Any,
+    messages: List[Dict[str, str]],
+    *,
+    add_generation_prompt: bool = True,
+    enable_thinking: bool = True,
+) -> str:
+    """
+    One canonical place to handle tokenizer.apply_chat_template signature drift.
+    """
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+
+
+================================================
 FILE: src/epoch_eval.py
 ================================================
 # src/epoch_eval.py
@@ -703,43 +757,53 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from .model_wrappers import apply_chat_template  # <-- centralized enable_thinking fallback
+from .think_utils import extract_think as _extract_think, strip_think_blocks as _strip_think_blocks
+
 # --------- small helpers ---------
 
-_THINK_RE = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
 _FINAL_RE = re.compile(r"FINAL\s*:\s*(.+)", re.IGNORECASE)
 _GSM8K_REF_RE = re.compile(r"####\s*([^\n]+)")
 
+
 def extract_think_span(text: str) -> str:
-    m = _THINK_RE.search(text or "")
-    return (m.group(1).strip() if m else "")
+    """
+    Back-compat wrapper (previously regex-based in this file).
+    Returns inner content of the FIRST closed <think>...</think> block.
+    """
+    return _extract_think(text, mode="inner", which="first", allow_partial=False)
+
 
 def strip_think_blocks(text: str) -> str:
-    return _THINK_RE.sub("", text or "")
+    """
+    Back-compat wrapper (previously regex-based in this file).
+    Removes all CLOSED <think>...</think> blocks.
+    """
+    return _strip_think_blocks(text, remove_dangling_tags=True)
+
 
 def count_tokens(tokenizer, text: str) -> int:
     if not text:
         return 0
     return len(tokenizer(text, add_special_tokens=False)["input_ids"])
 
+
 def normalize_number_str(s: str) -> str:
     s = (s or "").strip()
-    # keep leading '-' and digits / decimal
     s = s.replace(",", "")
-    # common wrappers
     s = s.strip().strip("`").strip()
-    # if it looks like an int/float, normalize int-ish floats
     try:
         if re.fullmatch(r"[-+]?\d+(\.\d+)?", s):
             if "." in s:
                 f = float(s)
                 if abs(f - round(f)) < 1e-9:
                     return str(int(round(f)))
-                # keep limited precision to avoid float noise
                 return str(f).rstrip("0").rstrip(".")
             return str(int(s))
     except Exception:
         pass
     return s
+
 
 def parse_gsm8k_ref(answer: str) -> str:
     m = _GSM8K_REF_RE.search(answer or "")
@@ -747,22 +811,18 @@ def parse_gsm8k_ref(answer: str) -> str:
         return normalize_number_str(answer)
     return normalize_number_str(m.group(1))
 
+
 def parse_gsm8k_pred(text: str) -> Optional[str]:
     text = text or ""
     m = _FINAL_RE.search(text)
     if m:
-        # take first token on that line
         line = m.group(1).strip().splitlines()[0].strip()
-        # sometimes model outputs "42." etc
         return normalize_number_str(line.strip().rstrip("."))
-    # fallback: last number in text
-    nums = re.findall(r"[-+]?\d+(\.\d+)?", text.replace(",", ""))
-    if nums:
-        # re.findall with groups returns tuples sometimes; redo without groups:
-        nums2 = re.findall(r"[-+]?\d+(?:\.\d+)?", text.replace(",", ""))
-        if nums2:
-            return normalize_number_str(nums2[-1])
+    nums2 = re.findall(r"[-+]?\d+(?:\.\d+)?", text.replace(",", ""))
+    if nums2:
+        return normalize_number_str(nums2[-1])
     return None
+
 
 def extract_code_from_completion(text: str) -> str:
     """
@@ -773,24 +833,34 @@ def extract_code_from_completion(text: str) -> str:
     """
     t = strip_think_blocks(text or "").strip()
 
-    # fenced code
     fence = re.search(r"```(?:python)?\s*(.*?)```", t, re.DOTALL | re.IGNORECASE)
     if fence:
         return fence.group(1).strip()
 
-    # start at first def
     idx = t.find("def ")
     if idx != -1:
         return t[idx:].strip()
 
     return t
 
+
 # --------- HumanEval sandbox runner ---------
 
 _ALLOWED_IMPORTS = {
-    "math", "itertools", "functools", "collections", "re", "string",
-    "heapq", "bisect", "typing", "statistics", "fractions", "decimal"
+    "math",
+    "itertools",
+    "functools",
+    "collections",
+    "re",
+    "string",
+    "heapq",
+    "bisect",
+    "typing",
+    "statistics",
+    "fractions",
+    "decimal",
 }
+
 
 def _limited_import(name, globals=None, locals=None, fromlist=(), level=0):
     root = (name or "").split(".")[0]
@@ -798,24 +868,42 @@ def _limited_import(name, globals=None, locals=None, fromlist=(), level=0):
         return __import__(name, globals, locals, fromlist, level)
     raise ImportError(f"Import blocked: {name}")
 
+
 def _safe_builtins() -> Dict[str, Any]:
-    # keep this minimal; HumanEval tasks usually need basic python only
     allowed = {
-        "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict, "enumerate": enumerate,
-        "float": float, "int": int, "len": len, "list": list, "max": max, "min": min,
-        "range": range, "reversed": reversed, "round": round, "set": set, "sorted": sorted,
-        "str": str, "sum": sum, "tuple": tuple, "zip": zip,
+        "abs": abs,
+        "all": all,
+        "any": any,
+        "bool": bool,
+        "dict": dict,
+        "enumerate": enumerate,
+        "float": float,
+        "int": int,
+        "len": len,
+        "list": list,
+        "max": max,
+        "min": min,
+        "range": range,
+        "reversed": reversed,
+        "round": round,
+        "set": set,
+        "sorted": sorted,
+        "str": str,
+        "sum": sum,
+        "tuple": tuple,
+        "zip": zip,
         "__import__": _limited_import,
     }
     return allowed
+
 
 def _humaneval_worker(payload: Dict[str, Any], q) -> None:
     """
     Runs in a subprocess. Returns (passed: bool, err: str|None)
     """
     try:
-        # hard timeout via alarm
         import signal
+
         signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError("timeout")))
         signal.alarm(int(payload.get("timeout_s", 3)))
 
@@ -831,7 +919,6 @@ def _humaneval_worker(payload: Dict[str, Any], q) -> None:
 
         exec(test, env, env)
 
-        # Most HumanEval tests define check(candidate)
         check = env.get("check", None)
         if check is None:
             q.put((False, "missing check() in test"))
@@ -842,6 +929,7 @@ def _humaneval_worker(payload: Dict[str, Any], q) -> None:
     except Exception as e:
         q.put((False, f"{type(e).__name__}: {e}"))
 
+
 def run_humaneval_case(code: str, test: str, entry_point: str, timeout_s: int = 3) -> Tuple[bool, Optional[str]]:
     """
     Executes in a separate process with:
@@ -850,6 +938,7 @@ def run_humaneval_case(code: str, test: str, entry_point: str, timeout_s: int = 
       - hard timeout
     """
     import multiprocessing as mp
+
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     p = ctx.Process(
@@ -867,6 +956,7 @@ def run_humaneval_case(code: str, test: str, entry_point: str, timeout_s: int = 
     except Exception:
         return (False, "No result")
 
+
 # --------- Model wrapper for codenames rollout ---------
 
 class InMemoryHFGenerator:
@@ -874,6 +964,7 @@ class InMemoryHFGenerator:
     Minimal TextGenerator-like wrapper around an in-memory (Peft) model + tokenizer.
     Implements generate() and generate_batch() (sequential per-item seeds).
     """
+
     def __init__(self, model, tokenizer, *, disable_adapter: bool = False):
         self.model = model
         self.tokenizer = tokenizer
@@ -884,35 +975,35 @@ class InMemoryHFGenerator:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def format_chat(self, messages: List[Dict[str, str]], *, add_generation_prompt=True, enable_thinking=True) -> str:
-        try:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-                enable_thinking=enable_thinking,
-            )
-        except TypeError:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-            )
+        return apply_chat_template(
+            self.tokenizer,
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        )
 
     def _maybe_disable_adapter_ctx(self):
         m = self.model
         if not self._disable_adapter:
             return _NullCtx()
-        # PEFT usually provides a context manager
         if hasattr(m, "disable_adapter"):
             try:
                 return m.disable_adapter()
             except TypeError:
-                # some versions require calling without args; still a ctx
                 return m.disable_adapter()
         return _NullCtx()
 
     @torch.no_grad()
-    def generate(self, prompt: str, *, temperature: float, top_p: float, top_k: int, max_new_tokens: int, seed: Optional[int] = None) -> str:
+    def generate(
+        self,
+        prompt: str,
+        *,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        max_new_tokens: int,
+        seed: Optional[int] = None,
+    ) -> str:
         if seed is not None:
             torch.manual_seed(int(seed))
             torch.cuda.manual_seed_all(int(seed))
@@ -938,18 +1029,40 @@ class InMemoryHFGenerator:
         gen_ids = out[0][prompt_len:]
         return self.tokenizer.decode(gen_ids, skip_special_tokens=True)
 
-    def generate_batch(self, prompts: List[str], *, temperature: float, top_p: float, top_k: int, max_new_tokens: int, seeds: Optional[List[Optional[int]]] = None) -> List[str]:
-        # sequential per prompt so seeds are per-example
+    def generate_batch(
+        self,
+        prompts: List[str],
+        *,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        max_new_tokens: int,
+        seeds: Optional[List[Optional[int]]] = None,
+    ) -> List[str]:
         if seeds is None:
             seeds = [None] * len(prompts)
         outs: List[str] = []
         for p, sd in zip(prompts, seeds):
-            outs.append(self.generate(p, temperature=temperature, top_p=top_p, top_k=top_k, max_new_tokens=max_new_tokens, seed=sd))
+            outs.append(
+                self.generate(
+                    p,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    max_new_tokens=max_new_tokens,
+                    seed=sd,
+                )
+            )
         return outs
 
+
 class _NullCtx:
-    def __enter__(self): return None
-    def __exit__(self, exc_type, exc, tb): return False
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
 
 # --------- Eval routines ---------
 
@@ -958,6 +1071,7 @@ class ProbeSamples:
     gsm8k: List[Dict[str, Any]]
     humaneval: List[Dict[str, Any]]
     wikitext: List[str]
+
 
 def load_probe_samples(
     *,
@@ -985,6 +1099,7 @@ def load_probe_samples(
 
     return ProbeSamples(gsm8k=gsm_samp, humaneval=he_samp, wikitext=wt_samp)
 
+
 @torch.no_grad()
 def eval_gsm8k(
     *,
@@ -1005,18 +1120,18 @@ def eval_gsm8k(
 
         messages = [
             {"role": "system", "content": "You are a careful math assistant."},
-            {"role": "user", "content": (
-                "Solve the problem.\n"
-                "Put your reasoning inside <think>...</think>.\n"
-                "Then output exactly one line: FINAL: <number>\n\n"
-                f"PROBLEM:\n{q}\n"
-            )},
+            {
+                "role": "user",
+                "content": (
+                    "Solve the problem.\n"
+                    "Put your reasoning inside <think>...</think>.\n"
+                    "Then output exactly one line: FINAL: <number>\n\n"
+                    f"PROBLEM:\n{q}\n"
+                ),
+            },
         ]
-        prompt = None
-        try:
-            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
-        except TypeError:
-            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+        prompt = apply_chat_template(tokenizer, messages, add_generation_prompt=True, enable_thinking=True)
 
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         out = model.generate(
@@ -1028,7 +1143,7 @@ def eval_gsm8k(
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
-        gen = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        gen = tokenizer.decode(out[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
 
         think = extract_think_span(gen)
         think_tokens.append(count_tokens(tokenizer, think))
@@ -1045,6 +1160,7 @@ def eval_gsm8k(
         "gsm8k_think_tokens_mean": float(sum(think_tokens) / max(1, len(think_tokens))),
         "gsm8k_think_tokens_p90": float(sorted(think_tokens)[int(0.9 * (len(think_tokens) - 1))]) if think_tokens else 0.0,
     }
+
 
 @torch.no_grad()
 def eval_humaneval(
@@ -1068,18 +1184,18 @@ def eval_humaneval(
 
         messages = [
             {"role": "system", "content": "You write correct Python functions."},
-            {"role": "user", "content": (
-                "Write the Python function described below.\n"
-                "Optional: if you think, put it in <think>...</think>.\n"
-                "Then output ONLY valid Python code (no backticks, no extra text).\n\n"
-                f"{prompt}"
-            )},
+            {
+                "role": "user",
+                "content": (
+                    "Write the Python function described below.\n"
+                    "Optional: if you think, put it in <think>...</think>.\n"
+                    "Then output ONLY valid Python code (no backticks, no extra text).\n\n"
+                    f"{prompt}"
+                ),
+            },
         ]
-        chat = None
-        try:
-            chat = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
-        except TypeError:
-            chat = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+        chat = apply_chat_template(tokenizer, messages, add_generation_prompt=True, enable_thinking=True)
 
         inputs = tokenizer(chat, return_tensors="pt").to(device)
         out = model.generate(
@@ -1091,7 +1207,7 @@ def eval_humaneval(
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
-        gen = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        gen = tokenizer.decode(out[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
 
         think = extract_think_span(gen)
         think_tokens.append(count_tokens(tokenizer, think))
@@ -1110,6 +1226,7 @@ def eval_humaneval(
         "humaneval_think_tokens_p90": float(sorted(think_tokens)[int(0.9 * (len(think_tokens) - 1))]) if think_tokens else 0.0,
     }
 
+
 @torch.no_grad()
 def eval_wikitext2_ppl(
     *,
@@ -1118,7 +1235,7 @@ def eval_wikitext2_ppl(
     texts: List[str],
     device: torch.device,
     block_size: int = 512,
-    max_blocks: int = 80,  # cap runtime
+    max_blocks: int = 80,
 ) -> Dict[str, Any]:
     model.eval()
     total_nll = 0.0
@@ -1131,7 +1248,6 @@ def eval_wikitext2_ppl(
         if input_ids.numel() < 2:
             continue
 
-        # chunk
         seq_len = input_ids.shape[1]
         for i in range(0, seq_len, block_size):
             if blocks_done >= max_blocks:
@@ -1141,7 +1257,6 @@ def eval_wikitext2_ppl(
                 continue
             labels = chunk.clone()
             out = model(chunk, labels=labels)
-            # loss is mean over tokens
             n_tokens = labels.numel()
             total_nll += float(out.loss) * n_tokens
             total_tokens += n_tokens
@@ -1155,6 +1270,7 @@ def eval_wikitext2_ppl(
         "wikitext2_tokens": int(total_tokens),
         "wikitext2_ppl": float(ppl),
     }
+
 
 def eval_codenames_subset(
     *,
@@ -1181,21 +1297,17 @@ def eval_codenames_subset(
     idx = rng.sample(range(len(boards)), k=min(n_boards, len(boards)))
     subset = [boards[i] for i in idx]
 
-    # speed overrides: keep eval cheap
-    # (your config defaults are huge max_new_tokens)
     sp_max = min(int(cfg["decoding"].get("spymaster_max_new_tokens", 512)), 512)
     g_max = min(int(cfg["decoding"].get("guesser_max_new_tokens", 256)), 256)
 
-    # build in-memory generators
     sp_gen = InMemoryHFGenerator(model, tokenizer, disable_adapter=False)
     g_gen = InMemoryHFGenerator(model, tokenizer, disable_adapter=True)
 
-    # n_candidates=1 for cheap epoch eval
     bests, metas = run_turns_batched(
         subset,
         sp_gen,
         g_gen,
-        embedder=None,   # config has enable_directness_check=false, so keep it off here
+        embedder=None,
         cfg={
             **cfg,
             "decoding": {
@@ -1208,18 +1320,19 @@ def eval_codenames_subset(
         n_candidates=1,
     )
 
-    # construct per-board records like eval.py
     per_board = []
     think_tok = []
     for b, best, meta in zip(subset, bests, metas):
         think = extract_think_span(best.raw_spymaster_text)
         think_tok.append(count_tokens(tokenizer, think))
-        per_board.append({
-            "board_id": b["board_id"],
-            "reward": float(best.reward),
-            "clue": best.clue,
-            "stats": {**best.stats, "directness": float(best.directness)},
-        })
+        per_board.append(
+            {
+                "board_id": b["board_id"],
+                "reward": float(best.reward),
+                "clue": best.clue,
+                "stats": {**best.stats, "directness": float(best.directness)},
+            }
+        )
 
     m = aggregate(per_board)
     return {
@@ -1236,6 +1349,7 @@ def eval_codenames_subset(
         "codenames_spymaster_think_tokens_p90": float(sorted(think_tok)[int(0.9 * (len(think_tok) - 1))]) if think_tok else 0.0,
     }
 
+
 # --------- plotting ---------
 
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -1248,6 +1362,7 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
             continue
         out.append(json.loads(line))
     return out
+
 
 def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
     """
@@ -1270,7 +1385,6 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
             xs.append(float(v) if v is not None else float("nan"))
         return xs
 
-    # 1) Correctness metrics
     plt.figure()
     plt.plot(epochs, series("gsm8k_acc"), label="GSM8K acc")
     plt.plot(epochs, series("humaneval_pass_rate"), label="HumanEval pass rate")
@@ -1282,7 +1396,6 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
     plt.savefig(out_dir / "correctness.png")
     plt.close()
 
-    # 2) Chain-of-thought verbosity (token count inside <think>)
     plt.figure()
     plt.plot(epochs, series("gsm8k_think_tokens_mean"), label="GSM8K think tok (mean)")
     plt.plot(epochs, series("humaneval_think_tokens_mean"), label="HumanEval think tok (mean)")
@@ -1295,7 +1408,6 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
     plt.savefig(out_dir / "think_verbosity.png")
     plt.close()
 
-    # 3) WikiText-2 perplexity
     plt.figure()
     plt.plot(epochs, series("wikitext2_ppl"))
     plt.xlabel("epoch")
@@ -1305,7 +1417,6 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
     plt.savefig(out_dir / "wikitext2_ppl.png")
     plt.close()
 
-    # 4) Train loss + EMA
     plt.figure()
     plt.plot(epochs, series("train_loss_epoch_mean"), label="train loss (epoch mean)")
     if any(not math.isnan(x) for x in series("train_loss_epoch_ema")):
@@ -1318,7 +1429,6 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
     plt.savefig(out_dir / "train_loss.png")
     plt.close()
 
-    # 5) Grad norm (if present)
     grad = series("grad_norm_epoch_mean")
     if any(not math.isnan(x) for x in grad):
         plt.figure()
@@ -1330,15 +1440,14 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
         plt.savefig(out_dir / "grad_norm.png")
         plt.close()
 
-    # 6) Codenames: reward with CI band
     plt.figure()
     rm = series("reward_mean")
     rlo = series("reward_ci95_lo")
     rhi = series("reward_ci95_hi")
     plt.plot(epochs, rm, label="reward_mean")
-    # CI band
     try:
         import numpy as np
+
         x = np.array(epochs, dtype=float)
         lo = np.array(rlo, dtype=float)
         hi = np.array(rhi, dtype=float)
@@ -1354,7 +1463,6 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
     plt.savefig(out_dir / "codenames_reward.png")
     plt.close()
 
-    # 7) Codenames behavior profile
     plt.figure()
     plt.plot(epochs, series("assassin_rate"), label="assassin_rate")
     plt.plot(epochs, series("team_mean"), label="team_mean")
@@ -1651,6 +1759,7 @@ from .mp_utils import launch_children, is_child_process, child_shard_info
 from .prompting import render_prompt
 from .rollout import run_turns_batched
 from .spymaster_prompt import build_spymaster_messages
+from .think_utils import extract_think as _extract_think
 from .utils import load_yaml, read_jsonl, set_global_seed, write_jsonl, save_progress
 
 
@@ -1691,15 +1800,11 @@ def _try_load_progress(progress_path: Path) -> Optional[Dict[str, Any]]:
 
 
 def extract_think_block(text: str) -> str:
-    # Keep the model-produced think block if present; otherwise return "".
-    lo = text.lower().rfind("<think>")
-    hi = text.lower().rfind("</think>")
-    if lo != -1 and hi != -1 and hi > lo:
-        return text[lo: hi + len("</think>")].strip()
-    # Sometimes you might only see </think>; keep everything up to it as "thinking".
-    if hi != -1:
-        return text[: hi + len("</think>")].strip()
-    return ""
+    """
+    Back-compat wrapper (this file previously had a custom "last block + partial tolerant" parser).
+    Returns the FULL <think>...</think> block (or best-effort partial) from the LAST block.
+    """
+    return _extract_think(text, mode="full", which="last", allow_partial=True)
 
 
 # -------------------------
@@ -1991,7 +2096,9 @@ def main():
                     # Centralized prompt rendering (no duplicated chat-template/thinking logic)
                     prompt = render_prompt(spymaster, msgs, cfg, role="spymaster")
 
+                    # Consolidated think parsing (shared util)
                     think_block = extract_think_block(best.raw_spymaster_text)
+
                     completion = ""
                     if think_block:
                         completion += think_block + "\n"
@@ -2542,9 +2649,42 @@ FILE: src/model_wrappers.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable, Union
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 import numpy as np
+
+
+# -------------------------
+# One canonical chat-template helper
+# -------------------------
+
+def apply_chat_template(
+    tokenizer: Any,
+    messages: List[Dict[str, str]],
+    *,
+    add_generation_prompt: bool = True,
+    enable_thinking: bool = True,
+) -> str:
+    """
+    Centralized compatibility wrapper for tokenizer.apply_chat_template signature drift.
+
+    Some tokenizers (e.g., Qwen3) accept enable_thinking=...
+    Others do not. This wrapper tries with enable_thinking and falls back cleanly.
+    """
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+
 
 @dataclass
 class GenerationConfig:
@@ -2552,6 +2692,7 @@ class GenerationConfig:
     top_p: float
     max_new_tokens: int
     top_k: int | None = None
+
 
 @runtime_checkable
 class TextGenerator(Protocol):
@@ -2575,10 +2716,12 @@ class TextGenerator(Protocol):
         enable_thinking: bool = True,
     ) -> str: ...
 
+
 class VLLMTextGenerator:
     """
     Thin wrapper around vLLM offline inference.
     """
+
     def __init__(
         self,
         model_id: str,
@@ -2625,19 +2768,12 @@ class VLLMTextGenerator:
         add_generation_prompt: bool = True,
         enable_thinking: bool = True,
     ) -> str:
-        try:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-                enable_thinking=enable_thinking,
-            )
-        except TypeError:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-            )
+        return apply_chat_template(
+            self.tokenizer,
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        )
 
     def generate(
         self,
@@ -2661,7 +2797,6 @@ class VLLMTextGenerator:
             assert isinstance(prompt_or_messages, str)
             prompt = prompt_or_messages
 
-        # vLLM: max_tokens == your max_new_tokens
         sp = SamplingParams(
             temperature=float(gen_cfg.temperature),
             top_p=float(gen_cfg.top_p),
@@ -2671,7 +2806,6 @@ class VLLMTextGenerator:
         )
 
         outs = self.llm.generate([prompt], sp, lora_request=self._lora_request)
-        # vLLM returns RequestOutput objects; generated text is output.outputs[0].text
         return outs[0].outputs[0].text
 
     def generate_batch(
@@ -2700,13 +2834,16 @@ class VLLMTextGenerator:
         outs = self.llm.generate(prompts, sps, lora_request=self._lora_request)
         return [o.outputs[0].text for o in outs]
 
+
 class HFTextGenerator:
     """
     Thin wrapper around transformers generation for reproducible calls.
     """
+
     def __init__(self, model_id: str, device_map: str = "auto", torch_dtype: str | None = None):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         import torch
+
         self.model_id = model_id
 
         dtype = None
@@ -2731,20 +2868,12 @@ class HFTextGenerator:
         add_generation_prompt: bool = True,
         enable_thinking: bool = True,
     ) -> str:
-        # Qwen3 supports enable_thinking in apply_chat_template; fall back if tokenizer doesn't accept it.
-        try:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-                enable_thinking=enable_thinking,
-            )
-        except TypeError:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-            )
+        return apply_chat_template(
+            self.tokenizer,
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        )
 
     def generate(
         self,
@@ -2796,13 +2925,14 @@ def load_lora_on_generator(base_generator: TextGenerator, adapter_dir: str) -> T
     """
     if isinstance(base_generator, HFTextGenerator):
         from peft import PeftModel
+
         base_generator.model = PeftModel.from_pretrained(base_generator.model, adapter_dir)
         base_generator.model.eval()
         return base_generator
 
     if isinstance(base_generator, VLLMTextGenerator):
         from vllm.lora.request import LoRARequest
-        # stable-ish ID (vLLM requires a globally unique int per adapter)
+
         lora_int_id = abs(hash(adapter_dir)) % (2**31)
         base_generator._lora_request = LoRARequest("codenames-lora", int(lora_int_id), adapter_dir)
         return base_generator
@@ -2823,6 +2953,7 @@ class Embedder:
     Embeds single tokens/words/short strings with caching.
     Uses sentence-transformers if available; otherwise uses a HF encoder with mean pooling.
     """
+
     def __init__(self, model_id: str, device: str = "cpu"):
         self.model_id = model_id
         self.device = device
@@ -2833,15 +2964,15 @@ class Embedder:
         self._hf_tok = None
         self._hf_model = None
 
-        # Prefer sentence-transformers if installed and model_id looks like one
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
+
             self._st_model = SentenceTransformer(model_id, device=device)
             self._mode = "st"
         except Exception:
             self._mode = "hf"
             from transformers import AutoModel, AutoTokenizer
-            import torch
+
             self._hf_tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
             self._hf_model = AutoModel.from_pretrained(model_id)
             self._hf_model.to(device)
@@ -2855,17 +2986,16 @@ class Embedder:
         if self._mode == "st":
             vec = np.asarray(self._st_model.encode([text], normalize_embeddings=True)[0], dtype=np.float32)
         else:
-            # HF encoder mean pooling
             import torch
+
             assert self._hf_tok is not None and self._hf_model is not None
             with torch.no_grad():
                 toks = self._hf_tok([text], return_tensors="pt", padding=True, truncation=True).to(self.device)
                 out = self._hf_model(**toks)
-                last = out.last_hidden_state  # (B,T,H)
-                mask = toks["attention_mask"].unsqueeze(-1)  # (B,T,1)
+                last = out.last_hidden_state
+                mask = toks["attention_mask"].unsqueeze(-1)
                 pooled = (last * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
                 vec = pooled[0].detach().cpu().numpy().astype(np.float32)
-                # normalize
                 n = np.linalg.norm(vec) + 1e-12
                 vec = vec / n
 
@@ -2934,23 +3064,81 @@ def launch_children(module: str, argv: List[str], num_procs: int) -> None:
 ================================================
 FILE: src/prompting.py
 ================================================
-# src/prompting.py
-from typing import Any, Dict, List
+from __future__ import annotations
 
-def render_prompt(generator, messages: List[Dict[str, str]], cfg: Dict[str, Any], *, role: str) -> str:
-    use_chat = bool(cfg.get("qwen", {}).get("use_chat_template", False))
-    if not use_chat:
+from typing import Any, Dict, List, Literal, Optional
+
+from .model_wrappers import GenerationConfig, TextGenerator
+
+Role = Literal["spymaster", "guesser", "generic"]
+
+
+def _use_chat_template(cfg: Dict[str, Any]) -> bool:
+    return bool(cfg.get("qwen", {}).get("use_chat_template", False))
+
+
+def _enable_thinking(cfg: Dict[str, Any], role: Role) -> bool:
+    q = cfg.get("qwen", {}) or {}
+    if role == "spymaster":
+        return bool(q.get("enable_thinking_spymaster", True))
+    if role == "guesser":
+        return bool(q.get("enable_thinking_guesser", True))
+    return bool(q.get("enable_thinking", True))
+
+
+def render_prompt(generator: Any, messages: List[Dict[str, str]], cfg: Dict[str, Any], *, role: Role) -> str:
+    """
+    Canonical prompt rendering for both batched & non-batched paths.
+    If chat templates are disabled, returns the raw user content.
+    Otherwise uses generator.format_chat(...) with role-specific enable_thinking.
+    """
+    if not _use_chat_template(cfg):
         return messages[-1]["content"]
+    return generator.format_chat(
+        messages,
+        add_generation_prompt=True,
+        enable_thinking=_enable_thinking(cfg, role),
+    )
 
-    think_key = "enable_thinking_spymaster" if role == "spymaster" else "enable_thinking_guesser"
-    enable_thinking = bool(cfg.get("qwen", {}).get(think_key, True))
-    return generator.format_chat(messages, add_generation_prompt=True, enable_thinking=enable_thinking)
+
+def generate_from_messages(
+    generator: TextGenerator,
+    messages: List[Dict[str, str]],
+    gen_cfg: GenerationConfig,
+    cfg: Dict[str, Any],
+    *,
+    role: Role,
+    seed: Optional[int] = None,
+) -> str:
+    """
+    Canonical "messages -> generator.generate(...)" wrapper.
+
+    This removes duplicated logic scattered around the codebase:
+      - chat_template vs raw string prompt
+      - role-specific enable_thinking flags
+      - passing the correct flags into generator.generate()
+    """
+    use_chat = _use_chat_template(cfg)
+    if use_chat:
+        return generator.generate(
+            messages,
+            gen_cfg,
+            seed=seed,
+            use_chat_template=True,
+            enable_thinking=_enable_thinking(cfg, role),
+        )
+    return generator.generate(
+        messages[-1]["content"],
+        gen_cfg,
+        seed=seed,
+        use_chat_template=False,
+        enable_thinking=False,  # ignored for raw prompts
+    )
 
 
 ================================================
 FILE: src/rollout.py
 ================================================
-# src/rollout.py
 from __future__ import annotations
 
 import re
@@ -2959,7 +3147,7 @@ from typing import Any, Dict, List, Optional, Tuple, overload, Literal
 
 from .gen_cfg import guesser_gen_cfg, spymaster_gen_cfg
 from .model_wrappers import Embedder, TextGenerator
-from .prompting import render_prompt
+from .prompting import render_prompt, generate_from_messages
 from .rules import is_valid_clue, normalize_word, score_turn
 from .spymaster_prompt import build_spymaster_messages
 from .guesser_prompt import build_guesser_messages
@@ -3057,18 +3245,16 @@ def run_one_candidate(
     sp_msgs = build_spymaster_messages(board_words, labels, revealed_mask, cfg)
     sp_gen = spymaster_gen_cfg(cfg)
 
-    use_chat = bool(cfg.get("qwen", {}).get("use_chat_template", False))
-    sp_think = bool(cfg.get("qwen", {}).get("enable_thinking_spymaster", True))
-
-    sp_text = spymaster.generate(
-        sp_msgs if use_chat else sp_msgs[-1]["content"],
+    sp_text = generate_from_messages(
+        spymaster,
+        sp_msgs,
         sp_gen,
+        cfg,
+        role="spymaster",
         seed=seed,
-        use_chat_template=use_chat,
-        enable_thinking=sp_think,
     )
-    clue, num = parse_spymaster_output(sp_text)
 
+    clue, num = parse_spymaster_output(sp_text)
     if clue is None or num is None:
         return CandidateResult(
             clue=clue or "",
@@ -3101,14 +3287,14 @@ def run_one_candidate(
     # --- guesser
     g_msgs = build_guesser_messages(board_words, revealed_mask, clue, int(num), cfg)
     g_gen = guesser_gen_cfg(cfg)
-    g_think = bool(cfg.get("qwen", {}).get("enable_thinking_guesser", True))
 
-    g_text = guesser.generate(
-        g_msgs if use_chat else g_msgs[-1]["content"],
+    g_text = generate_from_messages(
+        guesser,
+        g_msgs,
         g_gen,
+        cfg,
+        role="guesser",
         seed=seed,
-        use_chat_template=use_chat,
-        enable_thinking=g_think,
     )
 
     guesses_raw = parse_guesser_output(g_text)
@@ -3167,7 +3353,6 @@ def run_turn(
             rejection_counts[res.rejection_reason] = rejection_counts.get(res.rejection_reason, 0) + 1
 
         if got is None:
-            # record the last invalid result if we never got a valid one
             got = last_res if last_res is not None else CandidateResult(
                 clue="",
                 num=0,
@@ -3215,6 +3400,7 @@ def run_turns_batched(
     n_candidates: int,
     return_candidates: Literal[False] = False,
 ) -> Tuple[List[CandidateResult], List[Dict[str, Any]]]: ...
+
 
 @overload
 def run_turns_batched(
@@ -3296,9 +3482,7 @@ def run_turns_batched(
     rej_total_per_board: List[int] = [0 for _ in boards_batch]
 
     for ci in range(n_candidates):
-        # tuple: (clue, num, is_valid, reason, directness, raw_spymaster_text, used_seed)
         got: List[Optional[Tuple[str, int, bool, str, float, str, int]]] = [None] * len(boards_batch)
-
         pending = list(range(len(boards_batch)))
         last_text: Dict[int, str] = {}
         last_seed: Dict[int, int] = {}
@@ -3616,6 +3800,116 @@ Now produce your clue.
 
 
 ================================================
+FILE: src/think_utils.py
+================================================
+# src/think_utils.py
+from __future__ import annotations
+
+import re
+from typing import Literal, Optional, Tuple
+
+# Matches a CLOSED think block. Non-greedy so multiple blocks work.
+_THINK_CLOSED_RE = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
+
+
+Which = Literal["first", "last"]
+Mode = Literal["inner", "full"]
+
+
+def extract_think(
+    text: str | None,
+    *,
+    mode: Mode = "inner",
+    which: Which = "first",
+    allow_partial: bool = False,
+) -> str:
+    """
+    Extract content from <think>...</think>.
+
+    mode:
+      - "inner": returns content inside tags
+      - "full": returns the whole block including <think>...</think>
+
+    which:
+      - "first" or "last" match when multiple blocks exist
+
+    allow_partial:
+      - If True, tolerates outputs with only <think> OR only </think>.
+        * only </think>: treat everything up to </think> as thinking
+        * only <think>: treat everything after <think> as thinking
+    """
+    t = text or ""
+    if not t:
+        return ""
+
+    matches = list(_THINK_CLOSED_RE.finditer(t))
+    if matches:
+        m = matches[0] if which == "first" else matches[-1]
+        if mode == "inner":
+            return (m.group(1) or "").strip()
+        return t[m.start() : m.end()].strip()
+
+    if not allow_partial:
+        return ""
+
+    low = t.lower()
+    lo = low.rfind("<think>")
+    hi = low.rfind("</think>")
+
+    # both present but regex didn't match (weird nesting/spacing) -> best-effort slice
+    if lo != -1 and hi != -1 and hi > lo:
+        start = lo if mode == "full" else (lo + len("<think>"))
+        end = (hi + len("</think>")) if mode == "full" else hi
+        return t[start:end].strip()
+
+    # only closing tag present: keep everything up to it
+    if hi != -1:
+        end = hi + (len("</think>") if mode == "full" else 0)
+        return t[:end].strip()
+
+    # only opening tag present: keep everything after it
+    if lo != -1:
+        start = lo if mode == "full" else (lo + len("<think>"))
+        return t[start:].strip()
+
+    return ""
+
+
+def strip_think_blocks(text: str | None, *, remove_dangling_tags: bool = True) -> str:
+    """
+    Remove all CLOSED <think>...</think> blocks.
+    Optionally also remove dangling <think> or </think> tags.
+    """
+    t = text or ""
+    if not t:
+        return ""
+
+    t = _THINK_CLOSED_RE.sub("", t)
+
+    if remove_dangling_tags:
+        # If a model emits a single dangling tag, remove it.
+        t = re.sub(r"</?think>", "", t, flags=re.IGNORECASE)
+
+    return t
+
+
+def split_think_and_rest(
+    text: str | None,
+    *,
+    which: Which = "first",
+    allow_partial: bool = False,
+) -> Tuple[str, str]:
+    """
+    Returns (think_inner, rest_without_closed_think_blocks).
+    Useful when you want to log think separately but score/eval on the rest.
+    """
+    t = text or ""
+    think = extract_think(t, mode="inner", which=which, allow_partial=allow_partial)
+    rest = strip_think_blocks(t)
+    return think, rest
+
+
+================================================
 FILE: src/train_lora_sft.py
 ================================================
 # src/train_lora_sft.py
@@ -3626,6 +3920,10 @@ import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
+
+import json
+import math
+import time
 
 import torch
 from torch.utils.data import Dataset

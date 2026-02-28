@@ -14,6 +14,7 @@ from .mp_utils import launch_children, is_child_process, child_shard_info
 from .prompting import render_prompt
 from .rollout import run_turns_batched
 from .spymaster_prompt import build_spymaster_messages
+from .think_utils import extract_think as _extract_think
 from .utils import load_yaml, read_jsonl, set_global_seed, write_jsonl, save_progress
 
 
@@ -54,15 +55,11 @@ def _try_load_progress(progress_path: Path) -> Optional[Dict[str, Any]]:
 
 
 def extract_think_block(text: str) -> str:
-    # Keep the model-produced think block if present; otherwise return "".
-    lo = text.lower().rfind("<think>")
-    hi = text.lower().rfind("</think>")
-    if lo != -1 and hi != -1 and hi > lo:
-        return text[lo: hi + len("</think>")].strip()
-    # Sometimes you might only see </think>; keep everything up to it as "thinking".
-    if hi != -1:
-        return text[: hi + len("</think>")].strip()
-    return ""
+    """
+    Back-compat wrapper (this file previously had a custom "last block + partial tolerant" parser).
+    Returns the FULL <think>...</think> block (or best-effort partial) from the LAST block.
+    """
+    return _extract_think(text, mode="full", which="last", allow_partial=True)
 
 
 # -------------------------
@@ -354,7 +351,9 @@ def main():
                     # Centralized prompt rendering (no duplicated chat-template/thinking logic)
                     prompt = render_prompt(spymaster, msgs, cfg, role="spymaster")
 
+                    # Consolidated think parsing (shared util)
                     think_block = extract_think_block(best.raw_spymaster_text)
+
                     completion = ""
                     if think_block:
                         completion += think_block + "\n"

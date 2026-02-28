@@ -9,6 +9,7 @@ dependencies:
   - git-lfs
   - setuptools
   - wheel
+  - matplotlib
 
   # core utilities
   - numpy>=1.26

@@ -116,26 +116,26 @@ CLEAN="${CLEAN:-0}"
 # exit "$RC"
 
 # Run workload in its own session so we can kill the whole group on USR1 (torchrun-friendly)
-# set +e
-# setsid torchrun --standalone --nnodes=1 --nproc_per_node=2 \
-#   -m src.train_lora_sft --config configs/default.yml &
-# MAIN_PID=$!
-# wait "$MAIN_PID"
-# RC=$?
-# set -e
-
-# exit "$RC"
-
 set +e
-
-setsid bash -lc "
-  python -m src.eval --config configs/default.yml --mode baseline --out outputs/eval/baseline &&
-  python -m src.eval --config configs/default.yml --mode sft      --out outputs/eval/sft
-" &
+setsid torchrun --standalone --nnodes=1 --nproc_per_node=2 \
+  -m src.train_lora_sft --config configs/default.yml &
 MAIN_PID=$!
-
 wait "$MAIN_PID"
 RC=$?
 set -e
 
 exit "$RC"
+
+# set +e
+
+# setsid bash -lc "
+#   python -m src.eval --config configs/default.yml --mode baseline --out outputs/eval/baseline &&
+#   python -m src.eval --config configs/default.yml --mode sft      --out outputs/eval/sft
+# " &
+# MAIN_PID=$!
+
+# wait "$MAIN_PID"
+# RC=$?
+# set -e
+
+# exit "$RC"

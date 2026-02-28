@@ -13,43 +13,53 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from .model_wrappers import apply_chat_template  # <-- centralized enable_thinking fallback
+from .think_utils import extract_think as _extract_think, strip_think_blocks as _strip_think_blocks
+
 # --------- small helpers ---------
 
-_THINK_RE = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
 _FINAL_RE = re.compile(r"FINAL\s*:\s*(.+)", re.IGNORECASE)
 _GSM8K_REF_RE = re.compile(r"####\s*([^\n]+)")
 
+
 def extract_think_span(text: str) -> str:
-    m = _THINK_RE.search(text or "")
-    return (m.group(1).strip() if m else "")
+    """
+    Back-compat wrapper (previously regex-based in this file).
+    Returns inner content of the FIRST closed <think>...</think> block.
+    """
+    return _extract_think(text, mode="inner", which="first", allow_partial=False)
+
 
 def strip_think_blocks(text: str) -> str:
-    return _THINK_RE.sub("", text or "")
+    """
+    Back-compat wrapper (previously regex-based in this file).
+    Removes all CLOSED <think>...</think> blocks.
+    """
+    return _strip_think_blocks(text, remove_dangling_tags=True)
+
 
 def count_tokens(tokenizer, text: str) -> int:
     if not text:
         return 0
     return len(tokenizer(text, add_special_tokens=False)["input_ids"])
 
+
 def normalize_number_str(s: str) -> str:
     s = (s or "").strip()
-    # keep leading '-' and digits / decimal
     s = s.replace(",", "")
-    # common wrappers
     s = s.strip().strip("`").strip()
-    # if it looks like an int/float, normalize int-ish floats
     try:
         if re.fullmatch(r"[-+]?\d+(\.\d+)?", s):
             if "." in s:
                 f = float(s)
                 if abs(f - round(f)) < 1e-9:
                     return str(int(round(f)))
-                # keep limited precision to avoid float noise
                 return str(f).rstrip("0").rstrip(".")
             return str(int(s))
     except Exception:
         pass
     return s
+
 
 def parse_gsm8k_ref(answer: str) -> str:
     m = _GSM8K_REF_RE.search(answer or "")
@@ -57,22 +67,18 @@ def parse_gsm8k_ref(answer: str) -> str:
         return normalize_number_str(answer)
     return normalize_number_str(m.group(1))
 
+
 def parse_gsm8k_pred(text: str) -> Optional[str]:
     text = text or ""
     m = _FINAL_RE.search(text)
     if m:
-        # take first token on that line
         line = m.group(1).strip().splitlines()[0].strip()
-        # sometimes model outputs "42." etc
         return normalize_number_str(line.strip().rstrip("."))
-    # fallback: last number in text
-    nums = re.findall(r"[-+]?\d+(\.\d+)?", text.replace(",", ""))
-    if nums:
-        # re.findall with groups returns tuples sometimes; redo without groups:
-        nums2 = re.findall(r"[-+]?\d+(?:\.\d+)?", text.replace(",", ""))
-        if nums2:
-            return normalize_number_str(nums2[-1])
+    nums2 = re.findall(r"[-+]?\d+(?:\.\d+)?", text.replace(",", ""))
+    if nums2:
+        return normalize_number_str(nums2[-1])
     return None
+
 
 def extract_code_from_completion(text: str) -> str:
     """
@@ -83,24 +89,34 @@ def extract_code_from_completion(text: str) -> str:
     """
     t = strip_think_blocks(text or "").strip()
 
-    # fenced code
     fence = re.search(r"```(?:python)?\s*(.*?)```", t, re.DOTALL | re.IGNORECASE)
     if fence:
         return fence.group(1).strip()
 
-    # start at first def
     idx = t.find("def ")
     if idx != -1:
         return t[idx:].strip()
 
     return t
 
+
 # --------- HumanEval sandbox runner ---------
 
 _ALLOWED_IMPORTS = {
-    "math", "itertools", "functools", "collections", "re", "string",
-    "heapq", "bisect", "typing", "statistics", "fractions", "decimal"
+    "math",
+    "itertools",
+    "functools",
+    "collections",
+    "re",
+    "string",
+    "heapq",
+    "bisect",
+    "typing",
+    "statistics",
+    "fractions",
+    "decimal",
 }
+
 
 def _limited_import(name, globals=None, locals=None, fromlist=(), level=0):
     root = (name or "").split(".")[0]
@@ -108,24 +124,42 @@ def _limited_import(name, globals=None, locals=None, fromlist=(), level=0):
         return __import__(name, globals, locals, fromlist, level)
     raise ImportError(f"Import blocked: {name}")
 
+
 def _safe_builtins() -> Dict[str, Any]:
-    # keep this minimal; HumanEval tasks usually need basic python only
     allowed = {
-        "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict, "enumerate": enumerate,
-        "float": float, "int": int, "len": len, "list": list, "max": max, "min": min,
-        "range": range, "reversed": reversed, "round": round, "set": set, "sorted": sorted,
-        "str": str, "sum": sum, "tuple": tuple, "zip": zip,
+        "abs": abs,
+        "all": all,
+        "any": any,
+        "bool": bool,
+        "dict": dict,
+        "enumerate": enumerate,
+        "float": float,
+        "int": int,
+        "len": len,
+        "list": list,
+        "max": max,
+        "min": min,
+        "range": range,
+        "reversed": reversed,
+        "round": round,
+        "set": set,
+        "sorted": sorted,
+        "str": str,
+        "sum": sum,
+        "tuple": tuple,
+        "zip": zip,
         "__import__": _limited_import,
     }
     return allowed
+
 
 def _humaneval_worker(payload: Dict[str, Any], q) -> None:
     """
     Runs in a subprocess. Returns (passed: bool, err: str|None)
     """
     try:
-        # hard timeout via alarm
         import signal
+
         signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError("timeout")))
         signal.alarm(int(payload.get("timeout_s", 3)))
 
@@ -141,7 +175,6 @@ def _humaneval_worker(payload: Dict[str, Any], q) -> None:
 
         exec(test, env, env)
 
-        # Most HumanEval tests define check(candidate)
         check = env.get("check", None)
         if check is None:
             q.put((False, "missing check() in test"))
@@ -152,6 +185,7 @@ def _humaneval_worker(payload: Dict[str, Any], q) -> None:
     except Exception as e:
         q.put((False, f"{type(e).__name__}: {e}"))
 
+
 def run_humaneval_case(code: str, test: str, entry_point: str, timeout_s: int = 3) -> Tuple[bool, Optional[str]]:
     """
     Executes in a separate process with:
@@ -160,6 +194,7 @@ def run_humaneval_case(code: str, test: str, entry_point: str, timeout_s: int = 
       - hard timeout
     """
     import multiprocessing as mp
+
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     p = ctx.Process(
@@ -177,6 +212,7 @@ def run_humaneval_case(code: str, test: str, entry_point: str, timeout_s: int = 
     except Exception:
         return (False, "No result")
 
+
 # --------- Model wrapper for codenames rollout ---------
 
 class InMemoryHFGenerator:
@@ -184,6 +220,7 @@ class InMemoryHFGenerator:
     Minimal TextGenerator-like wrapper around an in-memory (Peft) model + tokenizer.
     Implements generate() and generate_batch() (sequential per-item seeds).
     """
+
     def __init__(self, model, tokenizer, *, disable_adapter: bool = False):
         self.model = model
         self.tokenizer = tokenizer
@@ -194,35 +231,35 @@ class InMemoryHFGenerator:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def format_chat(self, messages: List[Dict[str, str]], *, add_generation_prompt=True, enable_thinking=True) -> str:
-        try:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-                enable_thinking=enable_thinking,
-            )
-        except TypeError:
-            return self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-            )
+        return apply_chat_template(
+            self.tokenizer,
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        )
 
     def _maybe_disable_adapter_ctx(self):
         m = self.model
         if not self._disable_adapter:
             return _NullCtx()
-        # PEFT usually provides a context manager
         if hasattr(m, "disable_adapter"):
             try:
                 return m.disable_adapter()
             except TypeError:
-                # some versions require calling without args; still a ctx
                 return m.disable_adapter()
         return _NullCtx()
 
     @torch.no_grad()
-    def generate(self, prompt: str, *, temperature: float, top_p: float, top_k: int, max_new_tokens: int, seed: Optional[int] = None) -> str:
+    def generate(
+        self,
+        prompt: str,
+        *,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        max_new_tokens: int,
+        seed: Optional[int] = None,
+    ) -> str:
         if seed is not None:
             torch.manual_seed(int(seed))
             torch.cuda.manual_seed_all(int(seed))
@@ -248,18 +285,40 @@ class InMemoryHFGenerator:
         gen_ids = out[0][prompt_len:]
         return self.tokenizer.decode(gen_ids, skip_special_tokens=True)
 
-    def generate_batch(self, prompts: List[str], *, temperature: float, top_p: float, top_k: int, max_new_tokens: int, seeds: Optional[List[Optional[int]]] = None) -> List[str]:
-        # sequential per prompt so seeds are per-example
+    def generate_batch(
+        self,
+        prompts: List[str],
+        *,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        max_new_tokens: int,
+        seeds: Optional[List[Optional[int]]] = None,
+    ) -> List[str]:
         if seeds is None:
             seeds = [None] * len(prompts)
         outs: List[str] = []
         for p, sd in zip(prompts, seeds):
-            outs.append(self.generate(p, temperature=temperature, top_p=top_p, top_k=top_k, max_new_tokens=max_new_tokens, seed=sd))
+            outs.append(
+                self.generate(
+                    p,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    max_new_tokens=max_new_tokens,
+                    seed=sd,
+                )
+            )
         return outs
 
+
 class _NullCtx:
-    def __enter__(self): return None
-    def __exit__(self, exc_type, exc, tb): return False
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
 
 # --------- Eval routines ---------
 
@@ -268,6 +327,7 @@ class ProbeSamples:
     gsm8k: List[Dict[str, Any]]
     humaneval: List[Dict[str, Any]]
     wikitext: List[str]
+
 
 def load_probe_samples(
     *,
@@ -295,6 +355,7 @@ def load_probe_samples(
 
     return ProbeSamples(gsm8k=gsm_samp, humaneval=he_samp, wikitext=wt_samp)
 
+
 @torch.no_grad()
 def eval_gsm8k(
     *,
@@ -315,18 +376,18 @@ def eval_gsm8k(
 
         messages = [
             {"role": "system", "content": "You are a careful math assistant."},
-            {"role": "user", "content": (
-                "Solve the problem.\n"
-                "Put your reasoning inside <think>...</think>.\n"
-                "Then output exactly one line: FINAL: <number>\n\n"
-                f"PROBLEM:\n{q}\n"
-            )},
+            {
+                "role": "user",
+                "content": (
+                    "Solve the problem.\n"
+                    "Put your reasoning inside <think>...</think>.\n"
+                    "Then output exactly one line: FINAL: <number>\n\n"
+                    f"PROBLEM:\n{q}\n"
+                ),
+            },
         ]
-        prompt = None
-        try:
-            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
-        except TypeError:
-            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+        prompt = apply_chat_template(tokenizer, messages, add_generation_prompt=True, enable_thinking=True)
 
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         out = model.generate(
@@ -338,7 +399,7 @@ def eval_gsm8k(
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
-        gen = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        gen = tokenizer.decode(out[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
 
         think = extract_think_span(gen)
         think_tokens.append(count_tokens(tokenizer, think))
@@ -355,6 +416,7 @@ def eval_gsm8k(
         "gsm8k_think_tokens_mean": float(sum(think_tokens) / max(1, len(think_tokens))),
         "gsm8k_think_tokens_p90": float(sorted(think_tokens)[int(0.9 * (len(think_tokens) - 1))]) if think_tokens else 0.0,
     }
+
 
 @torch.no_grad()
 def eval_humaneval(
@@ -378,18 +440,18 @@ def eval_humaneval(
 
         messages = [
             {"role": "system", "content": "You write correct Python functions."},
-            {"role": "user", "content": (
-                "Write the Python function described below.\n"
-                "Optional: if you think, put it in <think>...</think>.\n"
-                "Then output ONLY valid Python code (no backticks, no extra text).\n\n"
-                f"{prompt}"
-            )},
+            {
+                "role": "user",
+                "content": (
+                    "Write the Python function described below.\n"
+                    "Optional: if you think, put it in <think>...</think>.\n"
+                    "Then output ONLY valid Python code (no backticks, no extra text).\n\n"
+                    f"{prompt}"
+                ),
+            },
         ]
-        chat = None
-        try:
-            chat = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
-        except TypeError:
-            chat = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+        chat = apply_chat_template(tokenizer, messages, add_generation_prompt=True, enable_thinking=True)
 
         inputs = tokenizer(chat, return_tensors="pt").to(device)
         out = model.generate(
@@ -401,7 +463,7 @@ def eval_humaneval(
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
-        gen = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        gen = tokenizer.decode(out[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
 
         think = extract_think_span(gen)
         think_tokens.append(count_tokens(tokenizer, think))
@@ -420,6 +482,7 @@ def eval_humaneval(
         "humaneval_think_tokens_p90": float(sorted(think_tokens)[int(0.9 * (len(think_tokens) - 1))]) if think_tokens else 0.0,
     }
 
+
 @torch.no_grad()
 def eval_wikitext2_ppl(
     *,
@@ -428,7 +491,7 @@ def eval_wikitext2_ppl(
     texts: List[str],
     device: torch.device,
     block_size: int = 512,
-    max_blocks: int = 80,  # cap runtime
+    max_blocks: int = 80,
 ) -> Dict[str, Any]:
     model.eval()
     total_nll = 0.0
@@ -441,7 +504,6 @@ def eval_wikitext2_ppl(
         if input_ids.numel() < 2:
             continue
 
-        # chunk
         seq_len = input_ids.shape[1]
         for i in range(0, seq_len, block_size):
             if blocks_done >= max_blocks:
@@ -451,7 +513,6 @@ def eval_wikitext2_ppl(
                 continue
             labels = chunk.clone()
             out = model(chunk, labels=labels)
-            # loss is mean over tokens
             n_tokens = labels.numel()
             total_nll += float(out.loss) * n_tokens
             total_tokens += n_tokens
@@ -465,6 +526,7 @@ def eval_wikitext2_ppl(
         "wikitext2_tokens": int(total_tokens),
         "wikitext2_ppl": float(ppl),
     }
+
 
 def eval_codenames_subset(
     *,
@@ -491,21 +553,17 @@ def eval_codenames_subset(
     idx = rng.sample(range(len(boards)), k=min(n_boards, len(boards)))
     subset = [boards[i] for i in idx]
 
-    # speed overrides: keep eval cheap
-    # (your config defaults are huge max_new_tokens)
     sp_max = min(int(cfg["decoding"].get("spymaster_max_new_tokens", 512)), 512)
     g_max = min(int(cfg["decoding"].get("guesser_max_new_tokens", 256)), 256)
 
-    # build in-memory generators
     sp_gen = InMemoryHFGenerator(model, tokenizer, disable_adapter=False)
     g_gen = InMemoryHFGenerator(model, tokenizer, disable_adapter=True)
 
-    # n_candidates=1 for cheap epoch eval
     bests, metas = run_turns_batched(
         subset,
         sp_gen,
         g_gen,
-        embedder=None,   # config has enable_directness_check=false, so keep it off here
+        embedder=None,
         cfg={
             **cfg,
             "decoding": {
@@ -518,18 +576,19 @@ def eval_codenames_subset(
         n_candidates=1,
     )
 
-    # construct per-board records like eval.py
     per_board = []
     think_tok = []
     for b, best, meta in zip(subset, bests, metas):
         think = extract_think_span(best.raw_spymaster_text)
         think_tok.append(count_tokens(tokenizer, think))
-        per_board.append({
-            "board_id": b["board_id"],
-            "reward": float(best.reward),
-            "clue": best.clue,
-            "stats": {**best.stats, "directness": float(best.directness)},
-        })
+        per_board.append(
+            {
+                "board_id": b["board_id"],
+                "reward": float(best.reward),
+                "clue": best.clue,
+                "stats": {**best.stats, "directness": float(best.directness)},
+            }
+        )
 
     m = aggregate(per_board)
     return {
@@ -546,6 +605,7 @@ def eval_codenames_subset(
         "codenames_spymaster_think_tokens_p90": float(sorted(think_tok)[int(0.9 * (len(think_tok) - 1))]) if think_tok else 0.0,
     }
 
+
 # --------- plotting ---------
 
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -558,6 +618,7 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
             continue
         out.append(json.loads(line))
     return out
+
 
 def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
     """
@@ -580,7 +641,6 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
             xs.append(float(v) if v is not None else float("nan"))
         return xs
 
-    # 1) Correctness metrics
     plt.figure()
     plt.plot(epochs, series("gsm8k_acc"), label="GSM8K acc")
     plt.plot(epochs, series("humaneval_pass_rate"), label="HumanEval pass rate")
@@ -592,7 +652,6 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
     plt.savefig(out_dir / "correctness.png")
     plt.close()
 
-    # 2) Chain-of-thought verbosity (token count inside <think>)
     plt.figure()
     plt.plot(epochs, series("gsm8k_think_tokens_mean"), label="GSM8K think tok (mean)")
     plt.plot(epochs, series("humaneval_think_tokens_mean"), label="HumanEval think tok (mean)")
@@ -605,7 +664,6 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
     plt.savefig(out_dir / "think_verbosity.png")
     plt.close()
 
-    # 3) WikiText-2 perplexity
     plt.figure()
     plt.plot(epochs, series("wikitext2_ppl"))
     plt.xlabel("epoch")
@@ -615,7 +673,6 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
     plt.savefig(out_dir / "wikitext2_ppl.png")
     plt.close()
 
-    # 4) Train loss + EMA
     plt.figure()
     plt.plot(epochs, series("train_loss_epoch_mean"), label="train loss (epoch mean)")
     if any(not math.isnan(x) for x in series("train_loss_epoch_ema")):
@@ -628,7 +685,6 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
     plt.savefig(out_dir / "train_loss.png")
     plt.close()
 
-    # 5) Grad norm (if present)
     grad = series("grad_norm_epoch_mean")
     if any(not math.isnan(x) for x in grad):
         plt.figure()
@@ -640,15 +696,14 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
         plt.savefig(out_dir / "grad_norm.png")
         plt.close()
 
-    # 6) Codenames: reward with CI band
     plt.figure()
     rm = series("reward_mean")
     rlo = series("reward_ci95_lo")
     rhi = series("reward_ci95_hi")
     plt.plot(epochs, rm, label="reward_mean")
-    # CI band
     try:
         import numpy as np
+
         x = np.array(epochs, dtype=float)
         lo = np.array(rlo, dtype=float)
         hi = np.array(rhi, dtype=float)
@@ -664,7 +719,6 @@ def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
     plt.savefig(out_dir / "codenames_reward.png")
     plt.close()
 
-    # 7) Codenames behavior profile
     plt.figure()
     plt.plot(epochs, series("assassin_rate"), label="assassin_rate")
     plt.plot(epochs, series("team_mean"), label="team_mean")
