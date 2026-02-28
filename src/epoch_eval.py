@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from .model_wrappers import apply_chat_template  # <-- centralized enable_thinking fallback
+from .model_wrappers import apply_chat_template, GenerationConfig  
 from .think_utils import extract_think as _extract_think, strip_think_blocks as _strip_think_blocks
 
 # --------- small helpers ---------
@@ -219,6 +219,9 @@ class InMemoryHFGenerator:
     """
     Minimal TextGenerator-like wrapper around an in-memory (Peft) model + tokenizer.
     Implements generate() and generate_batch() (sequential per-item seeds).
+
+    IMPORTANT: generate_batch signature matches rollout.run_turns_batched():
+      generate_batch(prompts: List[str], gen_cfg: GenerationConfig, seeds: Optional[List[Optional[int]]])
     """
 
     def __init__(self, model, tokenizer, *, disable_adapter: bool = False):
@@ -256,27 +259,34 @@ class InMemoryHFGenerator:
         *,
         temperature: float,
         top_p: float,
-        top_k: int,
+        top_k: int | None,
         max_new_tokens: int,
         seed: Optional[int] = None,
     ) -> str:
         if seed is not None:
             torch.manual_seed(int(seed))
-            torch.cuda.manual_seed_all(int(seed))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(seed))
 
         inputs = self.tokenizer(prompt, return_tensors="pt", padding=False)
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
         do_sample = temperature is not None and float(temperature) > 1e-6
+
         gen_kwargs = dict(
             do_sample=do_sample,
-            temperature=float(temperature) if do_sample else None,
-            top_p=float(top_p) if do_sample else None,
-            top_k=int(top_k) if (do_sample and top_k is not None) else None,
             max_new_tokens=int(max_new_tokens),
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
         )
+        if do_sample:
+            gen_kwargs.update(
+                dict(
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    top_k=int(top_k) if top_k is not None else None,
+                )
+            )
 
         with self._maybe_disable_adapter_ctx():
             out = self.model.generate(**inputs, **gen_kwargs)
@@ -288,11 +298,7 @@ class InMemoryHFGenerator:
     def generate_batch(
         self,
         prompts: List[str],
-        *,
-        temperature: float,
-        top_p: float,
-        top_k: int,
-        max_new_tokens: int,
+        gen_cfg: GenerationConfig,
         seeds: Optional[List[Optional[int]]] = None,
     ) -> List[str]:
         if seeds is None:
@@ -302,10 +308,10 @@ class InMemoryHFGenerator:
             outs.append(
                 self.generate(
                     p,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    max_new_tokens=max_new_tokens,
+                    temperature=float(gen_cfg.temperature),
+                    top_p=float(gen_cfg.top_p),
+                    top_k=(int(gen_cfg.top_k) if gen_cfg.top_k is not None else None),
+                    max_new_tokens=int(gen_cfg.max_new_tokens),
                     seed=sd,
                 )
             )
