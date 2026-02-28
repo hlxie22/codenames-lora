@@ -492,7 +492,11 @@ def main():
         gradient_accumulation_steps=int(tcfg["grad_accum"]),
         num_train_epochs=float(tcfg["epochs"]),
         learning_rate=float(tcfg["lr"]),
-        logging_steps=20,
+
+        logging_strategy="epoch",
+        logging_first_step=True,
+        # logging_steps=20,  # optional; mostly ignored when logging_strategy="epoch"
+
         save_steps=200,
         save_total_limit=2,
         report_to=[],

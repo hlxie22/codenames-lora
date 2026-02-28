@@ -132,3 +132,6 @@ epoch_eval:
   wikitext_max_blocks: 80
 
   codenames_n_boards: 20
+
+  codenames_spymaster_max_new_tokens: 4096
+  codenames_guesser_max_new_tokens: 2048
