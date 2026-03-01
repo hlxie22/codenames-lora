@@ -27,7 +27,7 @@ def extract_think_span(text: str) -> str:
     Back-compat wrapper (previously regex-based in this file).
     Returns inner content of the FIRST closed <think>...</think> block.
     """
-    return _extract_think(text, mode="inner", which="first", allow_partial=False)
+    return _extract_think(text, mode="inner", which="first", allow_partial=True)
 
 
 def strip_think_blocks(text: str) -> str:
@@ -559,8 +559,8 @@ def eval_codenames_subset(
     idx = rng.sample(range(len(boards)), k=min(n_boards, len(boards)))
     subset = [boards[i] for i in idx]
 
-    sp_max = min(int(cfg["decoding"].get("spymaster_max_new_tokens", 512)), 512)
-    g_max = min(int(cfg["decoding"].get("guesser_max_new_tokens", 256)), 256)
+    sp_max = int(cfg["decoding"].get("spymaster_max_new_tokens", 512))
+    g_max  = int(cfg["decoding"].get("guesser_max_new_tokens", 256))
 
     sp_gen = InMemoryHFGenerator(model, tokenizer, disable_adapter=False)
     g_gen = InMemoryHFGenerator(model, tokenizer, disable_adapter=True)
