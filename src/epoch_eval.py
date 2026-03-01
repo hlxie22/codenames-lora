@@ -13,8 +13,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from .model_wrappers import apply_chat_template, GenerationConfig  
+from .model_wrappers import apply_chat_template, GenerationConfig
 from .think_utils import extract_think as _extract_think, strip_think_blocks as _strip_think_blocks
+
 
 # --------- small helpers ---------
 
@@ -362,21 +363,39 @@ def load_probe_samples(
     return ProbeSamples(gsm8k=gsm_samp, humaneval=he_samp, wikitext=wt_samp)
 
 
+# -------------------------
+# RAW (reducible) evals for distributed aggregation
+# -------------------------
+
 @torch.no_grad()
-def eval_gsm8k(
+def eval_gsm8k_raw(
     *,
     model,
     tokenizer,
     samples: List[Dict[str, Any]],
+    global_indices: List[int],
     device: torch.device,
     max_new_tokens: int = 384,
+    seed_base: int = 0,
 ) -> Dict[str, Any]:
+    """
+    Returns reducible stats:
+      - n
+      - correct
+      - think_tokens (list[int]) for optional p90 via gather
+    """
     model.eval()
     correct = 0
     n = 0
     think_tokens: List[int] = []
 
-    for ex in samples:
+    for ex, gi in zip(samples, global_indices):
+        # deterministic per example irrespective of world size
+        sd = int(seed_base) + int(gi)
+        torch.manual_seed(sd)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(sd)
+
         q = ex["question"]
         ref = parse_gsm8k_ref(ex["answer"])
 
@@ -401,7 +420,7 @@ def eval_gsm8k(
             do_sample=True,
             temperature=0.2,
             top_p=0.95,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=int(max_new_tokens),
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
@@ -415,31 +434,38 @@ def eval_gsm8k(
             correct += 1
         n += 1
 
-    acc = correct / max(1, n)
-    return {
-        "gsm8k_n": n,
-        "gsm8k_acc": float(acc),
-        "gsm8k_think_tokens_mean": float(sum(think_tokens) / max(1, len(think_tokens))),
-        "gsm8k_think_tokens_p90": float(sorted(think_tokens)[int(0.9 * (len(think_tokens) - 1))]) if think_tokens else 0.0,
-    }
+    return {"n": int(n), "correct": int(correct), "think_tokens": think_tokens}
 
 
 @torch.no_grad()
-def eval_humaneval(
+def eval_humaneval_raw(
     *,
     model,
     tokenizer,
     samples: List[Dict[str, Any]],
+    global_indices: List[int],
     device: torch.device,
     max_new_tokens: int = 384,
     timeout_s: int = 3,
+    seed_base: int = 0,
 ) -> Dict[str, Any]:
+    """
+    Returns reducible stats:
+      - n
+      - passed
+      - think_tokens (list[int]) for optional p90 via gather
+    """
     model.eval()
     passed = 0
     n = 0
     think_tokens: List[int] = []
 
-    for ex in samples:
+    for ex, gi in zip(samples, global_indices):
+        sd = int(seed_base) + int(gi)
+        torch.manual_seed(sd)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(sd)
+
         prompt = ex["prompt"]
         test = ex["test"]
         entry = ex["entry_point"]
@@ -465,7 +491,7 @@ def eval_humaneval(
             do_sample=True,
             temperature=0.2,
             top_p=0.95,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=int(max_new_tokens),
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
@@ -476,21 +502,16 @@ def eval_humaneval(
 
         code_only = extract_code_from_completion(gen)
         full_code = prompt + "\n" + code_only + "\n"
-        ok, _err = run_humaneval_case(full_code, test, entry_point=entry, timeout_s=timeout_s)
+        ok, _err = run_humaneval_case(full_code, test, entry_point=entry, timeout_s=int(timeout_s))
 
         passed += 1 if ok else 0
         n += 1
 
-    return {
-        "humaneval_n": n,
-        "humaneval_pass_rate": float(passed / max(1, n)),
-        "humaneval_think_tokens_mean": float(sum(think_tokens) / max(1, len(think_tokens))),
-        "humaneval_think_tokens_p90": float(sorted(think_tokens)[int(0.9 * (len(think_tokens) - 1))]) if think_tokens else 0.0,
-    }
+    return {"n": int(n), "passed": int(passed), "think_tokens": think_tokens}
 
 
 @torch.no_grad()
-def eval_wikitext2_ppl(
+def eval_wikitext2_raw(
     *,
     model,
     tokenizer,
@@ -499,11 +520,17 @@ def eval_wikitext2_ppl(
     block_size: int = 512,
     max_blocks: int = 80,
 ) -> Dict[str, Any]:
+    """
+    Returns reducible totals:
+      - total_nll (sum over tokens)
+      - total_tokens
+      - blocks_done
+    """
     model.eval()
     total_nll = 0.0
     total_tokens = 0
-
     blocks_done = 0
+
     for t in texts:
         enc = tokenizer(t, return_tensors="pt", add_special_tokens=False)
         input_ids = enc["input_ids"].to(device)
@@ -511,62 +538,73 @@ def eval_wikitext2_ppl(
             continue
 
         seq_len = input_ids.shape[1]
-        for i in range(0, seq_len, block_size):
-            if blocks_done >= max_blocks:
+        for i in range(0, seq_len, int(block_size)):
+            if blocks_done >= int(max_blocks):
                 break
-            chunk = input_ids[:, i : i + block_size]
+            chunk = input_ids[:, i : i + int(block_size)]
             if chunk.shape[1] < 2:
                 continue
             labels = chunk.clone()
             out = model(chunk, labels=labels)
-            n_tokens = labels.numel()
+            n_tokens = int(labels.numel())
             total_nll += float(out.loss) * n_tokens
             total_tokens += n_tokens
             blocks_done += 1
-        if blocks_done >= max_blocks:
+        if blocks_done >= int(max_blocks):
             break
 
-    ppl = math.exp(total_nll / max(1, total_tokens))
-    return {
-        "wikitext2_blocks": int(blocks_done),
-        "wikitext2_tokens": int(total_tokens),
-        "wikitext2_ppl": float(ppl),
-    }
+    return {"total_nll": float(total_nll), "total_tokens": int(total_tokens), "blocks_done": int(blocks_done)}
 
 
-def eval_codenames_subset(
+def sample_codenames_eval_boards(
+    *,
+    cfg: Dict[str, Any],
+    n_boards: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    """
+    Deterministically sample a subset of eval boards.
+    Every rank can call this independently (same seed => same subset).
+    """
+    from .utils import read_jsonl
+
+    boards = read_jsonl(cfg["paths"]["boards_eval_path"])
+    if not boards:
+        return []
+
+    rng = random.Random(int(seed))
+    idx = rng.sample(range(len(boards)), k=min(int(n_boards), len(boards)))
+    return [boards[i] for i in idx]
+
+
+@torch.no_grad()
+def eval_codenames_boards_records(
     *,
     cfg: Dict[str, Any],
     model,
     tokenizer,
     device: torch.device,
-    n_boards: int,
-    seed: int,
+    boards: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
-    Computes the same key fields as src/metrics.py aggregate() but on a sampled subset of eval boards.
+    Distributed-friendly variant: evaluates exactly the provided boards (already sharded).
+    Returns:
+      - per_board: records suitable for metrics.aggregate()
+      - think_tokens: list[int] for p90
     """
-    from .utils import read_jsonl
-    from .rollout import run_turns_batched
-    from .metrics import aggregate
-
-    rng = random.Random(seed)
-
-    boards = read_jsonl(cfg["paths"]["boards_eval_path"])
     if not boards:
-        return {"codenames_n_boards": 0}
+        return {"per_board": [], "think_tokens": []}
 
-    idx = rng.sample(range(len(boards)), k=min(n_boards, len(boards)))
-    subset = [boards[i] for i in idx]
+    from .rollout import run_turns_batched
 
     sp_max = int(cfg["decoding"].get("spymaster_max_new_tokens", 512))
-    g_max  = int(cfg["decoding"].get("guesser_max_new_tokens", 256))
+    g_max = int(cfg["decoding"].get("guesser_max_new_tokens", 256))
 
     sp_gen = InMemoryHFGenerator(model, tokenizer, disable_adapter=False)
     g_gen = InMemoryHFGenerator(model, tokenizer, disable_adapter=True)
 
     bests, metas = run_turns_batched(
-        subset,
+        boards,
         sp_gen,
         g_gen,
         embedder=None,
@@ -582,9 +620,10 @@ def eval_codenames_subset(
         n_candidates=1,
     )
 
-    per_board = []
-    think_tok = []
-    for b, best, meta in zip(subset, bests, metas):
+    per_board: List[Dict[str, Any]] = []
+    think_tok: List[int] = []
+
+    for b, best, meta in zip(boards, bests, metas):
         think = extract_think_span(best.raw_spymaster_text)
         think_tok.append(count_tokens(tokenizer, think))
         per_board.append(
@@ -595,6 +634,121 @@ def eval_codenames_subset(
                 "stats": {**best.stats, "directness": float(best.directness)},
             }
         )
+
+    return {"per_board": per_board, "think_tokens": think_tok}
+
+
+# -------------------------
+# Back-compat (single-process) eval APIs used elsewhere
+# -------------------------
+
+@torch.no_grad()
+def eval_gsm8k(
+    *,
+    model,
+    tokenizer,
+    samples: List[Dict[str, Any]],
+    device: torch.device,
+    max_new_tokens: int = 384,
+) -> Dict[str, Any]:
+    # preserve original behavior
+    raw = eval_gsm8k_raw(
+        model=model,
+        tokenizer=tokenizer,
+        samples=samples,
+        global_indices=list(range(len(samples))),
+        device=device,
+        max_new_tokens=max_new_tokens,
+        seed_base=0,
+    )
+    n = raw["n"]
+    acc = raw["correct"] / max(1, n)
+    think_tokens = raw["think_tokens"]
+    return {
+        "gsm8k_n": int(n),
+        "gsm8k_acc": float(acc),
+        "gsm8k_think_tokens_mean": float(sum(think_tokens) / max(1, len(think_tokens))) if think_tokens else 0.0,
+        "gsm8k_think_tokens_p90": float(sorted(think_tokens)[int(0.9 * (len(think_tokens) - 1))]) if think_tokens else 0.0,
+    }
+
+
+@torch.no_grad()
+def eval_humaneval(
+    *,
+    model,
+    tokenizer,
+    samples: List[Dict[str, Any]],
+    device: torch.device,
+    max_new_tokens: int = 384,
+    timeout_s: int = 3,
+) -> Dict[str, Any]:
+    raw = eval_humaneval_raw(
+        model=model,
+        tokenizer=tokenizer,
+        samples=samples,
+        global_indices=list(range(len(samples))),
+        device=device,
+        max_new_tokens=max_new_tokens,
+        timeout_s=timeout_s,
+        seed_base=0,
+    )
+    n = raw["n"]
+    passed = raw["passed"]
+    think_tokens = raw["think_tokens"]
+    return {
+        "humaneval_n": int(n),
+        "humaneval_pass_rate": float(passed / max(1, n)),
+        "humaneval_think_tokens_mean": float(sum(think_tokens) / max(1, len(think_tokens))) if think_tokens else 0.0,
+        "humaneval_think_tokens_p90": float(sorted(think_tokens)[int(0.9 * (len(think_tokens) - 1))]) if think_tokens else 0.0,
+    }
+
+
+@torch.no_grad()
+def eval_wikitext2_ppl(
+    *,
+    model,
+    tokenizer,
+    texts: List[str],
+    device: torch.device,
+    block_size: int = 512,
+    max_blocks: int = 80,
+) -> Dict[str, Any]:
+    raw = eval_wikitext2_raw(
+        model=model,
+        tokenizer=tokenizer,
+        texts=texts,
+        device=device,
+        block_size=block_size,
+        max_blocks=max_blocks,
+    )
+    total_nll = float(raw["total_nll"])
+    total_tokens = int(raw["total_tokens"])
+    ppl = math.exp(total_nll / max(1, total_tokens))
+    return {
+        "wikitext2_blocks": int(raw["blocks_done"]),
+        "wikitext2_tokens": int(total_tokens),
+        "wikitext2_ppl": float(ppl),
+    }
+
+
+def eval_codenames_subset(
+    *,
+    cfg: Dict[str, Any],
+    model,
+    tokenizer,
+    device: torch.device,
+    n_boards: int,
+    seed: int,
+) -> Dict[str, Any]:
+    from .metrics import aggregate
+
+    subset = sample_codenames_eval_boards(cfg=cfg, n_boards=n_boards, seed=seed)
+    raw = eval_codenames_boards_records(cfg=cfg, model=model, tokenizer=tokenizer, device=device, boards=subset)
+    per_board = raw["per_board"]
+    think_tok = raw["think_tokens"]
+
+    if not per_board:
+        return {"codenames_n_boards": 0}
 
     m = aggregate(per_board)
     return {
@@ -607,7 +761,7 @@ def eval_codenames_subset(
         "team_mean": float(m.get("team_mean", 0.0)),
         "opp_mean": float(m.get("opp_mean", 0.0)),
         "neu_mean": float(m.get("neu_mean", 0.0)),
-        "codenames_spymaster_think_tokens_mean": float(sum(think_tok) / max(1, len(think_tok))),
+        "codenames_spymaster_think_tokens_mean": float(sum(think_tok) / max(1, len(think_tok))) if think_tok else 0.0,
         "codenames_spymaster_think_tokens_p90": float(sorted(think_tok)[int(0.9 * (len(think_tok) - 1))]) if think_tok else 0.0,
     }
 
@@ -629,6 +783,7 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
 def plot_epoch_history(history_path: Path, out_dir: Path) -> None:
     """
     Writes a small set of PNG plots vs epoch.
+    Also plots eval timing curves if timing keys are present.
     """
     import matplotlib.pyplot as plt
 
