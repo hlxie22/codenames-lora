@@ -102,7 +102,7 @@ filtering:
   min_reward: 3.0
 
 training:
-  deepspeed_config: "configs/ds_zero3_bf16.json"
+  deepspeed_config: null
   objective: "dpo" 
   dpo_beta: 0.1
   dpo_reward_margin: 2.0
@@ -127,7 +127,7 @@ training:
 
   attn_implementation: "sdpa"
   gradient_checkpointing: true
-  gradient_checkpointing_use_reentrant: true
+  gradient_checkpointing_use_reentrant: false
 
   distributed:
     num_nodes: 4

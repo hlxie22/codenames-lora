@@ -2,3 +2,7 @@
 /outputs/
 /logs/
 /setup-only.txt
+/.venv/
+/.gitingestignore
+/.gitignore
+/scancel.sh

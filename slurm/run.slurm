@@ -13,6 +13,7 @@
 #SBATCH --error=logs/%x-%j.err
 
 set -euo pipefail
+
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 mkdir -p logs
 
@@ -46,36 +47,20 @@ handle_usr1() {
 trap handle_usr1 USR1
 
 # -----------------------------
-# Conda activation (robust)
+# Conda activation
 # -----------------------------
-# Prefer an explicit CONDA_BASE if provided; otherwise try conda info --base; otherwise common install paths.
-CONDA_BASE="${CONDA_BASE:-}"
-if [[ -z "$CONDA_BASE" ]] && command -v conda >/dev/null 2>&1; then
-  CONDA_BASE="$(conda info --base 2>/dev/null || true)"
-fi
 
-FOUND_CONDA_SH=0
-for base in \
-  "$CONDA_BASE" \
-  "$HOME/miniconda3" \
-  "$HOME/mambaforge" \
-  "$HOME/anaconda3" \
-  "/opt/conda" \
-  "/usr/local/anaconda3" \
-; do
-  if [[ -n "$base" && -f "$base/etc/profile.d/conda.sh" ]]; then
-    # shellcheck disable=SC1090
-    source "$base/etc/profile.d/conda.sh"
-    FOUND_CONDA_SH=1
-    break
-  fi
-done
+module -q load miniforge/24.3.0-0
 
-if (( FOUND_CONDA_SH == 0 )); then
-  echo "ERROR: Could not find conda.sh. Set CONDA_BASE to your conda install prefix."
-  echo "Example: sbatch --export=ALL,CONDA_BASE=\$HOME/miniconda3 slurm/run.slurm"
+CONDA_BASE="/orcd/software/core/001/pkg/miniforge/24.3.0-0"
+if [[ ! -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
+  echo "ERROR: conda.sh not found at: $CONDA_BASE/etc/profile.d/conda.sh" >&2
+  echo "Edit CONDA_BASE/module load lines to match your cluster." >&2
   exit 1
 fi
+
+# shellcheck disable=SC1090
+source "$CONDA_BASE/etc/profile.d/conda.sh"
 
 echo "[$(date)] Activating conda env: $CONDA_ENV"
 conda activate "$CONDA_ENV"
@@ -99,10 +84,10 @@ export PYTHONUNBUFFERED=1
 unset SLURM_MEM_PER_CPU SLURM_MEM_PER_GPU SLURM_MEM_PER_NODE
 
 # -----------------------------
-# Validate required inputs exist (from previous cluster)
+# Validate required inputs exist (from previous steps)
 # -----------------------------
 if [[ ! -f "$CONFIG" ]]; then
-  echo "ERROR: CONFIG not found: $CONFIG"
+  echo "ERROR: CONFIG not found: $CONFIG" >&2
   exit 1
 fi
 
@@ -120,13 +105,13 @@ PY
 )"
 
 if [[ -z "$DPO_PATH" ]]; then
-  echo "ERROR: paths.dpo_pairs_path not found in $CONFIG"
+  echo "ERROR: paths.dpo_pairs_path not found in $CONFIG" >&2
   exit 1
 fi
 
 if [[ ! -s "$DPO_PATH" ]]; then
-  echo "ERROR: DPO pairs file missing or empty: $DPO_PATH"
-  echo "This run.slurm assumes previous steps already produced it on the shared filesystem."
+  echo "ERROR: DPO pairs file missing or empty: $DPO_PATH" >&2
+  echo "This run.slurm assumes previous steps already produced it on the shared filesystem." >&2
   exit 1
 fi
 
@@ -136,7 +121,7 @@ echo "[$(date)] Found DPO pairs: $DPO_PATH"
 # Multi-node torchrun via srun
 # -----------------------------
 NNODES="${SLURM_NNODES:-1}"
-GPUS_PER_NODE="${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-4}}"
+GPUS_PER_NODE="${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-2}}"
 
 MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"
 
@@ -152,7 +137,7 @@ srun --export=ALL \
      --ntasks-per-node=1 \
      --cpus-per-task="${SLURM_CPUS_PER_TASK:-16}" \
      --kill-on-bad-exit=1 \
-     python -c '
+     python - <<'PY' &
 import os, sys, subprocess
 
 node_rank = os.environ.get("SLURM_NODEID", "0")
@@ -182,7 +167,8 @@ if no_epoch_eval:
 
 print(f"[{os.uname().nodename}] node_rank={node_rank} launching: {' '.join(cmd)}", flush=True)
 raise SystemExit(subprocess.call(cmd))
-' &
+PY
+
 MAIN_PID=$!
 wait "$MAIN_PID"
 RC=$?
