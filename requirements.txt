@@ -1,0 +1,46 @@
+# ---- PyTorch ----
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+setuptools>=77.0.3,<80
+
+# Keep torch reasonably modern for vLLM; pin only if you know the cluster combo.
+torch>=2.2.0
+torchvision>=0.17.0
+torchaudio>=2.2.0
+
+# ---- vLLM ----
+vllm==0.10.2
+
+# ---- HF / training stack ----
+datasets>=2.20.0
+transformers>=4.53.0,<5.0.0
+accelerate>=0.34.0
+peft>=0.12.0
+huggingface-hub>=0.25.0
+safetensors>=0.4.3
+tokenizers>=0.19.1
+trl==0.29.0
+
+# ---- embeddings ----
+sentence-transformers>=3.0.0
+
+# ---- general utils ----
+numpy>=1.26.0
+pandas>=2.0.0
+tqdm>=4.66.0
+pyyaml>=6.0.1
+regex
+scipy
+psutil
+matplotlib
+
+# ---- vocab builder + tokenization ----
+wordfreq>=3.1.0
+tiktoken>=0.7.0
+
+sentencepiece
+protobuf
+
+# ---- DeepSpeed ----
+deepspeed==0.18.6
+ninja

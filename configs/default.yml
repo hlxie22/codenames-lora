@@ -1,0 +1,147 @@
+vocab:
+  lang: "en"
+  stop_n: 300
+  min_zipf: 3.0
+  max_zipf: 6.0
+  min_len: 3
+  max_len: 12
+  max_words: 30000
+  token_regex: "^[a-z]+$"
+  extra_banlist: null
+  manifest_path: "data/vocab_manifest.json"
+
+inference:
+  backend: "vllm"   # "hf" or "vllm"
+
+  num_processes: 4
+  batch_size: 16
+
+  vllm:
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.90
+    max_model_len: 4096
+    dtype: "bfloat16"   # "auto" | "float16" | "bfloat16"
+    trust_remote_code: true
+
+    enable_lora: true
+    max_lora_rank: 64
+
+paths:
+  data_dir: "data"
+  outputs_dir: "outputs"
+  vocab_path: "data/vocab.txt"
+  boards_train_path: "data/boards_train.jsonl"
+  boards_eval_path: "data/boards_eval.jsonl"
+  turns_path: "data/turns.jsonl"
+  turns_raw_path: "data/turns_raw.jsonl"
+  dpo_pairs_path: "data/dpo_pairs.jsonl"
+
+boards:
+  sft_max_train_boards: 8000
+  n_train_boards: 8000
+  n_eval_boards: 400
+  board_size: 25
+  n_team: 9
+  n_opp: 8
+  n_neu: 7
+  n_assassin: 1
+  seed_train: 123
+  seed_eval: 456
+  allow_duplicates: false
+  avoid_repeat_boards_within_split: true
+  avoid_repeat_boards_across_splits: true
+
+models:
+  spymaster_model_id: "Qwen/Qwen3-8B"
+  guesser_model_id: "Qwen/Qwen3-8B"
+  embedding_model_id: "sentence-transformers/all-MiniLM-L6-v2"
+
+qwen:
+  use_chat_template: true
+  enable_thinking_spymaster: true
+  enable_thinking_guesser: true
+  system_spymaster: "You are the Spymaster in a Codenames-like game."
+  system_guesser: "You are the Guesser in a Codenames-like game."
+
+decoding:
+  progress_every: 20
+  flush_every: 10
+
+  spymaster_temperature: 0.6
+  spymaster_top_p: 0.95
+  spymaster_top_k: 20
+  spymaster_max_new_tokens: 4096
+
+  guesser_temperature: 0.6
+  guesser_top_p: 0.95
+  guesser_top_k: 20
+  guesser_max_new_tokens: 2048
+
+  n_candidates: 6
+  max_resamples: 2
+
+constraints:
+  single_word_only: true
+  ban_board_words: true
+  ban_substrings: true
+  enable_directness_check: false
+  tau_direct: 0.52
+  directness_metric: "cosine"
+
+reward:
+  team_correct: 1.0
+  opp_wrong: -1.0
+  neu_wrong: -0.5
+  assassin_wrong: -3.0
+  repeat_penalty: 0.0
+  brevity_bonus: 0.0
+
+filtering:
+  mode: "rule_based"
+  require_no_assassin: true
+  min_reward: 3.0
+
+training:
+  deepspeed_config: "configs/ds_zero3_bf16.json"
+  objective: "dpo" 
+  dpo_beta: 0.1
+  dpo_reward_margin: 2.0
+
+  dpo_max_rejected_per_prompt: 3       
+  trl_max_length: 4096                
+  trl_truncation_mode: "keep_start"   
+
+  seed: 999
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  lr: 2.0e-4
+  epochs: 10
+  batch_size: 1
+  grad_accum: 2
+  max_seq_len: 4096
+  output_adapter_dir: "outputs/dpo/lora_spymaster"
+  bf16: true
+  fp16: false
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+  attn_implementation: "sdpa"
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: true
+
+  distributed:
+    num_nodes: 4
+
+epoch_eval:
+  gsm8k_n: 10
+  gsm8k_max_new_tokens: 2048
+
+  humaneval_n: 10
+  humaneval_max_new_tokens: 2048
+  humaneval_timeout_s: 3
+
+  wikitext_n: 20
+  wikitext_block_size: 512
+  wikitext_max_blocks: 80
+
+  codenames_n_boards: 20

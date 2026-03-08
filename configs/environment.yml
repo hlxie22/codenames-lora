@@ -1,0 +1,59 @@
+name: codenames-lora
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pip
+  - git
+  - git-lfs
+  - setuptools>=77.0.3,<80
+  - wheel
+  - matplotlib
+  - ninja
+
+  # core utilities
+  - numpy>=1.26
+  - pyyaml>=6.0.1
+  - tqdm>=4.66.0
+  - regex
+  - scipy
+  - pandas>=2.0.0
+  - psutil
+
+  - sentencepiece
+  - protobuf
+
+  - pip:
+      # PyTorch CUDA wheels 
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.7.0
+      - torchvision==0.22.0
+      - torchaudio==2.7.0
+
+      # vLLM
+      - vllm==0.9.2
+
+      # HF / training stack
+      - transformers==4.53.3
+      - accelerate>=0.34.0
+      - peft>=0.12.0
+      - huggingface-hub>=0.25.0
+      - safetensors>=0.4.3
+      - tokenizers>=0.19.1
+      - datasets>=2.20.0
+      - trl==0.29.0
+
+      # DeepSpeed
+      - deepspeed==0.18.6
+
+      - kernels
+
+      # embeddings
+      - sentence-transformers>=3.0.0
+
+      # vocab builder
+      - wordfreq>=3.1.0
+
+      # tokenizer backend
+      - tiktoken>=0.7.0
