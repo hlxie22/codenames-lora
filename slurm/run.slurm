@@ -23,8 +23,17 @@ mkdir -p logs
 CONFIG="${CONFIG:-configs/default.yml}"
 CONDA_ENV="${CONDA_ENV:-codenames-lora}"
 
-# Optional: set to 1 to disable custom epoch eval callback
+# If 1: disable custom epoch eval callback inside training
 NO_EPOCH_EVAL="${NO_EPOCH_EVAL:-0}"
+
+# If 1: after training, run src.eval (baseline + trained) and write into OUTPUT_ADAPTER_DIR/post_eval/...
+RUN_POST_EVAL="${RUN_POST_EVAL:-1}"
+
+# If 1: when training artifacts exist, skip training and only run missing eval outputs
+SKIP_TRAIN_IF_DONE="${SKIP_TRAIN_IF_DONE:-1}"
+
+# If set to "both" (default), "trained", or "baseline"
+POST_EVAL_WHICH="${POST_EVAL_WHICH:-both}"
 
 # Optional rendezvous port override
 MASTER_PORT="${MASTER_PORT:-29500}"
@@ -47,9 +56,8 @@ handle_usr1() {
 trap handle_usr1 USR1
 
 # -----------------------------
-# Conda activation
+# Conda activation (cluster-specific)
 # -----------------------------
-
 module -q load miniforge/24.3.0-0
 
 CONDA_BASE="/orcd/software/core/001/pkg/miniforge/24.3.0-0"
@@ -80,7 +88,6 @@ export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 export PYTHONUNBUFFERED=1
 
-# Some sites set these and it can confuse launcher tooling; keep consistent behavior.
 unset SLURM_MEM_PER_CPU SLURM_MEM_PER_GPU SLURM_MEM_PER_NODE
 
 # -----------------------------
@@ -91,21 +98,25 @@ if [[ ! -f "$CONFIG" ]]; then
   exit 1
 fi
 
-DPO_PATH="$(python - <<'PY'
-import os, sys
-import yaml
+read -r DPO_PATH OUT_DIR <<EOF
+$(python - <<'PY'
+import os, sys, yaml
 cfg_path = os.environ.get("CONFIG", "configs/default.yml")
-cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8"))
-p = cfg.get("paths", {}).get("dpo_pairs_path")
-if not p:
-  print("", end="")
-  sys.exit(0)
-print(p)
+cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8")) or {}
+dpo = (cfg.get("paths", {}) or {}).get("dpo_pairs_path", "")
+out = (cfg.get("training", {}) or {}).get("output_adapter_dir", "")
+print(dpo)
+print(out)
 PY
-)"
+)
+EOF
 
 if [[ -z "$DPO_PATH" ]]; then
   echo "ERROR: paths.dpo_pairs_path not found in $CONFIG" >&2
+  exit 1
+fi
+if [[ -z "$OUT_DIR" ]]; then
+  echo "ERROR: training.output_adapter_dir not found in $CONFIG" >&2
   exit 1
 fi
 
@@ -114,11 +125,108 @@ if [[ ! -s "$DPO_PATH" ]]; then
   echo "This run.slurm assumes previous steps already produced it on the shared filesystem." >&2
   exit 1
 fi
-
 echo "[$(date)] Found DPO pairs: $DPO_PATH"
+echo "[$(date)] OUT_DIR (training.output_adapter_dir): $OUT_DIR"
 
 # -----------------------------
-# Multi-node torchrun via srun
+# Decide whether training is already done
+# -----------------------------
+TRAIN_DONE=0
+if [[ -s "$OUT_DIR/adapter_model.safetensors" && -s "$OUT_DIR/adapter_config.json" ]]; then
+  TRAIN_DONE=1
+fi
+
+POST_EVAL_ROOT="${POST_EVAL_ROOT:-$OUT_DIR/post_eval}"
+EVAL_BASELINE_DIR="$POST_EVAL_ROOT/baseline"
+EVAL_TRAINED_DIR="$POST_EVAL_ROOT/trained"
+
+NEED_BASELINE=0
+NEED_TRAINED=0
+if [[ "$POST_EVAL_WHICH" == "both" || "$POST_EVAL_WHICH" == "baseline" ]]; then
+  [[ -s "$EVAL_BASELINE_DIR/metrics.json" ]] || NEED_BASELINE=1
+fi
+if [[ "$POST_EVAL_WHICH" == "both" || "$POST_EVAL_WHICH" == "trained" ]]; then
+  [[ -s "$EVAL_TRAINED_DIR/metrics.json" ]] || NEED_TRAINED=1
+fi
+
+EVAL_NEEDED=0
+if (( NEED_BASELINE == 1 || NEED_TRAINED == 1 )); then
+  EVAL_NEEDED=1
+fi
+
+# -----------------------------
+# Helper: run post-eval (baseline + trained)
+# -----------------------------
+run_post_eval() {
+  mkdir -p "$POST_EVAL_ROOT"
+
+  # GPUs available in this job
+  GPUS_PER_NODE="${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-2}}"
+  GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
+  if [[ "$GPUS_PER_NODE" -lt 1 ]]; then
+    GPUS_PER_NODE=1
+  fi
+  echo "[$(date)] Post-eval will use GPUS_PER_NODE=$GPUS_PER_NODE"
+
+  # Make a temp eval config that matches GPU count (prevents inference.num_processes mismatch)
+  EVAL_CONFIG="$POST_EVAL_ROOT/config_eval_autogen.yaml"
+  python - <<'PY'
+import os, yaml
+cfg_path = os.environ["CONFIG"]
+out_path = os.environ["EVAL_CONFIG"]
+gpus = int(os.environ.get("GPUS_PER_NODE", "1"))
+
+cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8")) or {}
+inf = cfg.get("inference", {}) or {}
+inf["num_processes"] = max(1, gpus)
+
+# If using vLLM + multi-proc, tensor_parallel_size should usually be 1
+v = inf.get("vllm", {}) or {}
+v["tensor_parallel_size"] = int(v.get("tensor_parallel_size", 1))
+if inf.get("backend", "hf") == "vllm":
+  v["tensor_parallel_size"] = 1
+inf["vllm"] = v
+
+cfg["inference"] = inf
+
+with open(out_path, "w", encoding="utf-8") as f:
+  yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+print(f"Wrote eval config -> {out_path} (inference.num_processes={inf['num_processes']})")
+PY
+  export EVAL_CONFIG GPUS_PER_NODE
+
+  if (( NEED_BASELINE == 1 )); then
+    echo "[$(date)] Running baseline eval -> $EVAL_BASELINE_DIR"
+    python -m src.eval --config "$EVAL_CONFIG" --mode baseline --out "$EVAL_BASELINE_DIR"
+  else
+    echo "[$(date)] Baseline eval already exists: $EVAL_BASELINE_DIR/metrics.json"
+  fi
+
+  if (( NEED_TRAINED == 1 )); then
+    echo "[$(date)] Running trained eval -> $EVAL_TRAINED_DIR"
+    python -m src.eval --config "$EVAL_CONFIG" --mode trained --out "$EVAL_TRAINED_DIR"
+  else
+    echo "[$(date)] Trained eval already exists: $EVAL_TRAINED_DIR/metrics.json"
+  fi
+}
+
+# -----------------------------
+# Skip-to-eval mode
+# -----------------------------
+if (( TRAIN_DONE == 1 )) && (( SKIP_TRAIN_IF_DONE == 1 )) && (( RUN_POST_EVAL == 1 )) && (( EVAL_NEEDED == 1 )); then
+  echo "[$(date)] Training artifacts detected, eval missing -> skipping training and running post-eval."
+  run_post_eval
+  echo "[$(date)] Done (eval-only)."
+  exit 0
+fi
+
+if (( TRAIN_DONE == 1 )) && (( SKIP_TRAIN_IF_DONE == 1 )) && (( RUN_POST_EVAL == 1 )) && (( EVAL_NEEDED == 0 )); then
+  echo "[$(date)] Training artifacts detected and eval already done -> nothing to do."
+  exit 0
+fi
+
+# -----------------------------
+# Multi-node torchrun via srun (training)
 # -----------------------------
 NNODES="${SLURM_NNODES:-1}"
 GPUS_PER_NODE="${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-2}}"
@@ -128,6 +236,7 @@ MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"
 echo "[$(date)] NNODES=$NNODES GPUS_PER_NODE=$GPUS_PER_NODE"
 echo "[$(date)] MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
 echo "[$(date)] CONFIG=$CONFIG"
+echo "[$(date)] Starting training..."
 
 export NNODES GPUS_PER_NODE MASTER_ADDR MASTER_PORT CONFIG NO_EPOCH_EVAL
 
@@ -174,4 +283,30 @@ wait "$MAIN_PID"
 RC=$?
 set -e
 
-exit "$RC"
+if [[ "$RC" -ne 0 ]]; then
+  echo "[$(date)] Training exited with RC=$RC"
+  exit "$RC"
+fi
+
+echo "[$(date)] Training finished OK."
+
+# -----------------------------
+# Post-eval after training (optional)
+# -----------------------------
+# Recompute NEED_* in case training just created OUT_DIR
+NEED_BASELINE=0
+NEED_TRAINED=0
+if [[ "$POST_EVAL_WHICH" == "both" || "$POST_EVAL_WHICH" == "baseline" ]]; then
+  [[ -s "$EVAL_BASELINE_DIR/metrics.json" ]] || NEED_BASELINE=1
+fi
+if [[ "$POST_EVAL_WHICH" == "both" || "$POST_EVAL_WHICH" == "trained" ]]; then
+  [[ -s "$EVAL_TRAINED_DIR/metrics.json" ]] || NEED_TRAINED=1
+fi
+
+if (( RUN_POST_EVAL == 1 )) && (( NEED_BASELINE == 1 || NEED_TRAINED == 1 )); then
+  echo "[$(date)] Running post-eval..."
+  run_post_eval
+fi
+
+echo "[$(date)] Done."
+exit 0

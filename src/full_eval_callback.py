@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import time
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,7 +15,7 @@ except Exception:
     TrainerCallback = object  # type: ignore[misc]
 
 from .metrics import aggregate
-from .model_wrappers import GenerationConfig, apply_chat_template, Embedder
+from .model_wrappers import apply_chat_template, Embedder
 from .rollout import run_turns_batched
 from .utils import read_jsonl, write_jsonl
 
@@ -98,6 +97,17 @@ def _trainer_device(trainer: Any) -> torch.device:
     return torch.device("cpu")
 
 
+def _infer_device_from_model(model: Any) -> torch.device:
+    try:
+        p = next(model.parameters())
+        return p.device
+    except Exception:
+        lr = int(os.environ.get("LOCAL_RANK", "0"))
+        if torch.cuda.is_available():
+            return torch.device("cuda", lr)
+        return torch.device("cpu")
+
+
 class _InTrainerGenerator:
     """
     Minimal TextGenerator-like adapter around the *current trainer model + tokenizer*.
@@ -130,7 +140,7 @@ class _InTrainerGenerator:
     def generate(
         self,
         prompt_or_messages: str | List[Dict[str, str]],
-        gen_cfg: GenerationConfig,
+        gen_cfg: Any,
         seed: Optional[int] = None,
         *,
         use_chat_template: bool = False,
@@ -154,14 +164,19 @@ class _InTrainerGenerator:
         inputs = self.tokenizer(prompt, return_tensors="pt", padding=False)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        do_sample = float(gen_cfg.temperature) > 1e-6
+        temperature = float(getattr(gen_cfg, "temperature", 0.0))
+        top_p = float(getattr(gen_cfg, "top_p", 1.0))
+        top_k = getattr(gen_cfg, "top_k", None)
+        max_new_tokens = int(getattr(gen_cfg, "max_new_tokens", 256))
+
+        do_sample = temperature > 1e-6
         gen_kwargs = dict(
             **inputs,
             do_sample=do_sample,
-            temperature=float(gen_cfg.temperature) if do_sample else None,
-            top_p=float(gen_cfg.top_p) if do_sample else None,
-            top_k=int(gen_cfg.top_k) if (do_sample and gen_cfg.top_k is not None) else None,
-            max_new_tokens=int(gen_cfg.max_new_tokens),
+            temperature=temperature if do_sample else None,
+            top_p=top_p if do_sample else None,
+            top_k=int(top_k) if (do_sample and top_k is not None) else None,
+            max_new_tokens=max_new_tokens,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
         )
@@ -179,7 +194,7 @@ class _InTrainerGenerator:
     def generate_batch(
         self,
         prompts: List[str],
-        gen_cfg: GenerationConfig,
+        gen_cfg: Any,
         seeds: Optional[List[Optional[int]]] = None,
     ) -> List[str]:
         if seeds is None:
@@ -218,18 +233,25 @@ class FullCodenamesEvalCallback(TrainerCallback):
         if (epoch_i % self.every_epochs) != 0:
             return control
 
-        trainer = kwargs.get("trainer", None)
-        if trainer is None:
-            return control
-
         rank, world = _dist_rank_world()
 
-        model = _unwrap_trainer_model(trainer)
-        tok = _get_tokenizer(trainer)
-        if model is None or tok is None:
-            return control
+        # ---- resolve trainer/model/tokenizer/device ----
+        trainer = kwargs.get("trainer", None)
 
-        device = _trainer_device(trainer)
+        if trainer is not None:
+            model = _unwrap_trainer_model(trainer)
+            tok = _get_tokenizer(trainer)
+            device = _trainer_device(trainer)
+        else:
+            # Fallback: many Trainer/TRL versions do NOT pass `trainer` in kwargs.
+            model = kwargs.get("model", None)
+            tok = kwargs.get("tokenizer", None) or kwargs.get("processing_class", None)
+            device = _infer_device_from_model(model) if model is not None else _infer_device_from_model(object())
+
+        if model is None or tok is None:
+            if rank == 0:
+                print("[full_eval] Could not resolve model/tokenizer from callback kwargs; skipping.")
+            return control
 
         # Load boards (small enough) + shard across ranks
         boards_eval_path = self.cfg["paths"]["boards_eval_path"]
@@ -237,15 +259,8 @@ class FullCodenamesEvalCallback(TrainerCallback):
         boards_local = _shard_list(boards_all, rank, world)
 
         # Generators (same model for spymaster+guesser to avoid loading a second model during training)
-        use_chat = bool(self.cfg.get("qwen", {}).get("use_chat_template", False))
-        q = self.cfg.get("qwen", {}) or {}
-        sp_think = bool(q.get("enable_thinking_spymaster", True))
-        g_think = bool(q.get("enable_thinking_guesser", True))
-
         base_gen = _InTrainerGenerator(model, tok, device, enable_thinking_default=True)
 
-        # We pass enable_thinking per role via rollout's prompting.generate_from_messages,
-        # so generator just needs to support the flag.
         spymaster = base_gen
         guesser = base_gen
 
@@ -329,11 +344,12 @@ class FullCodenamesEvalCallback(TrainerCallback):
 
             (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-            # best-effort Trainer logging
-            try:
-                trainer.log({f"full_eval/{k}": v for k, v in metrics.items() if isinstance(v, (int, float))})
-            except Exception:
-                pass
+            # best-effort Trainer logging (only if we actually have trainer)
+            if trainer is not None:
+                try:
+                    trainer.log({f"full_eval/{k}": v for k, v in metrics.items() if isinstance(v, (int, float))})
+                except Exception:
+                    pass
 
             print(f"[full_eval] wrote {len(per_board_all)} boards -> {per_path}")
             print(f"[full_eval] metrics -> {run_dir / 'metrics.json'}")
