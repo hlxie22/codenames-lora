@@ -13,6 +13,7 @@ mkdir -p logs
 # ---- knobs you change in one place ----
 CONFIG_MAIN="${CONFIG_MAIN:-configs/default.yml}"
 CONFIG_GEN="${CONFIG_GEN:-$CONFIG_MAIN}"
+export CONFIG_MAIN CONFIG_GEN
 
 # If 1: skip gen+merge when final artifacts already exist (non-empty)
 SKIP_IF_READY="${SKIP_IF_READY:-1}"
@@ -62,18 +63,15 @@ PY
 )}"
 
 # ---- resolve artifact paths from CONFIG_MAIN ----
-read -r TURNS_RAW_PATH TURNS_PATH DPO_PAIRS_PATH <<EOF
-$(python - <<'PY'
+# IMPORTANT: print all values on ONE line so read works.
+read -r TURNS_RAW_PATH TURNS_PATH DPO_PAIRS_PATH < <(python - <<'PY'
 import os, yaml
 cfg_path = os.environ.get("CONFIG_MAIN", "configs/default.yml")
 cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8")) or {}
 paths = cfg.get("paths", {}) or {}
-print(paths.get("turns_raw_path",""))
-print(paths.get("turns_path",""))
-print(paths.get("dpo_pairs_path",""))
+print(f"{paths.get('turns_raw_path','')}\t{paths.get('turns_path','')}\t{paths.get('dpo_pairs_path','')}")
 PY
 )
-EOF
 
 if [[ -z "${DPO_PAIRS_PATH}" ]]; then
   echo "ERROR: Could not read paths.dpo_pairs_path from CONFIG_MAIN=$CONFIG_MAIN"

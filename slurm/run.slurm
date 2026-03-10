@@ -21,6 +21,8 @@ mkdir -p logs
 # User-configurable knobs
 # -----------------------------
 CONFIG="${CONFIG:-configs/default.yml}"
+export CONFIG
+
 CONDA_ENV="${CONDA_ENV:-codenames-lora}"
 
 # If 1: disable custom epoch eval callback inside training
@@ -98,18 +100,16 @@ if [[ ! -f "$CONFIG" ]]; then
   exit 1
 fi
 
-read -r DPO_PATH OUT_DIR <<EOF
-$(python - <<'PY'
-import os, sys, yaml
+# IMPORTANT: print both values on ONE line so bash read works.
+read -r DPO_PATH OUT_DIR < <(python - <<'PY'
+import os, yaml
 cfg_path = os.environ.get("CONFIG", "configs/default.yml")
 cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8")) or {}
 dpo = (cfg.get("paths", {}) or {}).get("dpo_pairs_path", "")
 out = (cfg.get("training", {}) or {}).get("output_adapter_dir", "")
-print(dpo)
-print(out)
+print(f"{dpo}\t{out}")
 PY
 )
-EOF
 
 if [[ -z "$DPO_PATH" ]]; then
   echo "ERROR: paths.dpo_pairs_path not found in $CONFIG" >&2
@@ -170,9 +170,11 @@ run_post_eval() {
 
   # Make a temp eval config that matches GPU count (prevents inference.num_processes mismatch)
   EVAL_CONFIG="$POST_EVAL_ROOT/config_eval_autogen.yaml"
+  export EVAL_CONFIG GPUS_PER_NODE
+
   python - <<'PY'
 import os, yaml
-cfg_path = os.environ["CONFIG"]
+cfg_path = os.environ.get("CONFIG", "configs/default.yml")
 out_path = os.environ["EVAL_CONFIG"]
 gpus = int(os.environ.get("GPUS_PER_NODE", "1"))
 
@@ -193,7 +195,6 @@ with open(out_path, "w", encoding="utf-8") as f:
   yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
 print(f"Wrote eval config -> {out_path} (inference.num_processes={inf['num_processes']})")
 PY
-  export EVAL_CONFIG GPUS_PER_NODE
 
   if (( NEED_BASELINE == 1 )); then
     echo "[$(date)] Running baseline eval -> $EVAL_BASELINE_DIR"
@@ -238,7 +239,7 @@ echo "[$(date)] MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
 echo "[$(date)] CONFIG=$CONFIG"
 echo "[$(date)] Starting training..."
 
-export NNODES GPUS_PER_NODE MASTER_ADDR MASTER_PORT CONFIG NO_EPOCH_EVAL
+export NNODES GPUS_PER_NODE MASTER_ADDR MASTER_PORT NO_EPOCH_EVAL
 
 set +e
 srun --export=ALL \
@@ -255,7 +256,7 @@ nnodes = os.environ["NNODES"]
 gpus_per_node = os.environ["GPUS_PER_NODE"]
 master_addr = os.environ["MASTER_ADDR"]
 master_port = os.environ["MASTER_PORT"]
-cfg = os.environ["CONFIG"]
+cfg = os.environ.get("CONFIG", "configs/default.yml")
 no_epoch_eval = os.environ.get("NO_EPOCH_EVAL", "0") == "1"
 
 rdzv_id = os.environ.get("SLURM_JOB_ID", "0")
