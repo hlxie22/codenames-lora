@@ -10,6 +10,25 @@ vocab:
   extra_banlist: null
   manifest_path: "data/vocab_manifest.json"
 
+# ------------------------------------------------------------
+# Iteration knobs (single-config iteration workflow)
+#
+# iter.n:
+#   0 => "base run" writes to original paths/dirs (no suffix)
+#   1 => "iter1" uses previous adapter from iter0 (base dir)
+#   2 => "iter2" uses previous adapter from iter1, etc.
+#
+# iter.use_trained:
+#   false => rollouts from base model; training does NOT init from adapter
+#   true  => rollouts use prev adapter; training initializes from prev adapter
+#
+# You can also override iter.n with env var ITER (e.g., sbatch --export=ALL,ITER=1 ...)
+# ------------------------------------------------------------
+iter:
+  n: 1
+  use_trained: true
+  root: "outputs/dpo"
+
 inference:
   backend: "vllm"   # "hf" or "vllm"
 
@@ -26,15 +45,20 @@ inference:
     enable_lora: true
     max_lora_rank: 64
 
+  # If iter.use_trained=true, rollouts will use this adapter dir (prev iter).
+  rollout_adapter_dir: "{root}{prev_dir}/lora_spymaster"
+
 paths:
   data_dir: "data"
   outputs_dir: "outputs"
   vocab_path: "data/vocab.txt"
   boards_train_path: "data/boards_train.jsonl"
   boards_eval_path: "data/boards_eval.jsonl"
-  turns_path: "data/turns.jsonl"
-  turns_raw_path: "data/turns_raw.jsonl"
-  dpo_pairs_path: "data/dpo_pairs.jsonl"
+
+  # Iteration-scoped artifacts (iter0 keeps original names; iter>=1 gets suffix)
+  turns_path: "data/turns{iter_suffix}.jsonl"
+  turns_raw_path: "data/turns_raw{iter_suffix}.jsonl"
+  dpo_pairs_path: "data/dpo_pairs{iter_suffix}.jsonl"
 
 boards:
   sft_max_train_boards: 8000
@@ -103,13 +127,13 @@ filtering:
 
 training:
   deepspeed_config: null
-  objective: "dpo" 
+  objective: "dpo"
   dpo_beta: 0.1
   dpo_reward_margin: 2.0
 
-  dpo_max_rejected_per_prompt: 3       
-  trl_max_length: 4096                
-  trl_truncation_mode: "keep_start"   
+  dpo_max_rejected_per_prompt: 3
+  trl_max_length: 4096
+  trl_truncation_mode: "keep_start"
 
   seed: 999
   r: 16
@@ -120,7 +144,13 @@ training:
   batch_size: 1
   grad_accum: 2
   max_seq_len: 4096
-  output_adapter_dir: "outputs/dpo/lora_spymaster"
+
+  # Iteration-scoped output adapter dir (iter0 keeps original dir; iter>=1 under /iterN)
+  output_adapter_dir: "{root}{iter_dir}/lora_spymaster"
+
+  # If iter.use_trained=true, training will initialize from this (prev iter).
+  init_adapter_dir: "{root}{prev_dir}/lora_spymaster"
+
   bf16: true
   fp16: false
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]

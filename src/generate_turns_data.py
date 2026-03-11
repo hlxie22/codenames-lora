@@ -10,13 +10,96 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from .io_utils import shard_path_append_to_suffix, merge_jsonl_shards
-from .model_wrappers import Embedder, make_text_generator
+from .model_wrappers import Embedder, make_text_generator, load_lora_on_generator
 from .mp_utils import launch_children, is_child_process, child_shard_info
 from .prompting import render_prompt
 from .rollout import run_turns_batched
 from .spymaster_prompt import build_spymaster_messages
 from .think_utils import extract_think as _extract_think
 from .utils import load_yaml, read_jsonl, set_global_seed, write_jsonl, save_progress
+
+
+# -------------------------
+# vLLM LoRA toggling proxy (share one engine)
+# -------------------------
+
+class _VLLMProxy:
+    """
+    Delegate to a base generator but force a particular LoRA request for calls.
+    Works with VLLMTextGenerator which stores LoRARequest on `._lora_request`.
+    """
+
+    def __init__(self, base, lora_request):
+        self._base = base
+        self._lora_request = lora_request
+        self.model_id = getattr(base, "model_id", "unknown")
+
+    def format_chat(self, *args, **kwargs):
+        return self._base.format_chat(*args, **kwargs)
+
+    def generate(self, *args, **kwargs):
+        old = getattr(self._base, "_lora_request", None)
+        try:
+            setattr(self._base, "_lora_request", self._lora_request)
+            return self._base.generate(*args, **kwargs)
+        finally:
+            setattr(self._base, "_lora_request", old)
+
+    def generate_batch(self, *args, **kwargs):
+        old = getattr(self._base, "_lora_request", None)
+        try:
+            setattr(self._base, "_lora_request", self._lora_request)
+            return self._base.generate_batch(*args, **kwargs)
+        finally:
+            setattr(self._base, "_lora_request", old)
+
+
+def _rollout_adapter_dir(cfg: Dict[str, Any]) -> Optional[str]:
+    """
+    Rollout adapter dir comes from inference.rollout_adapter_dir.
+    (load_yaml() will set it to None when iter.use_trained=false.)
+    """
+    inf = cfg.get("inference", {}) or {}
+    ad = inf.get("rollout_adapter_dir")
+    if not ad:
+        return None
+    return str(ad)
+
+
+def build_rollout_generators(cfg: Dict[str, Any]):
+    """
+    Returns (spymaster_generator, guesser_generator) for rollouts.
+    If rollout_adapter_dir exists, apply it to the spymaster only.
+    """
+    backend = cfg.get("inference", {}).get("backend", "hf")
+    sp_id = cfg["models"]["spymaster_model_id"]
+    g_id = cfg["models"]["guesser_model_id"]
+
+    adapter_dir = _rollout_adapter_dir(cfg)
+    adapter_ok = bool(adapter_dir and Path(adapter_dir).exists())
+
+    # vLLM shared engine case
+    if backend == "vllm" and sp_id == g_id:
+        base = make_text_generator(sp_id, cfg)
+
+        if adapter_ok:
+            base = load_lora_on_generator(base, adapter_dir)  # sets base._lora_request
+            lora_req = getattr(base, "_lora_request", None)
+            setattr(base, "_lora_request", None)  # default: no LoRA
+
+            spymaster = _VLLMProxy(base, lora_req)
+            guesser = _VLLMProxy(base, None)
+            return spymaster, guesser
+
+        return base, base
+
+    # General case: separate generators
+    spymaster = make_text_generator(sp_id, cfg)
+    if adapter_ok:
+        spymaster = load_lora_on_generator(spymaster, adapter_dir)
+
+    guesser = make_text_generator(g_id, cfg)
+    return spymaster, guesser
 
 
 # -------------------------
@@ -380,10 +463,10 @@ def main():
         },
     )
 
-    # Models
-    gen = make_text_generator(cfg["models"]["spymaster_model_id"], cfg)
-    spymaster = gen
-    guesser = gen
+    # -------------------------
+    # Models (optionally load rollout adapter)
+    # -------------------------
+    spymaster, guesser = build_rollout_generators(cfg)
 
     # Embedder (OPTIONAL via constraints.enable_directness_check)
     use_embed = bool(cfg.get("constraints", {}).get("enable_directness_check", True))

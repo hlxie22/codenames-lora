@@ -6,8 +6,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-import numpy as np
 import yaml
+
 
 def now_iso() -> str:
     # Nice for logs/progress: 2026-02-20T13:45:12
@@ -46,12 +46,87 @@ def save_progress(
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     os.replace(tmp, progress_path)
 
+
+def _expand_templates(obj: Any, mapping: Dict[str, Any]) -> Any:
+    """
+    Recursively replace occurrences of {iter}, {prev}, {root}, {iter_suffix}, {prev_suffix},
+    {iter_dir}, {prev_dir} in strings.
+    """
+    if isinstance(obj, dict):
+        return {k: _expand_templates(v, mapping) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_templates(v, mapping) for v in obj]
+    if isinstance(obj, str):
+        s = obj
+        for k, v in mapping.items():
+            s = s.replace("{" + k + "}", str(v))
+        return s
+    return obj
+
+
 def load_yaml(path: str | Path) -> Dict[str, Any]:
+    """
+    Loads YAML and applies iteration templating + knob logic.
+
+    Supported placeholders in YAML strings:
+      {iter}        -> current iteration (int)
+      {prev}        -> iter-1
+      {root}        -> iter.root
+      {iter_suffix} -> "" if iter==0 else "_iter{iter}"
+      {prev_suffix} -> "" if prev==0 else "_iter{prev}"
+      {iter_dir}    -> "" if iter==0 else "/iter{iter}"
+      {prev_dir}    -> "" if prev==0 else "/iter{prev}"
+
+    Knob:
+      iter.use_trained=false => forces inference.rollout_adapter_dir=None and training.init_adapter_dir=None
+      iter.use_trained=true  => uses the expanded adapter dirs (caller should still check existence)
+    """
     with open(path, "r", encoding="utf-8") as f:
         obj = yaml.safe_load(f) or {}
     if not isinstance(obj, dict):
         raise ValueError(f"YAML config must be a mapping/dict: {path}")
-    return obj
+
+    cfg: Dict[str, Any] = obj
+
+    it = (cfg.get("iter", {}) or {})
+    env_iter = os.environ.get("ITER")
+    iter_n = int(env_iter) if env_iter is not None else int(it.get("n", 0))
+    use_trained = bool(it.get("use_trained", False))
+    root = str(it.get("root", "outputs/dpo"))
+    prev = iter_n - 1
+
+    iter_suffix = "" if iter_n == 0 else f"_iter{iter_n}"
+    prev_suffix = "" if prev == 0 else f"_iter{prev}"
+    iter_dir = "" if iter_n == 0 else f"/iter{iter_n}"
+    prev_dir = "" if prev == 0 else f"/iter{prev}"
+
+    mapping = {
+        "iter": iter_n,
+        "prev": prev,
+        "root": root,
+        "iter_suffix": iter_suffix,
+        "prev_suffix": prev_suffix,
+        "iter_dir": iter_dir,
+        "prev_dir": prev_dir,
+    }
+
+    cfg = _expand_templates(cfg, mapping)
+
+    # Write back resolved iteration info for clarity/debugging
+    cfg.setdefault("iter", {})
+    cfg["iter"]["n"] = iter_n
+    cfg["iter"]["prev"] = prev
+    cfg["iter"]["use_trained"] = use_trained
+    cfg["iter"]["root"] = root
+
+    # Apply knob: disable adapter dirs if not using trained
+    if not use_trained:
+        cfg.setdefault("inference", {})
+        cfg["inference"]["rollout_adapter_dir"] = None
+        cfg.setdefault("training", {})
+        cfg["training"]["init_adapter_dir"] = None
+
+    return cfg
 
 
 def ensure_dir(path: str | Path) -> Path:
@@ -78,6 +153,7 @@ def write_jsonl(path: str | Path, records: Iterable[Dict[str, Any]]) -> None:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
+
 def append_jsonl(path: str | Path, obj: Dict[str, Any], *, do_fsync: bool = True) -> None:
     path = Path(path)
     if path.parent and str(path.parent) != "":
@@ -89,10 +165,15 @@ def append_jsonl(path: str | Path, obj: Dict[str, Any], *, do_fsync: bool = True
         if do_fsync:
             os.fsync(f.fileno())
 
+
 def set_global_seed(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
-    np.random.seed(seed)
+    try:
+        import numpy as np  # lazy import
+        np.random.seed(seed)
+    except Exception:
+        pass
     try:
         import torch
         torch.manual_seed(seed)

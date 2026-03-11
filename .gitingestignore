@@ -6,3 +6,5 @@
 /.gitingestignore
 /.gitignore
 /scancel.sh
+/.venv/
+/.venv_pipeline/

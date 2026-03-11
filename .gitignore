@@ -5,3 +5,4 @@ __pycache__/
 digest.txt
 .venv/
 *.pyc
+/.venv_pipeline/

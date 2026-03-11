@@ -25,19 +25,10 @@ export CONFIG
 
 CONDA_ENV="${CONDA_ENV:-codenames-lora}"
 
-# If 1: disable custom epoch eval callback inside training
 NO_EPOCH_EVAL="${NO_EPOCH_EVAL:-0}"
-
-# If 1: after training, run src.eval (baseline + trained) and write into OUTPUT_ADAPTER_DIR/post_eval/...
 RUN_POST_EVAL="${RUN_POST_EVAL:-1}"
-
-# If 1: when training artifacts exist, skip training and only run missing eval outputs
 SKIP_TRAIN_IF_DONE="${SKIP_TRAIN_IF_DONE:-1}"
-
-# If set to "both" (default), "trained", or "baseline"
 POST_EVAL_WHICH="${POST_EVAL_WHICH:-both}"
-
-# Optional rendezvous port override
 MASTER_PORT="${MASTER_PORT:-29500}"
 
 # -----------------------------
@@ -93,18 +84,17 @@ export PYTHONUNBUFFERED=1
 unset SLURM_MEM_PER_CPU SLURM_MEM_PER_GPU SLURM_MEM_PER_NODE
 
 # -----------------------------
-# Validate required inputs exist (from previous steps)
+# Validate required inputs exist
 # -----------------------------
 if [[ ! -f "$CONFIG" ]]; then
   echo "ERROR: CONFIG not found: $CONFIG" >&2
   exit 1
 fi
 
-# IMPORTANT: print both values on ONE line so bash read works.
 read -r DPO_PATH OUT_DIR < <(python - <<'PY'
-import os, yaml
-cfg_path = os.environ.get("CONFIG", "configs/default.yml")
-cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8")) or {}
+import os
+from src.utils import load_yaml
+cfg = load_yaml(os.environ.get("CONFIG","configs/default.yml"))
 dpo = (cfg.get("paths", {}) or {}).get("dpo_pairs_path", "")
 out = (cfg.get("training", {}) or {}).get("output_adapter_dir", "")
 print(f"{dpo}\t{out}")
@@ -127,6 +117,7 @@ if [[ ! -s "$DPO_PATH" ]]; then
 fi
 echo "[$(date)] Found DPO pairs: $DPO_PATH"
 echo "[$(date)] OUT_DIR (training.output_adapter_dir): $OUT_DIR"
+echo "[$(date)] ITER=${ITER:-<unset>}"
 
 # -----------------------------
 # Decide whether training is already done
@@ -160,7 +151,6 @@ fi
 run_post_eval() {
   mkdir -p "$POST_EVAL_ROOT"
 
-  # GPUs available in this job
   GPUS_PER_NODE="${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-2}}"
   GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
   if [[ "$GPUS_PER_NODE" -lt 1 ]]; then
@@ -168,31 +158,31 @@ run_post_eval() {
   fi
   echo "[$(date)] Post-eval will use GPUS_PER_NODE=$GPUS_PER_NODE"
 
-  # Make a temp eval config that matches GPU count (prevents inference.num_processes mismatch)
   EVAL_CONFIG="$POST_EVAL_ROOT/config_eval_autogen.yaml"
   export EVAL_CONFIG GPUS_PER_NODE
 
   python - <<'PY'
 import os, yaml
+from src.utils import load_yaml
+
 cfg_path = os.environ.get("CONFIG", "configs/default.yml")
 out_path = os.environ["EVAL_CONFIG"]
 gpus = int(os.environ.get("GPUS_PER_NODE", "1"))
 
-cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8")) or {}
+cfg = load_yaml(cfg_path)
 inf = cfg.get("inference", {}) or {}
 inf["num_processes"] = max(1, gpus)
 
-# If using vLLM + multi-proc, tensor_parallel_size should usually be 1
 v = inf.get("vllm", {}) or {}
 v["tensor_parallel_size"] = int(v.get("tensor_parallel_size", 1))
 if inf.get("backend", "hf") == "vllm":
   v["tensor_parallel_size"] = 1
 inf["vllm"] = v
-
 cfg["inference"] = inf
 
 with open(out_path, "w", encoding="utf-8") as f:
   yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+
 print(f"Wrote eval config -> {out_path} (inference.num_processes={inf['num_processes']})")
 PY
 
@@ -294,7 +284,6 @@ echo "[$(date)] Training finished OK."
 # -----------------------------
 # Post-eval after training (optional)
 # -----------------------------
-# Recompute NEED_* in case training just created OUT_DIR
 NEED_BASELINE=0
 NEED_TRAINED=0
 if [[ "$POST_EVAL_WHICH" == "both" || "$POST_EVAL_WHICH" == "baseline" ]]; then

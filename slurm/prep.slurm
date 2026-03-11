@@ -19,9 +19,16 @@ if [[ "$CLEAN" == "1" ]]; then
   echo "[clean] Removing existing data artifacts..."
   rm -f data/vocab.txt data/vocab_manifest.json
   rm -f data/boards_train.jsonl data/boards_eval.jsonl
-  rm -f data/turns.jsonl data/turns_raw.jsonl
+
+  # Base + iteration-scoped turns/pairs
+  rm -f data/turns.jsonl data/turns_raw.jsonl data/dpo_pairs.jsonl
+  rm -f data/turns_iter*.jsonl data/turns_raw_iter*.jsonl data/dpo_pairs_iter*.jsonl
+
+  # Shards + progress for any variant
   rm -f data/turns_raw.jsonl.shard*-of-* 2>/dev/null || true
+  rm -f data/turns_raw_iter*.jsonl.shard*-of-* 2>/dev/null || true
   rm -f data/turns_raw.jsonl.*.progress.json 2>/dev/null || true
+  rm -f data/turns_raw_iter*.jsonl.*.progress.json 2>/dev/null || true
 fi
 
 if [[ ! -f data/vocab.txt ]]; then

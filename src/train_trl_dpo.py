@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
-from peft import LoraConfig
+from peft import LoraConfig, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.trainer_utils import get_last_checkpoint
 
@@ -91,24 +91,25 @@ def _make_trainer(
     tok: Any,
     train_dataset: Any,
     dpo_args: Any,
-    peft_cfg: Any,
+    peft_cfg: Optional[Any],
 ) -> Any:
     """
-    Robust init across minor TRL signature drift:
-      - new API: processing_class=...
-      - older API: tokenizer=...
+    Robust init across TRL signature drift + optional PEFT wrapping.
+
+    If peft_cfg is None, we DO NOT pass peft_config (model is already a PeftModel).
     """
-    # Try newest-style first
-    try:
-        return DPOTrainer(
-            model=model,
-            args=dpo_args,
-            train_dataset=train_dataset,
-            processing_class=tok,
-            peft_config=peft_cfg,
-        )
-    except TypeError as e1:
-        # Fall back to tokenizer=...
+    # Newer TRL: processing_class=...
+    if peft_cfg is not None:
+        try:
+            return DPOTrainer(
+                model=model,
+                args=dpo_args,
+                train_dataset=train_dataset,
+                processing_class=tok,
+                peft_config=peft_cfg,
+            )
+        except TypeError:
+            pass
         try:
             return DPOTrainer(
                 model=model,
@@ -118,17 +119,30 @@ def _make_trainer(
                 peft_config=peft_cfg,
             )
         except TypeError:
-            # Last resort: older TRL variants sometimes don't accept peft_config kw name
-            # (rare, but cheap to try)
-            try:
-                return DPOTrainer(
-                    model=model,
-                    args=dpo_args,
-                    train_dataset=train_dataset,
-                    tokenizer=tok,
-                )
-            except TypeError:
-                raise e1
+            pass
+        # fallback (rare)
+        return DPOTrainer(
+            model=model,
+            args=dpo_args,
+            train_dataset=train_dataset,
+            tokenizer=tok,
+        )
+
+    # Already PEFT-wrapped model
+    try:
+        return DPOTrainer(
+            model=model,
+            args=dpo_args,
+            train_dataset=train_dataset,
+            processing_class=tok,
+        )
+    except TypeError:
+        return DPOTrainer(
+            model=model,
+            args=dpo_args,
+            train_dataset=train_dataset,
+            tokenizer=tok,
+        )
 
 
 def main() -> None:
@@ -192,23 +206,31 @@ def main() -> None:
         model.config.use_cache = False
         model.config.pad_token_id = tok.pad_token_id
 
-    # ----- LoRA -----
-    peft_cfg = LoraConfig(
-        r=int(tcfg.get("r", 16)),
-        lora_alpha=int(tcfg.get("alpha", 32)),
-        lora_dropout=float(tcfg.get("dropout", 0.05)),
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=tcfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]),
-    )
-
     out_dir = ensure_dir(tcfg["output_adapter_dir"])
+
+    # ----- LoRA: fresh vs init-from-previous -----
+    init_adapter_dir = tcfg.get("init_adapter_dir") or os.environ.get("INIT_ADAPTER_DIR")
+    init_adapter_dir = str(init_adapter_dir) if init_adapter_dir else ""
+
+    peft_cfg: Optional[Any] = None
+    if init_adapter_dir and Path(init_adapter_dir).exists():
+        print(f"[train_trl_dpo] Initializing from LoRA adapter: {init_adapter_dir}")
+        model = PeftModel.from_pretrained(model, init_adapter_dir, is_trainable=True)
+        peft_cfg = None  # already PEFT-wrapped
+    else:
+        peft_cfg = LoraConfig(
+            r=int(tcfg.get("r", 16)),
+            lora_alpha=int(tcfg.get("alpha", 32)),
+            lora_dropout=float(tcfg.get("dropout", 0.05)),
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=tcfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]),
+        )
 
     # ----- Gradient checkpointing safety -----
     gc_on = bool(tcfg.get("gradient_checkpointing", True))
     user_use_reentrant = bool(tcfg.get("gradient_checkpointing_use_reentrant", False))
 
-    # Force non-reentrant in distributed to avoid DDP "marked ready twice" crashes in DPO+LoRA.
     force_nonreentrant = _should_force_nonreentrant(cfg)
     use_reentrant = user_use_reentrant
     if force_nonreentrant and user_use_reentrant:
@@ -218,7 +240,6 @@ def main() -> None:
         )
         use_reentrant = False
 
-    # Make sure LoRA grads exist under checkpointing.
     _safe_enable_input_grads(model)
     if gc_on:
         _safe_enable_gradient_checkpointing(model, use_reentrant=use_reentrant)
@@ -227,7 +248,6 @@ def main() -> None:
     max_len = int(tcfg.get("trl_max_length", tcfg.get("max_seq_len", 4096)))
     trunc_mode = str(tcfg.get("trl_truncation_mode", "keep_start"))
 
-    # Only pass checkpointing kwargs when checkpointing is enabled.
     gc_kwargs: Optional[Dict[str, Any]] = {"use_reentrant": bool(use_reentrant)} if gc_on else None
 
     dpo_args = DPOConfig(
@@ -244,7 +264,6 @@ def main() -> None:
         deepspeed=str(tcfg.get("deepspeed_config")) if tcfg.get("deepspeed_config") else None,
         gradient_checkpointing=gc_on,
         gradient_checkpointing_kwargs=gc_kwargs,
-        # With LoRA, it's common/expected that many base params are unused; disable extra DDP traversal.
         ddp_find_unused_parameters=False,
         logging_strategy="epoch",
         save_strategy="steps",
@@ -276,7 +295,7 @@ def main() -> None:
 
         trainer.add_callback(FullCodenamesEvalCallback(cfg, out_dir, every_epochs=every, batch_size=bs))
 
-    # Resume
+    # Resume (within this iteration’s output dir)
     last_ckpt = get_last_checkpoint(str(out_dir)) if Path(out_dir).exists() else None
     if last_ckpt:
         print(f"Resuming from checkpoint: {last_ckpt}")
