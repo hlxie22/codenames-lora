@@ -6,6 +6,8 @@ import math
 import os
 import random
 import time
+import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -237,10 +239,8 @@ class _InTrainerGenerator:
         )
 
         with torch.no_grad():
-            try:
-                out = self.model.generate(**gen_kwargs, synced_gpus=_dist_available())
-            except TypeError:
-                out = self.model.generate(**gen_kwargs)
+            # Avoid extra distributed sync inside callbacks
+            out = self.model.generate(**gen_kwargs)
 
         prompt_len = inputs["input_ids"].shape[1]
         gen_ids = out[0][prompt_len:]
@@ -517,6 +517,10 @@ class EpochEvalCallback(TrainerCallback):
     Writes (rank0):
       - <out_dir>/epoch_eval_history.jsonl
       - <out_dir>/epoch_eval_plots/*.png
+
+    Also writes:
+      - <out_dir>/epoch_eval_rank{rank}.err   (full tracebacks)
+      - stderr (SLURM .err)
     """
 
     def __init__(self, cfg: Dict[str, Any], out_dir: str | Path):
@@ -538,12 +542,35 @@ class EpochEvalCallback(TrainerCallback):
         self._last_epoch_logged = epoch_i
 
         rank, world = _dist_rank_world()
+        host = getattr(os, "uname", lambda: type("x", (), {"nodename": "unknown"})())().nodename
+
+        # ---- robust stderr + per-rank file logger ----
+        def _errlog(msg: str) -> None:
+            # stderr -> SLURM .err
+            print(msg, file=sys.stderr, flush=True)
+            # per-rank file
+            try:
+                p = self.out_dir / f"epoch_eval_rank{rank}.err"
+                with p.open("a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+                    f.flush()
+            except Exception:
+                pass
+
+        err_msgs: List[str] = []
 
         trainer = kwargs.get("trainer", None)
         model, tok, device = _resolve_model_tokenizer_device(trainer, kwargs)
         if model is None or tok is None:
+            msg = f"[epoch_eval][rank {rank} host={host}] Could not resolve model/tokenizer; skipping."
+            err_msgs.append(msg)
+            # still gather errors so rank0 sees it
+            all_errs = _all_gather_objects("\n\n".join(err_msgs))
             if rank == 0:
-                print("[epoch_eval] Could not resolve model/tokenizer from callback kwargs; skipping.")
+                for r, s in enumerate(all_errs):
+                    if s:
+                        _errlog(f"[epoch_eval] errors from rank {r}:\n{s}")
+            _barrier()
             return control
 
         ecfg = (self.cfg.get("epoch_eval", {}) or {})
@@ -552,49 +579,71 @@ class EpochEvalCallback(TrainerCallback):
         metrics: Dict[str, Any] = {}
         t0 = time.time()
 
-        # ---- Codenames subset ----
+        # -------------------------
+        # Codenames subset (distributed-safe)
+        # -------------------------
+        per_board_local: List[Dict[str, Any]] = []
+        think_local: List[int] = []
+
         try:
             n_boards = int(ecfg.get("codenames_n_boards", 0))
             if n_boards > 0:
                 seed = int(tcfg.get("seed", 0))
                 subset = sample_codenames_eval_boards(self.cfg, n_boards=n_boards, seed=seed + epoch_i)
-
                 subset_local = _shard_list(subset, rank, world)
+
                 raw = eval_codenames_subset_raw(self.cfg, model, tok, device, subset_local)
-
-                gathered_records = _all_gather_objects(raw.get("per_board", []))
-                per_board: List[Dict[str, Any]] = []
-                for part in gathered_records:
-                    per_board.extend(part or [])
-
-                gathered_think = _all_gather_objects([int(x) for x in raw.get("think_tokens", [])])
-                think_tokens: List[int] = []
-                for part in gathered_think:
-                    think_tokens.extend([int(x) for x in (part or [])])
-
-                if rank == 0 and per_board:
-                    m = aggregate_codenames(per_board)
-                    metrics["codenames_n_boards"] = int(m.get("n_boards", len(per_board)))
-                    metrics["reward_mean"] = float(m.get("reward_mean", 0.0))
-                    metrics["reward_median"] = float(m.get("reward_median", 0.0))
-                    ci = m.get("reward_ci95", (0.0, 0.0))
-                    metrics["reward_ci95_lo"] = float(ci[0]) if isinstance(ci, (list, tuple)) and len(ci) == 2 else 0.0
-                    metrics["reward_ci95_hi"] = float(ci[1]) if isinstance(ci, (list, tuple)) and len(ci) == 2 else 0.0
-                    metrics["assassin_rate"] = float(m.get("assassin_rate", 0.0))
-                    metrics["team_mean"] = float(m.get("team_mean", 0.0))
-                    metrics["opp_mean"] = float(m.get("opp_mean", 0.0))
-                    metrics["neu_mean"] = float(m.get("neu_mean", 0.0))
-                    metrics["directness_mean"] = float(m.get("directness_mean", 0.0))
-
-                    metrics["codenames_spymaster_think_tokens_mean"] = float(_mean([float(x) for x in think_tokens]))
-                    metrics["codenames_spymaster_think_tokens_p90"] = float(_p90([float(x) for x in think_tokens]))
+                per_board_local = list(raw.get("per_board", []) or [])
+                think_local = [int(x) for x in (raw.get("think_tokens", []) or [])]
         except Exception as e:
-            if rank == 0:
-                print(f"[epoch_eval] Codenames subset eval failed: {type(e).__name__}: {e}")
+            err_msgs.append(
+                f"[epoch_eval][rank {rank} host={host}] Codenames subset eval failed: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            # leave locals empty; we still gather below
+
+        # ALWAYS gather (even if empty) so ranks don't diverge
+        gathered_records = _all_gather_objects(per_board_local)
+        per_board: List[Dict[str, Any]] = []
+        for part in gathered_records:
+            per_board.extend(part or [])
+
+        gathered_think = _all_gather_objects(think_local)
+        think_tokens: List[int] = []
+        for part in gathered_think:
+            think_tokens.extend([int(x) for x in (part or [])])
+
+        if rank == 0 and per_board:
+            try:
+                m = aggregate_codenames(per_board)
+                metrics["codenames_n_boards"] = int(m.get("n_boards", len(per_board)))
+                metrics["reward_mean"] = float(m.get("reward_mean", 0.0))
+                metrics["reward_median"] = float(m.get("reward_median", 0.0))
+                ci = m.get("reward_ci95", (0.0, 0.0))
+                metrics["reward_ci95_lo"] = float(ci[0]) if isinstance(ci, (list, tuple)) and len(ci) == 2 else 0.0
+                metrics["reward_ci95_hi"] = float(ci[1]) if isinstance(ci, (list, tuple)) and len(ci) == 2 else 0.0
+                metrics["assassin_rate"] = float(m.get("assassin_rate", 0.0))
+                metrics["team_mean"] = float(m.get("team_mean", 0.0))
+                metrics["opp_mean"] = float(m.get("opp_mean", 0.0))
+                metrics["neu_mean"] = float(m.get("neu_mean", 0.0))
+                metrics["directness_mean"] = float(m.get("directness_mean", 0.0))
+                metrics["codenames_spymaster_think_tokens_mean"] = float(_mean([float(x) for x in think_tokens]))
+                metrics["codenames_spymaster_think_tokens_p90"] = float(_p90([float(x) for x in think_tokens]))
+            except Exception as e:
+                err_msgs.append(
+                    f"[epoch_eval][rank {rank} host={host}] Aggregation/metrics failed: {type(e).__name__}: {e}\n"
+                    f"{traceback.format_exc()}"
+                )
 
         _barrier()
 
-        # ---- Wikitext-2 ppl (best-effort) ----
+        # -------------------------
+        # Wikitext-2 ppl (distributed-safe)
+        # -------------------------
+        wt_total_nll = 0.0
+        wt_total_tokens = 0
+        wt_blocks_done = 0
+
         try:
             wt_n = int(ecfg.get("wikitext_n", 0))
             if wt_n > 0:
@@ -607,22 +656,48 @@ class EpochEvalCallback(TrainerCallback):
                     block_size=int(ecfg.get("wikitext_block_size", 512)),
                     max_blocks=int(ecfg.get("wikitext_max_blocks", 80)),
                 )
-                total_nll = _all_reduce_sum_float(float(raw["total_nll"]), device)
-                total_tokens = _all_reduce_sum_int(int(raw["total_tokens"]), device)
-                blocks_done = _all_reduce_sum_int(int(raw["blocks_done"]), device)
-                ppl = math.exp(total_nll / max(1, total_tokens))
-
-                if rank == 0:
-                    metrics["wikitext2_blocks"] = int(blocks_done)
-                    metrics["wikitext2_tokens"] = int(total_tokens)
-                    metrics["wikitext2_ppl"] = float(ppl)
+                wt_total_nll = float(raw.get("total_nll", 0.0))
+                wt_total_tokens = int(raw.get("total_tokens", 0))
+                wt_blocks_done = int(raw.get("blocks_done", 0))
         except Exception as e:
-            if rank == 0:
-                print(f"[epoch_eval] WikiText-2 eval failed (best-effort): {type(e).__name__}: {e}")
+            err_msgs.append(
+                f"[epoch_eval][rank {rank} host={host}] WikiText-2 eval failed: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            # leave zeros; still all-reduce below
+
+        total_nll = _all_reduce_sum_float(float(wt_total_nll), device)
+        total_tokens = _all_reduce_sum_int(int(wt_total_tokens), device)
+        blocks_done = _all_reduce_sum_int(int(wt_blocks_done), device)
+
+        if rank == 0 and int(ecfg.get("wikitext_n", 0)) > 0:
+            try:
+                ppl = math.exp(total_nll / max(1, total_tokens))
+                metrics["wikitext2_blocks"] = int(blocks_done)
+                metrics["wikitext2_tokens"] = int(total_tokens)
+                metrics["wikitext2_ppl"] = float(ppl)
+            except Exception as e:
+                err_msgs.append(
+                    f"[epoch_eval][rank {rank} host={host}] WikiText-2 metric compute failed: {type(e).__name__}: {e}\n"
+                    f"{traceback.format_exc()}"
+                )
 
         _barrier()
 
-        # ---- write + plot (rank0) ----
+        # -------------------------
+        # Emit gathered errors to rank0 + per-rank files
+        # -------------------------
+        all_errs = _all_gather_objects("\n\n".join([m for m in err_msgs if m.strip()]))
+        if rank == 0:
+            for r, s in enumerate(all_errs):
+                if s:
+                    _errlog(f"[epoch_eval] errors from rank {r}:\n{s}")
+
+        _barrier()
+
+        # -------------------------
+        # write + plot (rank0)
+        # -------------------------
         metrics["epoch"] = int(epoch_i)
         metrics["global_step"] = int(getattr(state, "global_step", 0))
         metrics["epoch_eval_seconds"] = float(time.time() - t0)
@@ -643,9 +718,12 @@ class EpochEvalCallback(TrainerCallback):
             try:
                 plot_epoch_history(self.history_path, self.plots_dir)
             except Exception as e:
-                print(f"[epoch_eval] plot_epoch_history failed: {type(e).__name__}: {e}")
+                _errlog(
+                    f"[epoch_eval][rank {rank} host={host}] plot_epoch_history failed: {type(e).__name__}: {e}\n"
+                    f"{traceback.format_exc()}"
+                )
 
-            print(f"[epoch_eval] wrote epoch {epoch_i} metrics -> {self.history_path}")
+            print(f"[epoch_eval] wrote epoch {epoch_i} metrics -> {self.history_path}", flush=True)
 
         _barrier()
         return control

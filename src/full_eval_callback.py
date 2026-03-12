@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import time
+import sys
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -182,10 +184,8 @@ class _InTrainerGenerator:
         )
 
         with torch.no_grad():
-            try:
-                out = self.model.generate(**gen_kwargs, synced_gpus=_dist_available())
-            except TypeError:
-                out = self.model.generate(**gen_kwargs)
+            # Avoid extra distributed sync inside callbacks
+            out = self.model.generate(**gen_kwargs)
 
         prompt_len = inputs["input_ids"].shape[1]
         gen_ids = out[0][prompt_len:]
@@ -212,6 +212,12 @@ class FullCodenamesEvalCallback(TrainerCallback):
     Outputs:
       <out_dir>/full_eval/epoch_XXX_step_YYY/per_board.jsonl
       <out_dir>/full_eval/epoch_XXX_step_YYY/metrics.json
+
+    Also writes:
+      <out_dir>/full_eval_rank{rank}.err   (tracebacks)
+      stderr (SLURM .err)
+
+    Distributed-safe: all ranks always participate in gathers/barriers.
     """
 
     def __init__(self, cfg: Dict[str, Any], out_dir: str | Path, *, every_epochs: int = 1, batch_size: int = 1):
@@ -234,6 +240,19 @@ class FullCodenamesEvalCallback(TrainerCallback):
             return control
 
         rank, world = _dist_rank_world()
+        host = getattr(os, "uname", lambda: type("x", (), {"nodename": "unknown"})())().nodename
+
+        def _errlog(msg: str) -> None:
+            print(msg, file=sys.stderr, flush=True)
+            try:
+                p = self.out_dir / f"full_eval_rank{rank}.err"
+                with p.open("a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+                    f.flush()
+            except Exception:
+                pass
+
+        err_msgs: List[str] = []
 
         # ---- resolve trainer/model/tokenizer/device ----
         trainer = kwargs.get("trainer", None)
@@ -249,29 +268,45 @@ class FullCodenamesEvalCallback(TrainerCallback):
             device = _infer_device_from_model(model) if model is not None else _infer_device_from_model(object())
 
         if model is None or tok is None:
+            err_msgs.append(f"[full_eval][rank {rank} host={host}] Could not resolve model/tokenizer; skipping.")
+            all_errs = _all_gather_objects("\n\n".join(err_msgs))
             if rank == 0:
-                print("[full_eval] Could not resolve model/tokenizer from callback kwargs; skipping.")
+                for r, s in enumerate(all_errs):
+                    if s:
+                        _errlog(f"[full_eval] errors from rank {r}:\n{s}")
+            _barrier()
             return control
 
         # Load boards (small enough) + shard across ranks
-        boards_eval_path = self.cfg["paths"]["boards_eval_path"]
-        boards_all = read_jsonl(boards_eval_path)
-        boards_local = _shard_list(boards_all, rank, world)
+        boards_local: List[Dict[str, Any]] = []
+        try:
+            boards_eval_path = self.cfg["paths"]["boards_eval_path"]
+            boards_all = read_jsonl(boards_eval_path)
+            boards_local = _shard_list(boards_all, rank, world)
+        except Exception as e:
+            err_msgs.append(
+                f"[full_eval][rank {rank} host={host}] Failed to load/shard boards_eval: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            boards_local = []
 
         # Generators (same model for spymaster+guesser to avoid loading a second model during training)
         base_gen = _InTrainerGenerator(model, tok, device, enable_thinking_default=True)
-
         spymaster = base_gen
         guesser = base_gen
 
         # Optional: directness embedder, but put it on CPU to avoid GPU OOM during training.
-        use_embed = bool(self.cfg.get("constraints", {}).get("enable_directness_check", True))
         embedder = None
-        if use_embed:
-            try:
+        try:
+            use_embed = bool(self.cfg.get("constraints", {}).get("enable_directness_check", True))
+            if use_embed:
                 embedder = Embedder(self.cfg["models"]["embedding_model_id"], device="cpu")
-            except Exception:
-                embedder = None
+        except Exception as e:
+            err_msgs.append(
+                f"[full_eval][rank {rank} host={host}] Embedder init failed: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            embedder = None
 
         # eval loop
         was_training = bool(getattr(model, "training", False))
@@ -283,42 +318,44 @@ class FullCodenamesEvalCallback(TrainerCallback):
         t0 = time.time()
         per_board_local: List[Dict[str, Any]] = []
 
-        # Always eval with n_candidates=1 (like src.eval)
-        n_candidates = 1
+        try:
+            # Always eval with n_candidates=1 (like src.eval)
+            n_candidates = 1
 
-        for start in range(0, len(boards_local), self.batch_size):
-            batch = boards_local[start : start + self.batch_size]
+            for start in range(0, len(boards_local), self.batch_size):
+                batch = boards_local[start : start + self.batch_size]
 
-            bests, metas = run_turns_batched(
-                batch,
-                spymaster,
-                guesser,
-                embedder,
-                self.cfg,
-                n_candidates=n_candidates,
+                bests, metas = run_turns_batched(
+                    batch,
+                    spymaster,
+                    guesser,
+                    embedder,
+                    self.cfg,
+                    n_candidates=n_candidates,
+                )
+
+                for b, best, meta in zip(batch, bests, metas):
+                    rec = {
+                        "board_id": b["board_id"],
+                        "reward": float(best.reward),
+                        "clue": best.clue,
+                        "num": int(best.num),
+                        "guess_words": best.guess_words,
+                        "stats": {**best.stats, "directness": float(best.directness)},
+                        "clue_meta": {
+                            "valid": bool(best.valid),
+                            "rejected_total": int(meta["rejected_total"]),
+                            "rejection_counts": meta["rejection_counts"],
+                        },
+                    }
+                    per_board_local.append(rec)
+
+        except Exception as e:
+            err_msgs.append(
+                f"[full_eval][rank {rank} host={host}] Full eval loop failed: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}"
             )
-
-            for b, best, meta in zip(batch, bests, metas):
-                rec = {
-                    "board_id": b["board_id"],
-                    "reward": float(best.reward),
-                    "clue": best.clue,
-                    "num": int(best.num),
-                    "guess_words": best.guess_words,
-                    "stats": {**best.stats, "directness": float(best.directness)},
-                    "clue_meta": {
-                        "valid": bool(best.valid),
-                        "rejected_total": int(meta["rejected_total"]),
-                        "rejection_counts": meta["rejection_counts"],
-                    },
-                }
-                per_board_local.append(rec)
-
-        # gather all per-board to rank0
-        gathered = _all_gather_objects(per_board_local)
-        per_board_all: List[Dict[str, Any]] = []
-        for part in gathered:
-            per_board_all.extend(part or [])
+            per_board_local = []
 
         # restore mode
         try:
@@ -327,32 +364,54 @@ class FullCodenamesEvalCallback(TrainerCallback):
         except Exception:
             pass
 
+        # ALWAYS gather to avoid rank divergence
+        gathered = _all_gather_objects(per_board_local)
+        per_board_all: List[Dict[str, Any]] = []
+        for part in gathered:
+            per_board_all.extend(part or [])
+
+        _barrier()
+
+        # Gather errors to rank0 and write them (also to per-rank files via stderr on rank0)
+        all_errs = _all_gather_objects("\n\n".join([m for m in err_msgs if m.strip()]))
+        if rank == 0:
+            for r, s in enumerate(all_errs):
+                if s:
+                    _errlog(f"[full_eval] errors from rank {r}:\n{s}")
+
         _barrier()
 
         if rank == 0:
-            run_dir = self.out_dir / "full_eval" / f"epoch_{epoch_i:03d}_step_{int(getattr(state, 'global_step', 0)):06d}"
-            run_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                run_dir = self.out_dir / "full_eval" / f"epoch_{epoch_i:03d}_step_{int(getattr(state, 'global_step', 0)):06d}"
+                run_dir.mkdir(parents=True, exist_ok=True)
 
-            per_path = run_dir / "per_board.jsonl"
-            write_jsonl(per_path, per_board_all)
+                per_path = run_dir / "per_board.jsonl"
+                write_jsonl(per_path, per_board_all)
 
-            metrics = aggregate(per_board_all)
-            metrics["epoch"] = int(epoch_i)
-            metrics["global_step"] = int(getattr(state, "global_step", 0))
-            metrics["eval_seconds"] = float(time.time() - t0)
-            metrics["n_boards_eval"] = int(len(per_board_all))
+                metrics = aggregate(per_board_all)
+                metrics["epoch"] = int(epoch_i)
+                metrics["global_step"] = int(getattr(state, "global_step", 0))
+                metrics["eval_seconds"] = float(time.time() - t0)
+                metrics["n_boards_eval"] = int(len(per_board_all))
 
-            (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+                (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-            # best-effort Trainer logging (only if we actually have trainer)
-            if trainer is not None:
-                try:
-                    trainer.log({f"full_eval/{k}": v for k, v in metrics.items() if isinstance(v, (int, float))})
-                except Exception:
-                    pass
+                # best-effort Trainer logging (only if we actually have trainer)
+                if trainer is not None:
+                    try:
+                        trainer.log({f"full_eval/{k}": v for k, v in metrics.items() if isinstance(v, (int, float))})
+                    except Exception:
+                        pass
 
-            print(f"[full_eval] wrote {len(per_board_all)} boards -> {per_path}")
-            print(f"[full_eval] metrics -> {run_dir / 'metrics.json'}")
+                print(f"[full_eval] wrote {len(per_board_all)} boards -> {per_path}", flush=True)
+                print(f"[full_eval] metrics -> {run_dir / 'metrics.json'}", flush=True)
+
+            except Exception as e:
+                _errlog(
+                    f"[full_eval][rank {rank} host={host}] Writing metrics/output failed: {type(e).__name__}: {e}\n"
+                    f"{traceback.format_exc()}"
+                )
 
         _barrier()
         return control

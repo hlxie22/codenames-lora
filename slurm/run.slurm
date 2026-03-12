@@ -49,6 +49,89 @@ handle_usr1() {
 trap handle_usr1 USR1
 
 # -----------------------------
+# Email notifications (manual; skips requeue exits)
+# -----------------------------
+MAIL_TO="henryxie@college.harvard.edu"            
+MAIL_SUBJECT_PREFIX="slurm"
+SECONDS=0
+START_TS="$(date -Iseconds)"
+
+send_mail() {
+  local subject="$1"
+  local body="$2"
+
+  [[ -n "$MAIL_TO" ]] || return 0
+
+  if command -v mail >/dev/null 2>&1; then
+    printf "%s\n" "$body" | mail -s "$subject" "$MAIL_TO"
+  elif command -v mailx >/dev/null 2>&1; then
+    printf "%s\n" "$body" | mailx -s "$subject" "$MAIL_TO"
+  elif command -v sendmail >/dev/null 2>&1; then
+    {
+      printf "To: %s\n" "$MAIL_TO"
+      printf "Subject: %s\n" "$subject"
+      printf "\n%s\n" "$body"
+    } | sendmail -t
+  else
+    echo "[$(date)] WARNING: no mail/mailx/sendmail found; cannot send email." >&2
+    return 1
+  fi
+}
+
+notify_on_exit() {
+  local rc=$?
+
+  # If this exit is due to our requeue handler, do NOT email.
+  if (( ${REQUEUE_SENT:-0} == 1 )); then
+    return 0
+  fi
+
+  # Be trap-safe
+  set +e
+
+  local end_ts dur out_log err_log status subject body
+  end_ts="$(date -Iseconds)"
+  dur="$SECONDS"
+  out_log="logs/${SLURM_JOB_NAME:-job}-${SLURM_JOB_ID:-unknown}.out"
+  err_log="logs/${SLURM_JOB_NAME:-job}-${SLURM_JOB_ID:-unknown}.err"
+
+  if [[ "$rc" -eq 0 ]]; then
+    status="COMPLETED"
+  else
+    status="FAILED (rc=$rc)"
+  fi
+
+  subject="${MAIL_SUBJECT_PREFIX}: ${SLURM_JOB_NAME:-job} ${SLURM_JOB_ID:-} ${status}"
+
+  body=$(
+    cat <<EOF
+Job notification: $status
+
+JobName:   ${SLURM_JOB_NAME:-}
+JobID:     ${SLURM_JOB_ID:-}
+User:      ${SLURM_JOB_USER:-$USER}
+Cluster:   ${SLURM_CLUSTER_NAME:-}
+Partition: ${SLURM_JOB_PARTITION:-}
+Nodes:     ${SLURM_JOB_NODELIST:-}
+Workdir:   ${SLURM_SUBMIT_DIR:-$(pwd)}
+
+Start:     $START_TS
+End:       $end_ts
+Duration:  ${dur}s
+
+CONFIG:    ${CONFIG:-}
+Stdout:    $out_log
+Stderr:    $err_log
+EOF
+  )
+
+  send_mail "$subject" "$body" >/dev/null 2>&1 || true
+  return 0
+}
+
+trap notify_on_exit EXIT
+
+# -----------------------------
 # Conda activation (cluster-specific)
 # -----------------------------
 module -q load miniforge/24.3.0-0
@@ -171,6 +254,8 @@ gpus = int(os.environ.get("GPUS_PER_NODE", "1"))
 
 cfg = load_yaml(cfg_path)
 inf = cfg.get("inference", {}) or {}
+bs = int(os.environ.get("EVAL_BATCH_SIZE", "4"))
+inf["batch_size"] = bs
 inf["num_processes"] = max(1, gpus)
 
 v = inf.get("vllm", {}) or {}
