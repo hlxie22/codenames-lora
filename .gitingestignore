@@ -5,6 +5,7 @@
 /.venv/
 /.gitingestignore
 /.gitignore
-/scancel.sh
 /.venv/
 /.venv_pipeline/
+/slurm/cleanup_turn_shards.sh
+/scripts/

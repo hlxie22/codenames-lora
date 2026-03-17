@@ -14,8 +14,7 @@ mkdir -p logs
 # Minimal deps for pipeline's inline python:
 #   - needs "import yaml" (PyYAML)
 #
-# IMPORTANT: install to node-local temp (NOT shared FS) to avoid pip
-# rename/RECORD issues on NFS/Lustre.
+# Install to node-local temp to avoid shared-FS pip rename/RECORD issues.
 # -------------------------------------------------------------------
 PYTHON="${PYTHON:-}"
 if [[ -z "${PYTHON}" ]]; then
@@ -29,13 +28,11 @@ if [[ -z "${PYTHON}" ]]; then
   exit 1
 fi
 
-# Node-local scratch if available
 LOCAL_TMP="${PIPELINE_TMP:-${SLURM_TMPDIR:-${TMPDIR:-/tmp}}}"
 JOB_TAG="${SLURM_JOB_ID:-$$}"
 PIPE_PY_PKGS="${PIPE_PY_PKGS:-$LOCAL_TMP/cn_pipeline_pkgs_${USER}_${JOB_TAG}}"
 mkdir -p "$PIPE_PY_PKGS"
 
-# Ensure pip exists (best-effort)
 if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
   if "$PYTHON" -m ensurepip --upgrade >/dev/null 2>&1; then
     :
@@ -46,7 +43,6 @@ if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
   fi
 fi
 
-# Install PyYAML into node-local target dir (retry once on transient FS issues)
 install_pyyaml() {
   "$PYTHON" -m pip install \
     --disable-pip-version-check \
@@ -62,10 +58,8 @@ if ! install_pyyaml >/dev/null 2>&1; then
   install_pyyaml >/dev/null
 fi
 
-# Ensure repo imports + target packages are visible
 export PYTHONPATH="$PIPE_PY_PKGS:$SLURM_SUBMIT_DIR:${PYTHONPATH:-}"
 
-# Sanity check for logs
 "$PYTHON" - <<'PY'
 import sys, yaml
 print("[pipeline] python =", sys.executable)
@@ -77,46 +71,46 @@ CONFIG_MAIN="${CONFIG_MAIN:-configs/default.yml}"
 CONFIG_GEN="${CONFIG_GEN:-$CONFIG_MAIN}"
 export CONFIG_MAIN CONFIG_GEN
 
-# If 1: skip gen+merge when final artifacts already exist (non-empty)
 SKIP_IF_READY="${SKIP_IF_READY:-1}"
 
-# How many SLURM array tasks (jobs) for turn generation.
-# Total global shards = GEN_ARRAY_TASKS * inference.num_processes (usually 4).
 GEN_ARRAY_TASKS="${GEN_ARRAY_TASKS:-4}"
-GEN_PROCS_PER_JOB="${GEN_PROCS_PER_JOB:-4}"  # must match inference.num_processes in CONFIG_GEN
+GEN_PROCS_PER_JOB="${GEN_PROCS_PER_JOB:-4}"
 
-CLEAN="${CLEAN:-0}"                 # sbatch --export=ALL,CLEAN=1 slurm/pipeline.slurm
-ALLOW_MISSING="${ALLOW_MISSING:-0}" # set 1 to merge partial shards (debug only)
+CLEAN="${CLEAN:-0}"
+ALLOW_MISSING="${ALLOW_MISSING:-0}"
 
-# ---- parse TRAIN_NODES from CONFIG_MAIN (training.distributed.num_nodes) ----
 TRAIN_NODES="${TRAIN_NODES:-$(
 "$PYTHON" - <<'PY'
 import os
 from src.utils import load_yaml
-cfg = load_yaml(os.environ.get("CONFIG_MAIN","configs/default.yml"))
-print(int(((cfg.get("training",{}) or {}).get("distributed",{}) or {}).get("num_nodes", 1)))
+cfg = load_yaml(os.environ.get("CONFIG_MAIN", "configs/default.yml"))
+print(int(((cfg.get("training", {}) or {}).get("distributed", {}) or {}).get("num_nodes", 1)))
 PY
 )}"
 
-# ---- resolve artifact paths from CONFIG_MAIN ----
-# IMPORTANT: print all values on ONE line so read works.
-read -r TURNS_RAW_PATH TURNS_PATH DPO_PAIRS_PATH < <("$PYTHON" - <<'PY'
+read -r TURNS_RAW_PATH TURNS_PATH DPO_PAIRS_PATH < <(
+"$PYTHON" - <<'PY'
 import os
 from src.utils import load_yaml
+
 cfg_path = os.environ.get("CONFIG_MAIN", "configs/default.yml")
 cfg = load_yaml(cfg_path)
 paths = cfg.get("paths", {}) or {}
-print(f"{paths.get('turns_raw_path','')}\t{paths.get('turns_path','')}\t{paths.get('dpo_pairs_path','')}")
+print(f"{paths.get('turns_raw_path', '')}\t{paths.get('turns_path', '')}\t{paths.get('dpo_pairs_path', '')}")
 PY
 )
 
+if [[ -z "${TURNS_RAW_PATH}" ]]; then
+  echo "ERROR: Could not read paths.turns_raw_path from CONFIG_MAIN=$CONFIG_MAIN" >&2
+  exit 1
+fi
 if [[ -z "${DPO_PAIRS_PATH}" ]]; then
   echo "ERROR: Could not read paths.dpo_pairs_path from CONFIG_MAIN=$CONFIG_MAIN" >&2
   exit 1
 fi
 
 echo "CONFIG_MAIN=$CONFIG_MAIN"
-echo "CONFIG_GEN =$CONFIG_GEN"
+echo "CONFIG_GEN=$CONFIG_GEN"
 echo "TRAIN_NODES=$TRAIN_NODES"
 echo "GEN_ARRAY_TASKS=$GEN_ARRAY_TASKS"
 echo "GEN_PROCS_PER_JOB=$GEN_PROCS_PER_JOB"
@@ -128,13 +122,14 @@ echo "TURNS_RAW_PATH=$TURNS_RAW_PATH"
 echo "TURNS_PATH=$TURNS_PATH"
 echo "DPO_PAIRS_PATH=$DPO_PAIRS_PATH"
 
-# ---- submit prep (vocab + boards) ----
 PREP_JOB=$(sbatch --parsable --export=ALL,CLEAN="$CLEAN",CONFIG="$CONFIG_MAIN" slurm/prep.slurm)
 echo "prep job: $PREP_JOB"
 
-# ---- fast path: if DPO pairs already exist, skip gen+merge and go straight to train ----
+# -------------------------------------------------------------------
+# Fast path 1: final DPO pairs already exist -> go straight to train
+# -------------------------------------------------------------------
 if [[ "$SKIP_IF_READY" == "1" && "$CLEAN" != "1" && -s "$DPO_PAIRS_PATH" ]]; then
-  echo "[pipeline] Found existing non-empty DPO pairs ($DPO_PAIRS_PATH). Skipping gen + merge."
+  echo "[pipeline] Found existing non-empty DPO pairs ($DPO_PAIRS_PATH). Skipping gen, merge, and build-pairs."
 
   TRAIN_JOB=$(sbatch --parsable \
     --dependency=afterok:"$PREP_JOB" \
@@ -144,17 +139,46 @@ if [[ "$SKIP_IF_READY" == "1" && "$CLEAN" != "1" && -s "$DPO_PAIRS_PATH" ]]; the
     slurm/train.slurm)
 
   echo "train job: $TRAIN_JOB"
-  echo "Pipeline submitted (skipped gen+merge)."
+  echo "Pipeline submitted (used existing DPO pairs)."
   exit 0
 fi
 
-# ---- optional: if all shard files exist, skip gen array and go straight to merge ----
-AUTO_SHARDS="$("$PYTHON" - <<'PY'
-import os, re, glob
+# -------------------------------------------------------------------
+# Fast path 2: merged turns_raw already exists -> rebuild pairs only
+# -------------------------------------------------------------------
+if [[ "$SKIP_IF_READY" == "1" && "$CLEAN" != "1" && -s "$TURNS_RAW_PATH" ]]; then
+  echo "[pipeline] Found existing merged turns_raw ($TURNS_RAW_PATH). Skipping gen + shard merge."
+
+  BUILD_JOB=$(sbatch --parsable \
+    --dependency=afterok:"$PREP_JOB" \
+    --export=ALL,CONFIG="$CONFIG_MAIN" \
+    slurm/build_pairs.slurm)
+  echo "build_pairs job: $BUILD_JOB"
+
+  TRAIN_JOB=$(sbatch --parsable \
+    --dependency=afterok:"$BUILD_JOB" \
+    --nodes="$TRAIN_NODES" \
+    --ntasks-per-node=1 \
+    --export=ALL,CONFIG="$CONFIG_MAIN" \
+    slurm/train.slurm)
+  echo "train job: $TRAIN_JOB"
+
+  echo "Pipeline submitted (used existing merged turns_raw)."
+  exit 0
+fi
+
+# -------------------------------------------------------------------
+# Fast path 3: all shard files already exist -> merge, build pairs, train
+# -------------------------------------------------------------------
+AUTO_SHARDS="$(
+"$PYTHON" - <<'PY'
+import os
+import re
+import glob
 from pathlib import Path
 from src.utils import load_yaml
 
-cfg = load_yaml(os.environ.get("CONFIG_MAIN","configs/default.yml"))
+cfg = load_yaml(os.environ.get("CONFIG_MAIN", "configs/default.yml"))
 base = (cfg.get("paths", {}) or {}).get("turns_raw_path", "")
 if not base:
     print("")
@@ -178,7 +202,6 @@ if len(ns) != 1:
 
 N = next(iter(ns))
 
-# require all shard files to exist and be non-empty
 ok = True
 for sid in range(N):
     tag = f"shard{sid:02d}-of-{N:02d}"
@@ -201,8 +224,14 @@ if [[ "$SKIP_IF_READY" == "1" && "$CLEAN" != "1" && -n "$AUTO_SHARDS" ]]; then
     slurm/merge_turns.slurm)
   echo "merge job: $MERGE_JOB (total_shards=$TOTAL_SHARDS)"
 
-  TRAIN_JOB=$(sbatch --parsable \
+  BUILD_JOB=$(sbatch --parsable \
     --dependency=afterok:"$MERGE_JOB" \
+    --export=ALL,CONFIG="$CONFIG_MAIN" \
+    slurm/build_pairs.slurm)
+  echo "build_pairs job: $BUILD_JOB"
+
+  TRAIN_JOB=$(sbatch --parsable \
+    --dependency=afterok:"$BUILD_JOB" \
     --nodes="$TRAIN_NODES" \
     --ntasks-per-node=1 \
     --export=ALL,CONFIG="$CONFIG_MAIN" \
@@ -213,15 +242,16 @@ if [[ "$SKIP_IF_READY" == "1" && "$CLEAN" != "1" && -n "$AUTO_SHARDS" ]]; then
   exit 0
 fi
 
-# ---- submit generation array (depends on prep) ----
+# -------------------------------------------------------------------
+# Default path: prep -> gen -> merge -> build pairs -> train
+# -------------------------------------------------------------------
 GEN_JOB=$(sbatch --parsable \
   --dependency=afterok:"$PREP_JOB" \
-  --array=0-$((GEN_ARRAY_TASKS-1)) \
+  --array=0-$((GEN_ARRAY_TASKS - 1)) \
   --export=ALL,CONFIG="$CONFIG_GEN",CLEAN="$CLEAN" \
   slurm/gen_turns_array.slurm)
 echo "gen array job: $GEN_JOB (tasks=$GEN_ARRAY_TASKS)"
 
-# ---- submit merge + filter + build_dpo_pairs (depends on ALL array tasks finishing) ----
 TOTAL_SHARDS=$((GEN_ARRAY_TASKS * GEN_PROCS_PER_JOB))
 MERGE_JOB=$(sbatch --parsable \
   --dependency=afterok:"$GEN_JOB" \
@@ -229,9 +259,14 @@ MERGE_JOB=$(sbatch --parsable \
   slurm/merge_turns.slurm)
 echo "merge job: $MERGE_JOB (total_shards=$TOTAL_SHARDS)"
 
-# # ---- submit training (depends on merge) ----
+BUILD_JOB=$(sbatch --parsable \
+  --dependency=afterok:"$MERGE_JOB" \
+  --export=ALL,CONFIG="$CONFIG_MAIN" \
+  slurm/build_pairs.slurm)
+echo "build_pairs job: $BUILD_JOB"
+
 # TRAIN_JOB=$(sbatch --parsable \
-#   --dependency=afterok:"$MERGE_JOB" \
+#   --dependency=afterok:"$BUILD_JOB" \
 #   --nodes="$TRAIN_NODES" \
 #   --ntasks-per-node=1 \
 #   --export=ALL,CONFIG="$CONFIG_MAIN" \

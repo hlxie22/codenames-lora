@@ -517,6 +517,7 @@ class EpochEvalCallback(TrainerCallback):
     Writes (rank0):
       - <out_dir>/epoch_eval_history.jsonl
       - <out_dir>/epoch_eval_plots/*.png
+      - <out_dir>/epoch_eval_board_ids.json
 
     Also writes:
       - <out_dir>/epoch_eval_rank{rank}.err   (full tracebacks)
@@ -529,9 +530,28 @@ class EpochEvalCallback(TrainerCallback):
         self.history_path = self.out_dir / "epoch_eval_history.jsonl"
         self.plots_dir = self.out_dir / "epoch_eval_plots"
         self._last_epoch_logged: Optional[int] = None
+        self._fixed_codenames_boards: Optional[List[Dict[str, Any]]] = None
 
     def on_train_begin(self, args, state, control, **kwargs):
         self.out_dir.mkdir(parents=True, exist_ok=True)
+
+        ecfg = (self.cfg.get("epoch_eval", {}) or {})
+        n_boards = int(ecfg.get("codenames_n_boards", 0))
+        subset_seed = int(ecfg.get("codenames_subset_seed", 0))
+
+        if n_boards > 0:
+            self._fixed_codenames_boards = sample_codenames_eval_boards(
+                self.cfg,
+                n_boards=n_boards,
+                seed=subset_seed,
+            )
+
+            rank, _ = _dist_rank_world()
+            if rank == 0:
+                ids_path = self.out_dir / "epoch_eval_board_ids.json"
+                ids = [b["board_id"] for b in self._fixed_codenames_boards]
+                ids_path.write_text(json.dumps(ids, indent=2), encoding="utf-8")
+
         return control
 
     def on_epoch_end(self, args, state, control, **kwargs):
@@ -588,8 +608,7 @@ class EpochEvalCallback(TrainerCallback):
         try:
             n_boards = int(ecfg.get("codenames_n_boards", 0))
             if n_boards > 0:
-                seed = int(tcfg.get("seed", 0))
-                subset = sample_codenames_eval_boards(self.cfg, n_boards=n_boards, seed=seed + epoch_i)
+                subset = self._fixed_codenames_boards or []
                 subset_local = _shard_list(subset, rank, world)
 
                 raw = eval_codenames_subset_raw(self.cfg, model, tok, device, subset_local)
