@@ -1,6 +1,7 @@
 # src/full_eval_callback.py
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -110,6 +111,21 @@ def _infer_device_from_model(model: Any) -> torch.device:
         return torch.device("cpu")
 
 
+@contextlib.contextmanager
+def _maybe_disable_adapter(model: Any, disable: bool):
+    if not disable:
+        yield
+        return
+
+    cm = getattr(model, "disable_adapter", None)
+    if callable(cm):
+        with cm():
+            yield
+        return
+
+    yield
+
+
 class _InTrainerGenerator:
     """
     Minimal TextGenerator-like adapter around the *current trainer model + tokenizer*.
@@ -118,12 +134,21 @@ class _InTrainerGenerator:
     Avoids loading a second model (which is the usual OOM trap during training).
     """
 
-    def __init__(self, model: Any, tokenizer: Any, device: torch.device, *, enable_thinking_default: bool = True):
+    def __init__(
+        self,
+        model: Any,
+        tokenizer: Any,
+        device: torch.device,
+        *,
+        enable_thinking_default: bool = True,
+        disable_adapter: bool = False,
+    ):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.model_id = getattr(getattr(model, "config", None), "_name_or_path", "trainer_model")
         self.enable_thinking_default = bool(enable_thinking_default)
+        self.disable_adapter = bool(disable_adapter)
 
     def format_chat(
         self,
@@ -184,8 +209,8 @@ class _InTrainerGenerator:
         )
 
         with torch.no_grad():
-            # Avoid extra distributed sync inside callbacks
-            out = self.model.generate(**gen_kwargs)
+            with _maybe_disable_adapter(self.model, self.disable_adapter):
+                out = self.model.generate(**gen_kwargs)
 
         prompt_len = inputs["input_ids"].shape[1]
         gen_ids = out[0][prompt_len:]
@@ -290,10 +315,21 @@ class FullCodenamesEvalCallback(TrainerCallback):
             )
             boards_local = []
 
-        # Generators (same model for spymaster+guesser to avoid loading a second model during training)
-        base_gen = _InTrainerGenerator(model, tok, device, enable_thinking_default=True)
-        spymaster = base_gen
-        guesser = base_gen
+        # Generators: spymaster uses current adapter, guesser uses base model.
+        spymaster = _InTrainerGenerator(
+            model,
+            tok,
+            device,
+            enable_thinking_default=True,
+            disable_adapter=False,
+        )
+        guesser = _InTrainerGenerator(
+            model,
+            tok,
+            device,
+            enable_thinking_default=True,
+            disable_adapter=True,
+        )
 
         # Optional: directness embedder, but put it on CPU to avoid GPU OOM during training.
         embedder = None
@@ -319,7 +355,7 @@ class FullCodenamesEvalCallback(TrainerCallback):
         per_board_local: List[Dict[str, Any]] = []
 
         try:
-            # Always eval with n_candidates=1 (like src.eval)
+            # Always eval with n_candidates=1 and force one-shot behavior (no resampling)
             n_candidates = 1
 
             for start in range(0, len(boards_local), self.batch_size):
@@ -332,6 +368,7 @@ class FullCodenamesEvalCallback(TrainerCallback):
                     embedder,
                     self.cfg,
                     n_candidates=n_candidates,
+                    max_resamples=1,
                 )
 
                 for b, best, meta in zip(batch, bests, metas):

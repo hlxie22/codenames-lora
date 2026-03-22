@@ -174,7 +174,7 @@ def main():
     # Evaluate
     per_board: List[Dict[str, Any]] = []
 
-    # Keep n_candidates=1 in eval
+    # Keep n_candidates=1 in eval and force one-shot behavior (no resampling)
     n_candidates = 1
 
     for start in range(0, len(boards), max(1, batch_size)):
@@ -187,6 +187,7 @@ def main():
             embedder,
             cfg,
             n_candidates=n_candidates,
+            max_resamples=1,
         )
 
         for b, best, meta in zip(batch, bests, metas):

@@ -1,12 +1,16 @@
 # src/epoch_eval.py
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
 import random
-import time
+import re
+import subprocess
 import sys
+import tempfile
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,13 +104,11 @@ def _shard_list(items: List[Any], rank: int, world: int) -> List[Any]:
 
 
 def _infer_device_from_model(model: Any) -> torch.device:
-    # Best-effort: parameters device
     try:
         p = next(model.parameters())
         return p.device
     except Exception:
         pass
-    # Fall back to LOCAL_RANK cuda if available
     lr = int(os.environ.get("LOCAL_RANK", "0"))
     if torch.cuda.is_available():
         return torch.device("cuda", lr)
@@ -117,14 +119,7 @@ def _resolve_model_tokenizer_device(
     trainer: Any,
     kwargs: Dict[str, Any],
 ) -> Tuple[Optional[Any], Optional[Any], torch.device]:
-    """
-    Transformers/TRL callbacks often do NOT include `trainer` in kwargs.
-    So:
-      - If trainer is present, unwrap + take its tokenizer/device.
-      - Else, fall back to kwargs["model"] and kwargs["tokenizer"] (or processing_class).
-    """
     if trainer is not None:
-        # unwrap model (accelerate/deepspeed)
         m = getattr(trainer, "model", None)
         acc = getattr(trainer, "accelerator", None)
         if acc is not None:
@@ -144,11 +139,26 @@ def _resolve_model_tokenizer_device(
             dev = _infer_device_from_model(m)
         return m, tok, dev
 
-    # no trainer: use kwargs
     m = kwargs.get("model", None)
     tok = kwargs.get("tokenizer", None) or kwargs.get("processing_class", None)
     dev = _infer_device_from_model(m) if m is not None else _infer_device_from_model(object())
     return m, tok, dev
+
+
+@contextlib.contextmanager
+def _maybe_disable_adapter(model: Any, disable: bool):
+    if not disable:
+        yield
+        return
+
+    cm = getattr(model, "disable_adapter", None)
+    if callable(cm):
+        with cm():
+            yield
+        return
+
+    # Non-PEFT model or no disable hook available.
+    yield
 
 
 # -------------------------
@@ -165,18 +175,14 @@ class _GenCfg:
 
 class _InTrainerGenerator:
     """
-    Minimal TextGenerator-like adapter around the *current trainer model + tokenizer*.
-
-    Must support:
-      - format_chat(messages, add_generation_prompt, enable_thinking)
-      - generate(prompt_or_messages, gen_cfg, seed, use_chat_template, enable_thinking)
-      - generate_batch(prompts, gen_cfg, seeds)
+    Minimal TextGenerator-like adapter around the current trainer model + tokenizer.
     """
 
-    def __init__(self, model: Any, tokenizer: Any, device: torch.device):
+    def __init__(self, model: Any, tokenizer: Any, device: torch.device, *, disable_adapter: bool = False):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
+        self.disable_adapter = bool(disable_adapter)
         self.model_id = getattr(getattr(model, "config", None), "_name_or_path", "trainer_model")
 
     def format_chat(
@@ -220,7 +226,6 @@ class _InTrainerGenerator:
         inputs = self.tokenizer(prompt, return_tensors="pt", padding=False)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        # gen_cfg is model_wrappers.GenerationConfig in your codebase
         temperature = float(getattr(gen_cfg, "temperature", 0.0))
         top_p = float(getattr(gen_cfg, "top_p", 1.0))
         top_k = getattr(gen_cfg, "top_k", None)
@@ -239,8 +244,8 @@ class _InTrainerGenerator:
         )
 
         with torch.no_grad():
-            # Avoid extra distributed sync inside callbacks
-            out = self.model.generate(**gen_kwargs)
+            with _maybe_disable_adapter(self.model, self.disable_adapter):
+                out = self.model.generate(**gen_kwargs)
 
         prompt_len = inputs["input_ids"].shape[1]
         gen_ids = out[0][prompt_len:]
@@ -261,7 +266,7 @@ class _InTrainerGenerator:
 
 
 # -------------------------
-# Eval pieces
+# Eval pieces: Codenames
 # -------------------------
 
 def sample_codenames_eval_boards(cfg: Dict[str, Any], *, n_boards: int, seed: int) -> List[Dict[str, Any]]:
@@ -279,15 +284,10 @@ def sample_codenames_eval_boards(cfg: Dict[str, Any], *, n_boards: int, seed: in
 
 
 def _count_think_tokens(tokenizer: Any, text: str) -> int:
-    """
-    Count tokens inside the LAST <think>...</think> block if present, else 0.
-    Uses your think_utils if available; falls back to regex.
-    """
     try:
         from .think_utils import extract_think
         think = extract_think(text, mode="inner", which="last", allow_partial=True)
     except Exception:
-        import re
         m = list(re.finditer(r"<think>(.*?)</think>", text, flags=re.IGNORECASE | re.DOTALL))
         think = (m[-1].group(1).strip() if m else "")
 
@@ -310,19 +310,12 @@ def eval_codenames_subset_raw(
     device: torch.device,
     boards: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """
-    Run Codenames gameplay on a subset of boards using the in-trainer model for both roles.
-    Returns raw per-board records + think token stats.
-    """
     if not boards:
         return {"per_board": [], "think_tokens": []}
 
-    # same model for spymaster + guesser (avoids loading second model)
-    base_gen = _InTrainerGenerator(model, tokenizer, device)
-    spymaster = base_gen
-    guesser = base_gen
+    spymaster = _InTrainerGenerator(model, tokenizer, device, disable_adapter=False)
+    guesser = _InTrainerGenerator(model, tokenizer, device, disable_adapter=True)
 
-    # Optional directness embedder; keep it on CPU to avoid OOM during training
     use_embed = bool(cfg.get("constraints", {}).get("enable_directness_check", True))
     embedder = None
     if use_embed:
@@ -331,7 +324,6 @@ def eval_codenames_subset_raw(
         except Exception:
             embedder = None
 
-    # eval loop (batched by inference.batch_size)
     bs = int(cfg.get("inference", {}).get("batch_size", 1))
     bs = max(1, bs)
 
@@ -347,7 +339,6 @@ def eval_codenames_subset_raw(
     try:
         for start in range(0, len(boards), bs):
             batch = boards[start : start + bs]
-            # n_candidates=1 for eval
             bests, metas = run_turns_batched(
                 batch,
                 spymaster,
@@ -355,6 +346,7 @@ def eval_codenames_subset_raw(
                 embedder,
                 cfg,
                 n_candidates=1,
+                max_resamples=1,
             )
 
             for b, best, meta in zip(batch, bests, metas):
@@ -384,6 +376,10 @@ def eval_codenames_subset_raw(
     return {"per_board": per_board, "think_tokens": think_tokens}
 
 
+# -------------------------
+# Eval pieces: WikiText-2 PPL
+# -------------------------
+
 def eval_wikitext2_ppl_raw(
     model: Any,
     tokenizer: Any,
@@ -394,10 +390,6 @@ def eval_wikitext2_ppl_raw(
     block_size: int,
     max_blocks: int,
 ) -> Dict[str, Any]:
-    """
-    Best-effort Wikitext-2 perplexity on a small sample.
-    If datasets loading fails, caller should catch.
-    """
     from datasets import load_dataset  # type: ignore
 
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
@@ -421,7 +413,6 @@ def eval_wikitext2_ppl_raw(
             for t in texts:
                 enc = tokenizer(t, return_tensors="pt", truncation=False)
                 ids = enc["input_ids"][0]
-                # chunk into blocks
                 for start in range(0, int(ids.shape[0]), int(block_size)):
                     if blocks_done >= int(max_blocks):
                         break
@@ -430,7 +421,6 @@ def eval_wikitext2_ppl_raw(
                         continue
                     inp = chunk.unsqueeze(0).to(device)
                     out = model(input_ids=inp, labels=inp)
-                    # HF returns mean loss over tokens; convert to sum nll
                     loss = float(out.loss)
                     n_tok = int(inp.numel())
                     total_nll += loss * n_tok
@@ -448,11 +438,315 @@ def eval_wikitext2_ppl_raw(
     return {"total_nll": total_nll, "total_tokens": total_tokens, "blocks_done": blocks_done}
 
 
+# -------------------------
+# Eval pieces: GSM8K
+# -------------------------
+
+_GSM8K_GOLD_RE = re.compile(r"####\s*([-+]?\d[\d,]*(?:\.\d+)?)")
+_GSM8K_FINAL_RE = re.compile(r"(?:FINAL|ANSWER)\s*:\s*([-+]?\d[\d,]*(?:\.\d+)?)", re.IGNORECASE)
+_GSM8K_BOXED_RE = re.compile(r"\\boxed\{([^}]+)\}")
+_ANY_NUM_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
+
+
+def _norm_num_str(s: str) -> str:
+    s = s.strip().replace(",", "")
+    if s.endswith("."):
+        s = s[:-1]
+    return s
+
+
+def _extract_gsm8k_gold(answer: str) -> str:
+    m = _GSM8K_GOLD_RE.search(answer or "")
+    if m:
+        return _norm_num_str(m.group(1))
+
+    ms = _ANY_NUM_RE.findall(answer or "")
+    if ms:
+        return _norm_num_str(ms[-1])
+
+    return ""
+
+
+def _extract_gsm8k_pred(text: str) -> str:
+    t = text or ""
+
+    m = _GSM8K_FINAL_RE.search(t)
+    if m:
+        return _norm_num_str(m.group(1))
+
+    m = _GSM8K_BOXED_RE.search(t)
+    if m:
+        inner = m.group(1)
+        ms = _ANY_NUM_RE.findall(inner)
+        if ms:
+            return _norm_num_str(ms[-1])
+
+    ms = _ANY_NUM_RE.findall(t)
+    if ms:
+        return _norm_num_str(ms[-1])
+
+    return ""
+
+
+def load_gsm8k_subset(*, n: int, seed: int) -> List[Dict[str, Any]]:
+    from datasets import load_dataset  # type: ignore
+
+    ds = load_dataset("openai/gsm8k", "main", split="test")
+    rows = [{"question": q, "answer": a, "idx": i} for i, (q, a) in enumerate(zip(ds["question"], ds["answer"]))]
+
+    if n <= 0:
+        return []
+    if n >= len(rows):
+        return rows
+
+    rng = random.Random(int(seed))
+    idxs = list(range(len(rows)))
+    rng.shuffle(idxs)
+    take = sorted(idxs[:n])
+    return [rows[i] for i in take]
+
+
+def eval_gsm8k_raw(
+    model: Any,
+    tokenizer: Any,
+    device: torch.device,
+    examples: List[Dict[str, Any]],
+    *,
+    max_new_tokens: int,
+) -> Dict[str, Any]:
+    if not examples:
+        return {"n": 0, "correct": 0, "records": []}
+
+    gen = _InTrainerGenerator(model, tokenizer, device)
+    gen_cfg = _GenCfg(
+        temperature=0.0,
+        top_p=1.0,
+        top_k=None,
+        max_new_tokens=int(max_new_tokens),
+    )
+
+    was_training = bool(getattr(model, "training", False))
+    try:
+        model.eval()
+    except Exception:
+        pass
+
+    records: List[Dict[str, Any]] = []
+    correct = 0
+
+    try:
+        for ex in examples:
+            messages = [
+                {
+                    "role": "system",
+                    "content": "Solve the math word problem carefully. End with exactly one line: FINAL: <number>",
+                },
+                {
+                    "role": "user",
+                    "content": ex["question"],
+                },
+            ]
+
+            out = gen.generate(
+                messages,
+                gen_cfg,
+                seed=1234 + int(ex["idx"]),
+                use_chat_template=True,
+                enable_thinking=True,
+            )
+
+            gold = _extract_gsm8k_gold(ex["answer"])
+            pred = _extract_gsm8k_pred(out)
+            ok = (gold != "" and pred == gold)
+            correct += int(ok)
+
+            records.append(
+                {
+                    "idx": int(ex["idx"]),
+                    "gold": gold,
+                    "pred": pred,
+                    "correct": bool(ok),
+                }
+            )
+    finally:
+        try:
+            if was_training:
+                model.train()
+        except Exception:
+            pass
+
+    return {"n": len(examples), "correct": correct, "records": records}
+
+
+# -------------------------
+# Eval pieces: HumanEval
+# -------------------------
+
+def load_humaneval_subset(*, n: int, seed: int) -> List[Dict[str, Any]]:
+    from datasets import load_dataset  # type: ignore
+
+    ds = load_dataset("openai/openai_humaneval", split="test")
+    rows: List[Dict[str, Any]] = []
+    for i in range(len(ds)):
+        rows.append(
+            {
+                "task_id": ds[i]["task_id"],
+                "prompt": ds[i]["prompt"],
+                "test": ds[i]["test"],
+                "entry_point": ds[i]["entry_point"],
+                "idx": i,
+            }
+        )
+
+    if n <= 0:
+        return []
+    if n >= len(rows):
+        return rows
+
+    rng = random.Random(int(seed))
+    idxs = list(range(len(rows)))
+    rng.shuffle(idxs)
+    take = sorted(idxs[:n])
+    return [rows[i] for i in take]
+
+
+def _strip_code_fences(text: str) -> str:
+    t = text or ""
+    m = re.search(r"```(?:python)?\n(.*?)```", t, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return t.strip()
+
+
+def _cleanup_humaneval_completion(text: str) -> str:
+    try:
+        from .think_utils import strip_think_blocks
+        text = strip_think_blocks(text, remove_dangling_tags=True)
+    except Exception:
+        pass
+
+    text = _strip_code_fences(text)
+
+    lines = text.splitlines()
+    cleaned: List[str] = []
+    for line in lines:
+        if line.strip().startswith("```"):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip("\n")
+
+
+def _run_humaneval_check(
+    prompt: str,
+    completion: str,
+    test_code: str,
+    entry_point: str,
+    timeout_s: int,
+) -> Tuple[bool, str]:
+    program = (
+        prompt
+        + completion
+        + "\n\n"
+        + test_code
+        + f"\n\ncheck({entry_point})\nprint('HUMANEVAL_PASS')\n"
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "humaneval_check.py"
+        p.write_text(program, encoding="utf-8")
+
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(p)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=int(timeout_s),
+            )
+        except subprocess.TimeoutExpired:
+            return False, "timeout"
+
+        ok = (proc.returncode == 0) and ("HUMANEVAL_PASS" in proc.stdout)
+        if ok:
+            return True, "ok"
+
+        detail = (proc.stderr or proc.stdout or f"returncode={proc.returncode}").strip()
+        if len(detail) > 500:
+            detail = detail[:500]
+        return False, detail
+
+
+def eval_humaneval_raw(
+    model: Any,
+    tokenizer: Any,
+    device: torch.device,
+    examples: List[Dict[str, Any]],
+    *,
+    max_new_tokens: int,
+    timeout_s: int,
+) -> Dict[str, Any]:
+    if not examples:
+        return {"n": 0, "passed": 0, "records": []}
+
+    gen = _InTrainerGenerator(model, tokenizer, device)
+    gen_cfg = _GenCfg(
+        temperature=0.0,
+        top_p=1.0,
+        top_k=None,
+        max_new_tokens=int(max_new_tokens),
+    )
+
+    was_training = bool(getattr(model, "training", False))
+    try:
+        model.eval()
+    except Exception:
+        pass
+
+    passed = 0
+    records: List[Dict[str, Any]] = []
+
+    try:
+        for ex in examples:
+            out = gen.generate(
+                ex["prompt"],
+                gen_cfg,
+                seed=4321 + int(ex["idx"]),
+                use_chat_template=False,
+                enable_thinking=False,
+            )
+
+            completion = _cleanup_humaneval_completion(out)
+            ok, detail = _run_humaneval_check(
+                ex["prompt"],
+                completion,
+                ex["test"],
+                ex["entry_point"],
+                timeout_s=int(timeout_s),
+            )
+            passed += int(ok)
+
+            records.append(
+                {
+                    "task_id": ex["task_id"],
+                    "passed": bool(ok),
+                    "detail": "ok" if ok else detail,
+                }
+            )
+    finally:
+        try:
+            if was_training:
+                model.train()
+        except Exception:
+            pass
+
+    return {"n": len(examples), "passed": passed, "records": records}
+
+
+# -------------------------
+# Plotting
+# -------------------------
+
 def plot_epoch_history(history_path: Path, plots_dir: Path) -> None:
-    """
-    Simple plotting utility: makes line plots for a few common metrics.
-    Safe to call repeatedly; overwrites PNGs.
-    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # type: ignore
@@ -488,6 +782,8 @@ def plot_epoch_history(history_path: Path, plots_dir: Path) -> None:
         "assassin_rate",
         "directness_mean",
         "wikitext2_ppl",
+        "gsm8k_exact_match",
+        "humaneval_pass_at_1",
         "codenames_spymaster_think_tokens_mean",
         "codenames_spymaster_think_tokens_p90",
     ]
@@ -512,16 +808,12 @@ def plot_epoch_history(history_path: Path, plots_dir: Path) -> None:
 
 class EpochEvalCallback(TrainerCallback):
     """
-    End-of-epoch eval callback that does not assume `trainer` is passed in kwargs.
+    End-of-epoch eval callback.
 
     Writes (rank0):
       - <out_dir>/epoch_eval_history.jsonl
       - <out_dir>/epoch_eval_plots/*.png
       - <out_dir>/epoch_eval_board_ids.json
-
-    Also writes:
-      - <out_dir>/epoch_eval_rank{rank}.err   (full tracebacks)
-      - stderr (SLURM .err)
     """
 
     def __init__(self, cfg: Dict[str, Any], out_dir: str | Path):
@@ -531,11 +823,14 @@ class EpochEvalCallback(TrainerCallback):
         self.plots_dir = self.out_dir / "epoch_eval_plots"
         self._last_epoch_logged: Optional[int] = None
         self._fixed_codenames_boards: Optional[List[Dict[str, Any]]] = None
+        self._fixed_gsm8k_examples: Optional[List[Dict[str, Any]]] = None
+        self._fixed_humaneval_examples: Optional[List[Dict[str, Any]]] = None
 
     def on_train_begin(self, args, state, control, **kwargs):
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
         ecfg = (self.cfg.get("epoch_eval", {}) or {})
+
         n_boards = int(ecfg.get("codenames_n_boards", 0))
         subset_seed = int(ecfg.get("codenames_subset_seed", 0))
 
@@ -552,6 +847,16 @@ class EpochEvalCallback(TrainerCallback):
                 ids = [b["board_id"] for b in self._fixed_codenames_boards]
                 ids_path.write_text(json.dumps(ids, indent=2), encoding="utf-8")
 
+        gsm8k_n = int(ecfg.get("gsm8k_n", 0))
+        if gsm8k_n > 0:
+            gsm8k_seed = int(ecfg.get("gsm8k_seed", 2027))
+            self._fixed_gsm8k_examples = load_gsm8k_subset(n=gsm8k_n, seed=gsm8k_seed)
+
+        humaneval_n = int(ecfg.get("humaneval_n", 0))
+        if humaneval_n > 0:
+            humaneval_seed = int(ecfg.get("humaneval_seed", 2028))
+            self._fixed_humaneval_examples = load_humaneval_subset(n=humaneval_n, seed=humaneval_seed)
+
         return control
 
     def on_epoch_end(self, args, state, control, **kwargs):
@@ -564,11 +869,8 @@ class EpochEvalCallback(TrainerCallback):
         rank, world = _dist_rank_world()
         host = getattr(os, "uname", lambda: type("x", (), {"nodename": "unknown"})())().nodename
 
-        # ---- robust stderr + per-rank file logger ----
         def _errlog(msg: str) -> None:
-            # stderr -> SLURM .err
             print(msg, file=sys.stderr, flush=True)
-            # per-rank file
             try:
                 p = self.out_dir / f"epoch_eval_rank{rank}.err"
                 with p.open("a", encoding="utf-8") as f:
@@ -584,7 +886,6 @@ class EpochEvalCallback(TrainerCallback):
         if model is None or tok is None:
             msg = f"[epoch_eval][rank {rank} host={host}] Could not resolve model/tokenizer; skipping."
             err_msgs.append(msg)
-            # still gather errors so rank0 sees it
             all_errs = _all_gather_objects("\n\n".join(err_msgs))
             if rank == 0:
                 for r, s in enumerate(all_errs):
@@ -600,7 +901,7 @@ class EpochEvalCallback(TrainerCallback):
         t0 = time.time()
 
         # -------------------------
-        # Codenames subset (distributed-safe)
+        # Codenames subset
         # -------------------------
         per_board_local: List[Dict[str, Any]] = []
         think_local: List[int] = []
@@ -619,9 +920,7 @@ class EpochEvalCallback(TrainerCallback):
                 f"[epoch_eval][rank {rank} host={host}] Codenames subset eval failed: {type(e).__name__}: {e}\n"
                 f"{traceback.format_exc()}"
             )
-            # leave locals empty; we still gather below
 
-        # ALWAYS gather (even if empty) so ranks don't diverge
         gathered_records = _all_gather_objects(per_board_local)
         per_board: List[Dict[str, Any]] = []
         for part in gathered_records:
@@ -657,7 +956,7 @@ class EpochEvalCallback(TrainerCallback):
         _barrier()
 
         # -------------------------
-        # Wikitext-2 ppl (distributed-safe)
+        # WikiText-2 PPL
         # -------------------------
         wt_total_nll = 0.0
         wt_total_tokens = 0
@@ -683,7 +982,6 @@ class EpochEvalCallback(TrainerCallback):
                 f"[epoch_eval][rank {rank} host={host}] WikiText-2 eval failed: {type(e).__name__}: {e}\n"
                 f"{traceback.format_exc()}"
             )
-            # leave zeros; still all-reduce below
 
         total_nll = _all_reduce_sum_float(float(wt_total_nll), device)
         total_tokens = _all_reduce_sum_int(int(wt_total_tokens), device)
@@ -704,7 +1002,80 @@ class EpochEvalCallback(TrainerCallback):
         _barrier()
 
         # -------------------------
-        # Emit gathered errors to rank0 + per-rank files
+        # GSM8K
+        # -------------------------
+        gsm_correct_local = 0
+        gsm_total_local = 0
+
+        try:
+            gsm_n = int(ecfg.get("gsm8k_n", 0))
+            if gsm_n > 0:
+                subset = self._fixed_gsm8k_examples or []
+                subset_local = _shard_list(subset, rank, world)
+
+                raw = eval_gsm8k_raw(
+                    model=model,
+                    tokenizer=tok,
+                    device=device,
+                    examples=subset_local,
+                    max_new_tokens=int(ecfg.get("gsm8k_max_new_tokens", 1024)),
+                )
+                gsm_correct_local = int(raw.get("correct", 0))
+                gsm_total_local = int(raw.get("n", 0))
+        except Exception as e:
+            err_msgs.append(
+                f"[epoch_eval][rank {rank} host={host}] GSM8K eval failed: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+
+        gsm_correct = _all_reduce_sum_int(gsm_correct_local, device)
+        gsm_total = _all_reduce_sum_int(gsm_total_local, device)
+
+        if rank == 0 and int(ecfg.get("gsm8k_n", 0)) > 0:
+            metrics["gsm8k_n"] = int(gsm_total)
+            metrics["gsm8k_exact_match"] = float(gsm_correct / max(1, gsm_total))
+
+        _barrier()
+
+        # -------------------------
+        # HumanEval
+        # -------------------------
+        he_pass_local = 0
+        he_total_local = 0
+
+        try:
+            he_n = int(ecfg.get("humaneval_n", 0))
+            if he_n > 0:
+                subset = self._fixed_humaneval_examples or []
+                subset_local = _shard_list(subset, rank, world)
+
+                raw = eval_humaneval_raw(
+                    model=model,
+                    tokenizer=tok,
+                    device=device,
+                    examples=subset_local,
+                    max_new_tokens=int(ecfg.get("humaneval_max_new_tokens", 1024)),
+                    timeout_s=int(ecfg.get("humaneval_timeout_s", 3)),
+                )
+                he_pass_local = int(raw.get("passed", 0))
+                he_total_local = int(raw.get("n", 0))
+        except Exception as e:
+            err_msgs.append(
+                f"[epoch_eval][rank {rank} host={host}] HumanEval failed: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+
+        he_pass = _all_reduce_sum_int(he_pass_local, device)
+        he_total = _all_reduce_sum_int(he_total_local, device)
+
+        if rank == 0 and int(ecfg.get("humaneval_n", 0)) > 0:
+            metrics["humaneval_n"] = int(he_total)
+            metrics["humaneval_pass_at_1"] = float(he_pass / max(1, he_total))
+
+        _barrier()
+
+        # -------------------------
+        # Emit gathered errors to rank0
         # -------------------------
         all_errs = _all_gather_objects("\n\n".join([m for m in err_msgs if m.strip()]))
         if rank == 0:
@@ -715,7 +1086,7 @@ class EpochEvalCallback(TrainerCallback):
         _barrier()
 
         # -------------------------
-        # write + plot (rank0)
+        # Write + plot (rank0)
         # -------------------------
         metrics["epoch"] = int(epoch_i)
         metrics["global_step"] = int(getattr(state, "global_step", 0))
@@ -726,7 +1097,6 @@ class EpochEvalCallback(TrainerCallback):
             with self.history_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
 
-            # If trainer exists, also log into trainer
             tr = trainer
             if tr is not None:
                 try:

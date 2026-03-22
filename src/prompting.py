@@ -14,7 +14,7 @@ def _use_chat_template(cfg: Dict[str, Any]) -> bool:
 def _enable_thinking(cfg: Dict[str, Any], role: Role) -> bool:
     q = cfg.get("qwen", {}) or {}
     if role == "spymaster":
-        return bool(q.get("enable_thinking_spymaster", True))
+        return bool(q.get("enable_thinking_spymaster", False))
     if role == "guesser":
         return bool(q.get("enable_thinking_guesser", True))
     return bool(q.get("enable_thinking", True))

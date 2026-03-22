@@ -25,7 +25,7 @@ vocab:
 # You can also override iter.n with env var ITER (e.g., sbatch --export=ALL,ITER=1 ...)
 # ------------------------------------------------------------
 iter:
-  n: 2
+  n: 0
   use_trained: true
   root: "outputs/dpo"
 
@@ -82,9 +82,9 @@ models:
 
 qwen:
   use_chat_template: true
-  enable_thinking_spymaster: true
+  enable_thinking_spymaster: false
   enable_thinking_guesser: true
-  system_spymaster: "You are the Spymaster in a Codenames-like game."
+  system_spymaster: "You are the Spymaster in a Codenames-like game. Reason carefully, but keep your reasoning concise and decision-focused."
   system_guesser: "You are the Guesser in a Codenames-like game."
 
 decoding:
@@ -94,7 +94,7 @@ decoding:
   spymaster_temperature: 0.6
   spymaster_top_p: 0.95
   spymaster_top_k: 20
-  spymaster_max_new_tokens: 4096
+  spymaster_max_new_tokens: 2048
 
   guesser_temperature: 0.6
   guesser_top_p: 0.95
@@ -168,16 +168,19 @@ training:
     max_opp_wrong: null
     max_neu_wrong: null
     require_no_assassin: true
+    require_valid: true
 
   dpo_mix_previous_pairs: true
   dpo_mix_num_previous_iters: 1
 
 epoch_eval:
   gsm8k_n: 10
-  gsm8k_max_new_tokens: 2048
+  gsm8k_seed: 2027
+  gsm8k_max_new_tokens: 1024
 
   humaneval_n: 10
-  humaneval_max_new_tokens: 2048
+  humaneval_seed: 2028
+  humaneval_max_new_tokens: 1024
   humaneval_timeout_s: 3
 
   wikitext_n: 20

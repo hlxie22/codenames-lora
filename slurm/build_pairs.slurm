@@ -13,6 +13,7 @@ mkdir -p logs data outputs
 source slurm/common.sh
 
 CONFIG="${CONFIG:-configs/default.yml}"
+export CONFIG
 
 if [[ ! -f "$CONFIG" ]]; then
   echo "ERROR: CONFIG not found: $CONFIG" >&2

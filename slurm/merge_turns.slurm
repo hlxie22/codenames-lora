@@ -13,6 +13,7 @@ mkdir -p logs data outputs
 source slurm/common.sh
 
 CONFIG="${CONFIG:-configs/default.yml}"
+export CONFIG
 
 TOTAL_SHARDS="${TOTAL_SHARDS:?need TOTAL_SHARDS exported from pipeline (jobs * procs_per_job)}"
 ALLOW_MISSING="${ALLOW_MISSING:-0}"

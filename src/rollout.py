@@ -185,12 +185,21 @@ def run_turn(
     cfg: Dict[str, Any],
     n_candidates: int = 1,
     seed: Optional[int] = None,
+    max_resamples: Optional[int] = None,
 ) -> Tuple[List[CandidateResult], Dict[str, Any]]:
     """
     Samples up to n_candidates, with validity-enforced resampling.
     Returns candidates and metadata including rejected counts.
+
+    max_resamples:
+      - None => use cfg["decoding"]["max_resamples"]
+      - int  => override, useful for eval where we want one-shot behavior
     """
-    max_resamples = int(cfg["decoding"]["max_resamples"])
+    if max_resamples is None:
+        max_resamples = int(cfg["decoding"]["max_resamples"])
+    else:
+        max_resamples = int(max_resamples)
+
     candidates: List[CandidateResult] = []
     rejection_counts: Dict[str, int] = {}
     total_rejected = 0
@@ -258,6 +267,7 @@ def run_turns_batched(
     *,
     n_candidates: int,
     return_candidates: Literal[False] = False,
+    max_resamples: Optional[int] = None,
 ) -> Tuple[List[CandidateResult], List[Dict[str, Any]]]: ...
 
 
@@ -271,6 +281,7 @@ def run_turns_batched(
     *,
     n_candidates: int,
     return_candidates: Literal[True],
+    max_resamples: Optional[int] = None,
 ) -> Tuple[List[CandidateResult], List[Dict[str, Any]], List[List[CandidateResult]]]: ...
 
 
@@ -283,6 +294,7 @@ def run_turns_batched(
     *,
     n_candidates: int,
     return_candidates: bool = False,
+    max_resamples: Optional[int] = None,
 ) -> Any:
     """
     Returns (default):
@@ -292,7 +304,16 @@ def run_turns_batched(
     If return_candidates=True:
       - also returns all candidates per board (length == n_candidates)
         so you can analyze variance across candidates.
+
+    max_resamples:
+      - None => use cfg["decoding"]["max_resamples"]
+      - int  => override, useful for eval where we want one-shot behavior
     """
+    if max_resamples is None:
+        max_resamples = int(cfg["decoding"]["max_resamples"])
+    else:
+        max_resamples = int(max_resamples)
+
     # Sequential fallback if no batch API
     if not (hasattr(spymaster, "generate_batch") and hasattr(guesser, "generate_batch")):
         bests: List[CandidateResult] = []
@@ -300,7 +321,16 @@ def run_turns_batched(
         all_cands: List[List[CandidateResult]] = []
         for b in boards_batch:
             seed = int(b.get("seed", 0))
-            cands, meta = run_turn(b, spymaster, guesser, embedder, cfg, n_candidates=n_candidates, seed=seed)
+            cands, meta = run_turn(
+                b,
+                spymaster,
+                guesser,
+                embedder,
+                cfg,
+                n_candidates=n_candidates,
+                seed=seed,
+                max_resamples=max_resamples,
+            )
             all_cands.append(cands)
             bests.append(select_best_candidate(cands))
             metas.append(meta)
@@ -310,7 +340,6 @@ def run_turns_batched(
 
     sp_gen = spymaster_gen_cfg(cfg)
     g_gen = guesser_gen_cfg(cfg)
-    max_resamples = int(cfg["decoding"]["max_resamples"])
 
     # Precompute prompts + bookkeeping per board
     sp_prompts: List[str] = []

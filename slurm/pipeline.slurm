@@ -74,7 +74,26 @@ export CONFIG_MAIN CONFIG_GEN
 SKIP_IF_READY="${SKIP_IF_READY:-1}"
 
 GEN_ARRAY_TASKS="${GEN_ARRAY_TASKS:-4}"
-GEN_PROCS_PER_JOB="${GEN_PROCS_PER_JOB:-4}"
+
+# Source of truth for workers per generation job: inference.num_processes in CONFIG_GEN
+GEN_PROCS_PER_JOB="$(
+"$PYTHON" - <<'PY'
+import os
+from src.utils import load_yaml
+
+cfg = load_yaml(os.environ.get("CONFIG_GEN", "configs/default.yml"))
+print(int((cfg.get("inference", {}) or {}).get("num_processes", 1)))
+PY
+)"
+
+if [[ -z "${GEN_PROCS_PER_JOB}" ]]; then
+  echo "ERROR: Could not read inference.num_processes from CONFIG_GEN=$CONFIG_GEN" >&2
+  exit 1
+fi
+if [[ "${GEN_PROCS_PER_JOB}" -lt 1 ]]; then
+  echo "ERROR: inference.num_processes must be >= 1 (got ${GEN_PROCS_PER_JOB})" >&2
+  exit 1
+fi
 
 CLEAN="${CLEAN:-0}"
 ALLOW_MISSING="${ALLOW_MISSING:-0}"
