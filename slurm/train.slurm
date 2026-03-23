@@ -50,6 +50,49 @@ trap _requeue_me TERM INT USR2
 source slurm/common.sh
 
 CONFIG="${CONFIG:-configs/default.yml}"
+NO_EPOCH_EVAL="${NO_EPOCH_EVAL:-0}"
+export CONFIG NO_EPOCH_EVAL
+
+if [[ ! -f "$CONFIG" ]]; then
+  echo "ERROR: CONFIG not found: $CONFIG" >&2
+  exit 1
+fi
+
+read -r TRAIN_OBJECTIVE TRAIN_MODULE TRAIN_DATA_PATH TRAIN_OUT_DIR < <(
+  python - <<'PY'
+import os
+from src.utils import load_yaml, resolve_training_plan
+
+cfg = load_yaml(os.environ.get("CONFIG", "configs/default.yml"))
+plan = resolve_training_plan(cfg)
+print(f"{plan['objective']}\t{plan['module']}\t{plan['data_path']}\t{plan['out_dir']}")
+PY
+)
+
+if [[ -z "$TRAIN_DATA_PATH" ]]; then
+  echo "ERROR: could not resolve training data path from $CONFIG" >&2
+  exit 1
+fi
+
+if [[ -z "$TRAIN_OUT_DIR" ]]; then
+  echo "ERROR: could not resolve training output dir from $CONFIG" >&2
+  exit 1
+fi
+
+if [[ ! -s "$TRAIN_DATA_PATH" ]]; then
+  if [[ "$TRAIN_OBJECTIVE" == "sft" ]]; then
+    echo "ERROR: SFT source file missing or empty: $TRAIN_DATA_PATH" >&2
+  else
+    echo "ERROR: DPO pairs file missing or empty: $TRAIN_DATA_PATH" >&2
+  fi
+  exit 1
+fi
+
+echo "[$(date)] TRAIN_OBJECTIVE=$TRAIN_OBJECTIVE"
+echo "[$(date)] TRAIN_MODULE=$TRAIN_MODULE"
+echo "[$(date)] TRAIN_DATA_PATH=$TRAIN_DATA_PATH"
+echo "[$(date)] TRAIN_OUT_DIR=$TRAIN_OUT_DIR"
+echo "[$(date)] NO_EPOCH_EVAL=$NO_EPOCH_EVAL"
 
 # ---- distributed via srun (1 task per node) + torch.distributed.run (no bash -c) ----
 NNODES="${SLURM_NNODES:-1}"
@@ -68,7 +111,7 @@ if [[ -z "$VENV_PY" || ! -x "$VENV_PY" ]]; then
   exit 1
 fi
 
-export NNODES GPUS_PER_NODE MASTER_ADDR MASTER_PORT CONFIG VENV_PY
+export NNODES GPUS_PER_NODE MASTER_ADDR MASTER_PORT CONFIG VENV_PY TRAIN_MODULE
 
 # Some sites set these and it can confuse launcher tooling
 unset SLURM_MEM_PER_CPU SLURM_MEM_PER_GPU SLURM_MEM_PER_NODE
@@ -90,10 +133,16 @@ master_addr = os.environ["MASTER_ADDR"]
 master_port = os.environ["MASTER_PORT"]
 cfg = os.environ["CONFIG"]
 py = os.environ.get("VENV_PY", sys.executable)
+train_module = os.environ["TRAIN_MODULE"]
+no_epoch_eval = os.environ.get("NO_EPOCH_EVAL", "0") == "1"
 
 rdzv_id = os.environ.get("SLURM_JOB_ID", "0")
 
-print(f"[{os.uname().nodename}] node_rank={node_rank} nnodes={nnodes} gpus_per_node={gpus_per_node}", flush=True)
+print(
+    f"[{os.uname().nodename}] node_rank={node_rank} "
+    f"nnodes={nnodes} gpus_per_node={gpus_per_node} module={train_module}",
+    flush=True,
+)
 
 cmd = [
   py, "-m", "torch.distributed.run",
@@ -103,9 +152,12 @@ cmd = [
   "--rdzv_backend=c10d",
   f"--rdzv_id={rdzv_id}",
   f"--rdzv_endpoint={master_addr}:{master_port}",
-  "-m", "src.train_trl_dpo",
+  "-m", train_module,
   "--config", cfg,
 ]
+
+if no_epoch_eval:
+    cmd.append("--no-epoch-eval")
 
 raise SystemExit(subprocess.call(cmd))
 ' &

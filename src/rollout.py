@@ -71,6 +71,7 @@ def map_guesses_to_board(guesses: List[str], board_words: List[str]) -> List[str
 class CandidateResult:
     clue: str
     num: int
+    parse_valid: bool
     valid: bool
     rejection_reason: str
     directness: float
@@ -118,6 +119,7 @@ def run_one_candidate(
         return CandidateResult(
             clue=clue or "",
             num=num or 0,
+            parse_valid=False,
             valid=False,
             rejection_reason="parse_fail",
             directness=0.0,
@@ -133,6 +135,7 @@ def run_one_candidate(
         return CandidateResult(
             clue=clue,
             num=int(num),
+            parse_valid=True,
             valid=False,
             rejection_reason=reason,
             directness=float(d),
@@ -166,6 +169,7 @@ def run_one_candidate(
     return CandidateResult(
         clue=clue,
         num=int(num),
+        parse_valid=True,
         valid=True,
         rejection_reason="ok",
         directness=float(d),
@@ -224,6 +228,7 @@ def run_turn(
             got = last_res if last_res is not None else CandidateResult(
                 clue="",
                 num=0,
+                parse_valid=False,
                 valid=False,
                 rejection_reason="exhausted",
                 directness=0.0,
@@ -370,10 +375,9 @@ def run_turns_batched(
     rej_total_per_board: List[int] = [0 for _ in boards_batch]
 
     for ci in range(n_candidates):
-        got: List[Optional[Tuple[str, int, bool, str, float, str, int]]] = [None] * len(boards_batch)
+        got: List[Optional[Tuple[str, int, bool, bool, str, float, str, int]]] = [None] * len(boards_batch)
         pending = list(range(len(boards_batch)))
-        last_text: Dict[int, str] = {}
-        last_seed: Dict[int, int] = {}
+        last_attempt: Dict[int, Tuple[str, int, bool, bool, str, float, str, int]] = {}
 
         # Batched spymaster resampling
         for ri in range(max_resamples):
@@ -387,49 +391,50 @@ def run_turns_batched(
             for idx_in_list, bi in enumerate(pending):
                 txt = texts[idx_in_list]
                 s_used = seeds[idx_in_list]
-                last_text[bi] = txt
-                last_seed[bi] = s_used
 
                 clue, num = parse_spymaster_output(txt)
                 if clue is None or num is None:
+                    last_attempt[bi] = ("", 0, False, False, "parse_fail", 0.0, txt, s_used)
                     reason = "parse_fail"
                     rej_total_per_board[bi] += 1
                     rej_counts_per_board[bi][reason] = rej_counts_per_board[bi].get(reason, 0) + 1
                     continue
 
                 valid, reason, d = is_valid_clue(clue, board_words_list[bi], target_words_list[bi], embedder, cfg)
+                last_attempt[bi] = (
+                    clue,
+                    int(num),
+                    True,
+                    bool(valid),
+                    reason if not valid else "ok",
+                    float(d),
+                    txt,
+                    s_used,
+                )
                 if not valid:
                     rej_total_per_board[bi] += 1
                     rej_counts_per_board[bi][reason] = rej_counts_per_board[bi].get(reason, 0) + 1
                     continue
 
-                got[bi] = (clue, int(num), True, "ok", float(d), txt, s_used)
+                got[bi] = last_attempt[bi]
 
             pending = [bi for bi in pending if got[bi] is None]
 
         # Fill any missing with last attempt (invalid)
         for bi in range(len(boards_batch)):
             if got[bi] is None:
-                txt = last_text.get(bi, "")
-                s_used = last_seed.get(bi, seeds0[bi] + ci * 1000)
-                clue, num = parse_spymaster_output(txt)
-                got[bi] = (
-                    clue or "",
-                    int(num) if num is not None else 0,
-                    False,
-                    "exhausted",
-                    0.0,
-                    txt,
-                    s_used,
+                got[bi] = last_attempt.get(
+                    bi,
+                    ("", 0, False, False, "exhausted", 0.0, "", seeds0[bi] + ci * 1000),
                 )
 
         # Batched guesser for valid ones only
-        valid_bis = [bi for bi in range(len(boards_batch)) if got[bi][2]]  # type: ignore[index]
+        valid_bis = [bi for bi in range(len(boards_batch)) if got[bi][3]]  # type: ignore[index]
         g_prompts: List[str] = []
         g_seeds: List[int] = []
 
         for bi in valid_bis:
-            clue, num, _, _, _, _, s_used = got[bi]  # type: ignore[misc]
+            clue, num, _, _, _, _, _, s_used = got[bi]  # type: ignore[misc]
             revealed_mask = [False] * len(board_words_list[bi])
             g_msgs = build_guesser_messages(board_words_list[bi], revealed_mask, clue, int(num), cfg)
             g_prompts.append(render_prompt(guesser, g_msgs, cfg, role="guesser"))
@@ -439,13 +444,14 @@ def run_turns_batched(
 
         gi = 0
         for bi in range(len(boards_batch)):
-            clue, num, is_valid, reason, d, sp_txt, _ = got[bi]  # type: ignore[misc]
+            clue, num, parse_valid, is_valid, reason, d, sp_txt, _ = got[bi]  # type: ignore[misc]
 
             if not is_valid:
                 all_candidates_per_board[bi].append(
                     CandidateResult(
                         clue=clue,
                         num=int(num),
+                        parse_valid=bool(parse_valid),
                         valid=False,
                         rejection_reason=reason,
                         directness=float(d),
@@ -472,6 +478,7 @@ def run_turns_batched(
                 CandidateResult(
                     clue=clue,
                     num=int(num),
+                    parse_valid=bool(parse_valid),
                     valid=True,
                     rejection_reason="ok",
                     directness=float(d),

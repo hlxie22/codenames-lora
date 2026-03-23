@@ -51,7 +51,7 @@ trap handle_usr1 USR1
 # -----------------------------
 # Email notifications (manual; skips requeue exits)
 # -----------------------------
-MAIL_TO="henryxie@college.harvard.edu"            
+MAIL_TO="henryxie@college.harvard.edu"
 MAIL_SUBJECT_PREFIX="slurm"
 SECONDS=0
 START_TS="$(date -Iseconds)"
@@ -81,12 +81,10 @@ send_mail() {
 notify_on_exit() {
   local rc=$?
 
-  # If this exit is due to our requeue handler, do NOT email.
   if (( ${REQUEUE_SENT:-0} == 1 )); then
     return 0
   fi
 
-  # Be trap-safe
   set +e
 
   local end_ts dur out_log err_log status subject body
@@ -104,7 +102,7 @@ notify_on_exit() {
   subject="${MAIL_SUBJECT_PREFIX}: ${SLURM_JOB_NAME:-job} ${SLURM_JOB_ID:-} ${status}"
 
   body=$(
-    cat <<EOF
+    cat <<EOF2
 Job notification: $status
 
 JobName:   ${SLURM_JOB_NAME:-}
@@ -122,7 +120,7 @@ Duration:  ${dur}s
 CONFIG:    ${CONFIG:-}
 Stdout:    $out_log
 Stderr:    $err_log
-EOF
+EOF2
   )
 
   send_mail "$subject" "$body" >/dev/null 2>&1 || true
@@ -174,43 +172,49 @@ if [[ ! -f "$CONFIG" ]]; then
   exit 1
 fi
 
-read -r DPO_PATH OUT_DIR < <(python - <<'PY'
+read -r TRAIN_OBJECTIVE TRAIN_MODULE TRAIN_DATA_PATH TRAIN_OUT_DIR < <(
+  python - <<'PY'
 import os
-from src.utils import load_yaml
-cfg = load_yaml(os.environ.get("CONFIG","configs/default.yml"))
-dpo = (cfg.get("paths", {}) or {}).get("dpo_pairs_path", "")
-out = (cfg.get("training", {}) or {}).get("output_adapter_dir", "")
-print(f"{dpo}\t{out}")
+from src.utils import load_yaml, resolve_training_plan
+
+cfg = load_yaml(os.environ.get("CONFIG", "configs/default.yml"))
+plan = resolve_training_plan(cfg)
+print(f"{plan['objective']}\t{plan['module']}\t{plan['data_path']}\t{plan['out_dir']}")
 PY
 )
 
-if [[ -z "$DPO_PATH" ]]; then
-  echo "ERROR: paths.dpo_pairs_path not found in $CONFIG" >&2
+if [[ -z "$TRAIN_DATA_PATH" ]]; then
+  echo "ERROR: could not resolve training data path from $CONFIG" >&2
   exit 1
 fi
-if [[ -z "$OUT_DIR" ]]; then
-  echo "ERROR: training.output_adapter_dir not found in $CONFIG" >&2
+if [[ -z "$TRAIN_OUT_DIR" ]]; then
+  echo "ERROR: could not resolve training output dir from $CONFIG" >&2
   exit 1
 fi
 
-if [[ ! -s "$DPO_PATH" ]]; then
-  echo "ERROR: DPO pairs file missing or empty: $DPO_PATH" >&2
+if [[ ! -s "$TRAIN_DATA_PATH" ]]; then
+  echo "ERROR: training source file missing or empty: $TRAIN_DATA_PATH" >&2
   echo "This run.slurm assumes previous steps already produced it on the shared filesystem." >&2
   exit 1
 fi
-echo "[$(date)] Found DPO pairs: $DPO_PATH"
-echo "[$(date)] OUT_DIR (training.output_adapter_dir): $OUT_DIR"
+
+echo "[$(date)] TRAIN_OBJECTIVE=$TRAIN_OBJECTIVE"
+echo "[$(date)] TRAIN_MODULE=$TRAIN_MODULE"
+echo "[$(date)] TRAIN_DATA_PATH=$TRAIN_DATA_PATH"
+echo "[$(date)] TRAIN_OUT_DIR=$TRAIN_OUT_DIR"
 echo "[$(date)] ITER=${ITER:-<unset>}"
+
+export TRAIN_OBJECTIVE TRAIN_MODULE TRAIN_OUT_DIR
 
 # -----------------------------
 # Decide whether training is already done
 # -----------------------------
 TRAIN_DONE=0
-if [[ -s "$OUT_DIR/adapter_model.safetensors" && -s "$OUT_DIR/adapter_config.json" ]]; then
+if [[ -s "$TRAIN_OUT_DIR/adapter_model.safetensors" && -s "$TRAIN_OUT_DIR/adapter_config.json" ]]; then
   TRAIN_DONE=1
 fi
 
-POST_EVAL_ROOT="${POST_EVAL_ROOT:-$OUT_DIR/post_eval}"
+POST_EVAL_ROOT="${POST_EVAL_ROOT:-$TRAIN_OUT_DIR/post_eval}"
 EVAL_BASELINE_DIR="$POST_EVAL_ROOT/baseline"
 EVAL_TRAINED_DIR="$POST_EVAL_ROOT/trained"
 
@@ -253,6 +257,16 @@ out_path = os.environ["EVAL_CONFIG"]
 gpus = int(os.environ.get("GPUS_PER_NODE", "1"))
 
 cfg = load_yaml(cfg_path)
+objective = os.environ.get("TRAIN_OBJECTIVE", "dpo").strip().lower()
+train_out_dir = os.environ.get("TRAIN_OUT_DIR", "").strip()
+
+if objective == "sft" and train_out_dir:
+    tcfg = cfg.get("training", {}) or {}
+    # src.eval --mode trained reads training.output_adapter_dir.
+    # Point it at the actual trained adapter dir for SFT runs.
+    tcfg["output_adapter_dir"] = train_out_dir
+    cfg["training"] = tcfg
+
 inf = cfg.get("inference", {}) or {}
 bs = int(os.environ.get("EVAL_BATCH_SIZE", "4"))
 inf["batch_size"] = bs
@@ -266,7 +280,7 @@ inf["vllm"] = v
 cfg["inference"] = inf
 
 with open(out_path, "w", encoding="utf-8") as f:
-  yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+    yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
 
 print(f"Wrote eval config -> {out_path} (inference.num_processes={inf['num_processes']})")
 PY
@@ -312,9 +326,10 @@ MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"
 echo "[$(date)] NNODES=$NNODES GPUS_PER_NODE=$GPUS_PER_NODE"
 echo "[$(date)] MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
 echo "[$(date)] CONFIG=$CONFIG"
+echo "[$(date)] TRAIN_OBJECTIVE=$TRAIN_OBJECTIVE TRAIN_MODULE=$TRAIN_MODULE"
 echo "[$(date)] Starting training..."
 
-export NNODES GPUS_PER_NODE MASTER_ADDR MASTER_PORT NO_EPOCH_EVAL
+export NNODES GPUS_PER_NODE MASTER_ADDR MASTER_PORT NO_EPOCH_EVAL TRAIN_MODULE
 
 set +e
 srun --export=ALL \
@@ -333,6 +348,7 @@ master_addr = os.environ["MASTER_ADDR"]
 master_port = os.environ["MASTER_PORT"]
 cfg = os.environ.get("CONFIG", "configs/default.yml")
 no_epoch_eval = os.environ.get("NO_EPOCH_EVAL", "0") == "1"
+train_module = os.environ["TRAIN_MODULE"]
 
 rdzv_id = os.environ.get("SLURM_JOB_ID", "0")
 
@@ -344,7 +360,7 @@ cmd = [
   "--rdzv_backend=c10d",
   f"--rdzv_id={rdzv_id}",
   f"--rdzv_endpoint={master_addr}:{master_port}",
-  "-m", "src.train_trl_dpo",
+  "-m", train_module,
   "--config", cfg,
 ]
 if no_epoch_eval:

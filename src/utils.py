@@ -64,22 +64,128 @@ def _expand_templates(obj: Any, mapping: Dict[str, Any]) -> Any:
     return obj
 
 
+def _parse_iter_spec(raw_iter: Any) -> Dict[str, Any]:
+    """
+    Supports:
+      iter:
+        n: 0
+        use_trained: true
+        root: "outputs/dpo"
+
+    and also:
+      iter: 2
+      iter: "2"
+    """
+    n = 0
+    use_trained = False
+    root = "outputs/dpo"
+
+    if raw_iter is None:
+        pass
+    elif isinstance(raw_iter, dict):
+        n = int(raw_iter.get("n", 0))
+        use_trained = bool(raw_iter.get("use_trained", False))
+        root = str(raw_iter.get("root", "outputs/dpo"))
+    elif isinstance(raw_iter, int):
+        n = int(raw_iter)
+    elif isinstance(raw_iter, str):
+        s = raw_iter.strip()
+        try:
+            n = int(s)
+        except Exception as e:
+            raise ValueError(
+                f"Unsupported iter value {raw_iter!r}. "
+                "Use a mapping or an integer."
+            ) from e
+    else:
+        raise ValueError(
+            f"Unsupported iter value type: {type(raw_iter)}. "
+            "Use a mapping or an integer."
+        )
+
+    if n < 0:
+        raise ValueError(f"iter.n must be >= 0 (got {n})")
+
+    return {
+        "n": int(n),
+        "use_trained": bool(use_trained),
+        "root": root,
+    }
+
+
+def resolve_training_objective(cfg: Dict[str, Any]) -> str:
+    training = cfg.get("training", {}) or {}
+    objective = str(training.get("objective", "dpo")).strip().lower() or "dpo"
+    if objective not in {"sft", "dpo"}:
+        raise ValueError(f"Unsupported training objective: {objective!r}. Expected 'sft' or 'dpo'.")
+
+    cfg.setdefault("training", {})
+    cfg["training"]["objective"] = objective
+    return objective
+
+
+def resolve_training_plan(cfg: Dict[str, Any]) -> Dict[str, str]:
+    objective = resolve_training_objective(cfg)
+    tcfg = cfg.get("training", {}) or {}
+    paths = cfg.get("paths", {}) or {}
+
+    if objective == "sft":
+        sft_source = str(tcfg.get("sft_source", "turns_raw")).strip().lower()
+        if sft_source not in {"turns_raw", "turns"}:
+            raise ValueError(
+                f"Unsupported training.sft_source: {sft_source!r}. Expected 'turns_raw' or 'turns'."
+            )
+
+        if sft_source == "turns":
+            data_path = str(paths.get("turns_path", ""))
+        else:
+            data_path = str(paths.get("turns_raw_path", ""))
+
+        out_dir = str(tcfg.get("sft_output_adapter_dir", tcfg.get("output_adapter_dir", "")))
+        module = "src.train_sft"
+    else:
+        sft_source = ""
+        data_path = str(paths.get("dpo_pairs_path", ""))
+        out_dir = str(tcfg.get("output_adapter_dir", ""))
+        module = "src.train_trl_dpo"
+
+    return {
+        "objective": objective,
+        "module": module,
+        "data_path": data_path,
+        "out_dir": out_dir,
+        "sft_source": sft_source,
+    }
+
+
 def load_yaml(path: str | Path) -> Dict[str, Any]:
     """
-    Loads YAML and applies iteration templating + knob logic.
+    Loads YAML and applies iteration templating + objective normalization.
+
+    Supported YAML forms:
+      iter:
+        n: 0
+        use_trained: true
+        root: outputs/dpo
+
+      iter: 2
 
     Supported placeholders in YAML strings:
       {iter}        -> current iteration (int)
-      {prev}        -> iter-1
+      {prev}        -> previous iteration index, clamped at 0
       {root}        -> iter.root
       {iter_suffix} -> "" if iter==0 else "_iter{iter}"
       {prev_suffix} -> "" if prev==0 else "_iter{prev}"
       {iter_dir}    -> "" if iter==0 else "/iter{iter}"
       {prev_dir}    -> "" if prev==0 else "/iter{prev}"
 
-    Knob:
-      iter.use_trained=false => forces inference.rollout_adapter_dir=None and training.init_adapter_dir=None
-      iter.use_trained=true  => uses the expanded adapter dirs (caller should still check existence)
+    Environment override:
+      ITER=<int>    -> overrides iter.n
+
+    Effective adapter behavior:
+      - When iter.n > 0 and iter.use_trained=true, previous-iteration adapters stay enabled
+        for rollouts and training initialization.
+      - Otherwise rollout_adapter_dir / init_adapter_dir / sft_init_adapter_dir are disabled.
     """
     with open(path, "r", encoding="utf-8") as f:
         obj = yaml.safe_load(f) or {}
@@ -88,12 +194,26 @@ def load_yaml(path: str | Path) -> Dict[str, Any]:
 
     cfg: Dict[str, Any] = obj
 
-    it = (cfg.get("iter", {}) or {})
+    raw_iter = cfg.get("iter", {})
+    parsed = _parse_iter_spec(raw_iter)
+
+    iter_n = int(parsed["n"])
+    requested_use_trained = bool(parsed["use_trained"])
+    root = str(parsed["root"])
+
     env_iter = os.environ.get("ITER")
-    iter_n = int(env_iter) if env_iter is not None else int(it.get("n", 0))
-    use_trained = bool(it.get("use_trained", False))
-    root = str(it.get("root", "outputs/dpo"))
-    prev = iter_n - 1
+    if env_iter is not None:
+        try:
+            iter_n = int(env_iter)
+        except Exception as e:
+            raise ValueError(
+                f"Invalid ITER environment override {env_iter!r}. Use an integer."
+            ) from e
+
+    if iter_n < 0:
+        raise ValueError(f"iter.n must be >= 0 after overrides (got {iter_n})")
+
+    prev = max(0, iter_n - 1)
 
     iter_suffix = "" if iter_n == 0 else f"_iter{iter_n}"
     prev_suffix = "" if prev == 0 else f"_iter{prev}"
@@ -111,21 +231,26 @@ def load_yaml(path: str | Path) -> Dict[str, Any]:
     }
 
     cfg = _expand_templates(cfg, mapping)
+    objective = resolve_training_objective(cfg)
 
-    # Write back resolved iteration info for clarity/debugging
-    cfg.setdefault("iter", {})
-    cfg["iter"]["n"] = iter_n
-    cfg["iter"]["prev"] = prev
-    cfg["iter"]["use_trained"] = use_trained
-    cfg["iter"]["root"] = root
+    effective_use_trained = bool(iter_n > 0 and requested_use_trained)
 
-    # Apply knob: disable adapter dirs if not using trained
-    if not use_trained:
+    cfg["iter"] = {
+        "n": iter_n,
+        "prev": prev,
+        "use_trained": effective_use_trained,
+        "root": root,
+    }
+
+    if not effective_use_trained:
         cfg.setdefault("inference", {})
         cfg["inference"]["rollout_adapter_dir"] = None
         cfg.setdefault("training", {})
         cfg["training"]["init_adapter_dir"] = None
+        if "sft_init_adapter_dir" in cfg["training"]:
+            cfg["training"]["sft_init_adapter_dir"] = None
 
+    cfg["training"]["objective"] = objective
     return cfg
 
 

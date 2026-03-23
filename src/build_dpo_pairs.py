@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple
 
 from transformers import AutoTokenizer
 
-from .utils import load_yaml, read_jsonl, write_jsonl
+from .utils import load_yaml, read_jsonl, resolve_training_objective, write_jsonl
 
 
 def _record_valid(record: Dict[str, Any]) -> bool:
@@ -275,6 +275,14 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
+
+    objective = resolve_training_objective(cfg)
+    if objective == "sft":
+        raise SystemExit(
+            "build_dpo_pairs is disabled for training.objective=sft. "
+            "Set training.objective=dpo before building DPO pairs."
+        )
+
     tcfg = cfg.get("training", {}) or {}
 
     turns_raw_path = args.turns_raw or cfg["paths"]["turns_raw_path"]

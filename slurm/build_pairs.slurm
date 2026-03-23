@@ -20,15 +20,21 @@ if [[ ! -f "$CONFIG" ]]; then
   exit 1
 fi
 
-read -r TURNS_RAW_PATH DPO_PAIRS_PATH < <(
+read -r TRAIN_OBJECTIVE TURNS_RAW_PATH DPO_PAIRS_PATH < <(
   python - <<'PY'
 import os
-from src.utils import load_yaml
+from src.utils import load_yaml, resolve_training_plan
 
 cfg = load_yaml(os.environ.get("CONFIG", "configs/default.yml"))
-print(f"{cfg['paths']['turns_raw_path']}\t{cfg['paths']['dpo_pairs_path']}")
+plan = resolve_training_plan(cfg)
+print(f"{plan['objective']}\t{cfg['paths']['turns_raw_path']}\t{cfg['paths']['dpo_pairs_path']}")
 PY
 )
+
+if [[ "$TRAIN_OBJECTIVE" == "sft" ]]; then
+  echo "[$(date)] training.objective is SFT; skipping DPO pair build."
+  exit 0
+fi
 
 if [[ -z "${TURNS_RAW_PATH}" ]]; then
   echo "ERROR: Could not resolve paths.turns_raw_path from $CONFIG" >&2
@@ -47,6 +53,7 @@ fi
 
 echo "[$(date)] Building TRL DPO pairs..."
 echo "[$(date)] CONFIG=$CONFIG"
+echo "[$(date)] TRAIN_OBJECTIVE=$TRAIN_OBJECTIVE"
 echo "[$(date)] TURNS_RAW_PATH=$TURNS_RAW_PATH"
 echo "[$(date)] DPO_PAIRS_PATH=$DPO_PAIRS_PATH"
 

@@ -563,6 +563,7 @@ def main():
                         cd: Dict[str, Any] = {
                             "clue": c.clue,
                             "num": int(c.num),
+                            "parse_valid": bool(c.parse_valid),
                             "valid": bool(c.valid),
                             "rejection_reason": c.rejection_reason,
                             "directness": float(c.directness),
@@ -588,6 +589,7 @@ def main():
                         "clue_meta": {
                             "clue": best.clue,
                             "num": int(best.num),
+                            "parse_valid": bool(c.parse_valid),
                             "valid": bool(best.valid),
                             "rejected_candidates": int(meta["rejected_total"]),
                             "rejection_counts": meta["rejection_counts"],

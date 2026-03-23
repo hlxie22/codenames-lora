@@ -359,6 +359,7 @@ def eval_codenames_subset_raw(
                         "guess_words": best.guess_words,
                         "stats": {**best.stats, "directness": float(best.directness)},
                         "clue_meta": {
+                            "parse_valid": bool(best.parse_valid),
                             "valid": bool(best.valid),
                             "rejected_total": int(meta["rejected_total"]),
                             "rejection_counts": meta["rejection_counts"],
@@ -779,6 +780,8 @@ def plot_epoch_history(history_path: Path, plots_dir: Path) -> None:
 
     keys = [
         "reward_mean",
+        "parse_valid_rate",
+        "nonempty_clue_rate",
         "assassin_rate",
         "directness_mean",
         "wikitext2_ppl",
@@ -945,6 +948,17 @@ class EpochEvalCallback(TrainerCallback):
                 metrics["opp_mean"] = float(m.get("opp_mean", 0.0))
                 metrics["neu_mean"] = float(m.get("neu_mean", 0.0))
                 metrics["directness_mean"] = float(m.get("directness_mean", 0.0))
+                metrics["parse_valid_rate"] = float(m.get("parse_valid_rate", 0.0))
+                metrics["parse_fail_rate"] = float(m.get("parse_fail_rate", 0.0))
+                metrics["nonempty_clue_rate"] = float(m.get("nonempty_clue_rate", 0.0))
+                metrics["rejected_candidates_mean"] = float(m.get("rejected_candidates_mean", 0.0))
+
+                rej_counts = dict(m.get("rejection_reason_counts", {}) or {})
+                metrics["rejection_reason_counts"] = rej_counts
+                for k, v in sorted(rej_counts.items()):
+                    safe_k = re.sub(r"[^0-9A-Za-z_]+", "_", str(k)).strip("_") or "unknown"
+                    metrics[f"rejection_reason_count__{safe_k}"] = int(v)
+
                 metrics["codenames_spymaster_think_tokens_mean"] = float(_mean([float(x) for x in think_tokens]))
                 metrics["codenames_spymaster_think_tokens_p90"] = float(_p90([float(x) for x in think_tokens]))
             except Exception as e:
@@ -1100,7 +1114,7 @@ class EpochEvalCallback(TrainerCallback):
             tr = trainer
             if tr is not None:
                 try:
-                    tr.log(metrics)
+                    tr.log({k: v for k, v in metrics.items() if isinstance(v, (int, float))})
                 except Exception:
                     pass
 

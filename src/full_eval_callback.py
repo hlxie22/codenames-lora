@@ -381,6 +381,7 @@ class FullCodenamesEvalCallback(TrainerCallback):
                         "stats": {**best.stats, "directness": float(best.directness)},
                         "clue_meta": {
                             "valid": bool(best.valid),
+                            "parse_valid": bool(c.parse_valid),
                             "rejected_total": int(meta["rejected_total"]),
                             "rejection_counts": meta["rejection_counts"],
                         },
