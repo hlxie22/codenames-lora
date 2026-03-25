@@ -325,6 +325,8 @@ def main() -> None:
         gradient_accumulation_steps=int(tcfg.get("sft_grad_accum", tcfg.get("grad_accum", 1))),
         num_train_epochs=float(tcfg.get("sft_epochs", 1)),
         learning_rate=float(tcfg.get("sft_lr", 5e-5)),
+        lr_scheduler_type=str(tcfg.get("lr_scheduler_type", "linear")),
+        warmup_ratio=float(tcfg.get("warmup_ratio", 0.05)),
         bf16=use_bf16,
         fp16=use_fp16,
         deepspeed=str(tcfg.get("deepspeed_config")) if tcfg.get("deepspeed_config") else None,
