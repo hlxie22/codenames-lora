@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Tuple
 
 from transformers import AutoTokenizer
 
+from .think_utils import split_think_and_rest
 from .utils import load_yaml, read_jsonl, resolve_training_objective, write_jsonl
 
 
@@ -84,10 +85,36 @@ def _passes_rejected_filter(
     return True
 
 
+def _resolve_completion_text(obj: Dict[str, Any], field: str) -> str | None:
+    val = obj.get(field)
+    if not (isinstance(val, str) and val):
+        if field == "completion":
+            return None
+        val = obj.get("completion")
+        if not (isinstance(val, str) and val):
+            return None
+
+    text = str(val)
+
+    # Backward compatibility for pre-patch native-thinking datasets where
+    # `completion` may still contain the raw Qwen3 reasoning trace.
+    if field == "completion":
+        final = obj.get("completion_final")
+        raw = obj.get("completion_raw") or obj.get("raw_spymaster_text") or text
+        reasoning_trace, stripped = split_think_and_rest(str(raw), which="first", allow_partial=True)
+        if reasoning_trace and isinstance(final, str) and final:
+            return final
+        if reasoning_trace and stripped:
+            return stripped
+
+    return text
+
+
 def build_pairs(
     turns_raw: List[Dict[str, Any]],
     *,
     margin: float,
+    completion_field: str = "completion",
     max_rejected_per_prompt: int = 1,
     chosen_filter: Dict[str, Any] | None = None,
     rejected_filter: Dict[str, Any] | None = None,
@@ -96,22 +123,14 @@ def build_pairs(
     Flatten per-board records into TRL DPO pairs:
       {prompt: str, chosen: str, rejected: str}
 
-    chosen = r["completion"]
-    rejected = candidates that:
-      1) pass rejected_filter
-      2) satisfy (chosen_reward - cand_reward) >= margin
-
-    Among eligible rejecteds, keep the hardest ones first:
-      highest reward first, capped per prompt.
-
-    Only keeps prompts whose chosen response passes chosen_filter.
+    completion_field controls which completion text is used for chosen/rejected.
     """
     out: List[Dict[str, str]] = []
     max_rej = max(1, int(max_rejected_per_prompt))
 
     for r in turns_raw:
         prompt = r.get("prompt")
-        chosen = r.get("completion")
+        chosen = _resolve_completion_text(r, completion_field)
         if not isinstance(prompt, str) or not isinstance(chosen, str):
             continue
 
@@ -128,7 +147,7 @@ def build_pairs(
                     continue
 
                 rej_reward = float(c.get("reward", 0.0))
-                rej_text = c.get("completion")
+                rej_text = _resolve_completion_text(c, completion_field)
                 if not isinstance(rej_text, str) or not rej_text:
                     continue
 
@@ -140,7 +159,6 @@ def build_pairs(
         if not rej_list:
             continue
 
-        # hardest eligible negatives first
         rej_list.sort(key=lambda t: t[0], reverse=True)
 
         for _, rejected in rej_list[:max_rej]:
@@ -165,6 +183,7 @@ def _pairs_from_turns_raw(
     turns_raw_path: str,
     *,
     margin: float,
+    completion_field: str,
     max_rejected_per_prompt: int,
     chosen_filter: Dict[str, Any] | None,
     rejected_filter: Dict[str, Any] | None,
@@ -173,6 +192,7 @@ def _pairs_from_turns_raw(
     return build_pairs(
         rows,
         margin=margin,
+        completion_field=completion_field,
         max_rejected_per_prompt=max_rejected_per_prompt,
         chosen_filter=chosen_filter,
         rejected_filter=rejected_filter,
@@ -195,13 +215,6 @@ def _filter_overlong_pairs(
     tokenizer: Any,
     max_length: int,
 ) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
-    """
-    Drop DPO pairs that would exceed TRL's max_length instead of letting TRL truncate.
-
-    We track:
-      - completion-only lengths (helps debug overly verbose responses)
-      - prompt+chosen and prompt+rejected lengths (actual training-time constraint)
-    """
     kept: List[Dict[str, str]] = []
     stats: Dict[str, Any] = {
         "max_length": int(max_length),
@@ -289,6 +302,7 @@ def main() -> None:
     out_path = args.out or cfg["paths"]["dpo_pairs_path"]
 
     margin = float(tcfg.get("dpo_reward_margin", 2.0))
+    completion_field = str(tcfg.get("dpo_completion_field", "completion"))
     max_rej = int(tcfg.get("dpo_max_rejected_per_prompt", 1))
     max_len = int(tcfg.get("trl_max_length", tcfg.get("max_seq_len", 4096)))
     chosen_filter = dict(tcfg.get("dpo_chosen_filter") or {})
@@ -301,6 +315,7 @@ def main() -> None:
     current_pairs = _pairs_from_turns_raw(
         turns_raw_path,
         margin=margin,
+        completion_field=completion_field,
         max_rejected_per_prompt=max_rej,
         chosen_filter=chosen_filter,
         rejected_filter=rejected_filter,
@@ -325,6 +340,7 @@ def main() -> None:
             prev_pairs = _pairs_from_turns_raw(
                 prev_turns_raw_path,
                 margin=margin,
+                completion_field=completion_field,
                 max_rejected_per_prompt=max_rej,
                 chosen_filter=chosen_filter,
                 rejected_filter=rejected_filter,
@@ -355,6 +371,7 @@ def main() -> None:
     stats_payload = {
         "out_path": str(out_path),
         "turns_raw_path": str(turns_raw_path),
+        "completion_field": completion_field,
         "current_iter_pairs_before_length_filter": int(len(current_pairs)),
         "previous_iter_pairs_added_before_length_filter": int(prev_added),
         "all_pairs_before_length_filter": int(all_pairs_before_length_filter),
@@ -363,6 +380,7 @@ def main() -> None:
     stats_path.write_text(json.dumps(stats_payload, indent=2), encoding="utf-8")
 
     print(f"Wrote {len(all_pairs)} DPO pairs -> {out_path}")
+    print(f"  completion_field: {completion_field}")
     print(f"  current iter pairs kept before length filter: {len(current_pairs)}")
     if mix_previous:
         print(f"  previous iter pairs added before length filter: {prev_added}")

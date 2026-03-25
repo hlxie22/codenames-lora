@@ -20,6 +20,7 @@ from transformers.trainer_utils import get_last_checkpoint
 
 from .build_dpo_pairs import _passes_chosen_filter
 from .epoch_eval import EpochEvalCallback
+from .think_utils import split_think_and_rest
 from .utils import (
     ensure_dir,
     load_yaml,
@@ -112,6 +113,11 @@ def _resolve_sft_source_path(cfg: Dict[str, Any]) -> str:
     return str(cfg["paths"]["turns_raw_path"])
 
 
+def _resolve_sft_completion_field(cfg: Dict[str, Any]) -> str:
+    tcfg = cfg.get("training", {}) or {}
+    return str(tcfg.get("sft_completion_field", "completion"))
+
+
 def _sort_sft_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     def key(r: Dict[str, Any]):
         stats = r.get("stats") or {}
@@ -125,12 +131,38 @@ def _sort_sft_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(rows, key=key)
 
 
+def _resolve_completion_text(row: Dict[str, Any], field: str) -> str | None:
+    val = row.get(field)
+    if isinstance(val, str) and val:
+        text = val
+    elif field != "completion":
+        val = row.get("completion")
+        if isinstance(val, str) and val:
+            text = val
+        else:
+            return None
+    else:
+        return None
+
+    if field == "completion":
+        final = row.get("completion_final")
+        raw = row.get("completion_raw") or row.get("raw_spymaster_text") or text
+        reasoning_trace, stripped = split_think_and_rest(str(raw), which="first", allow_partial=True)
+        if reasoning_trace and isinstance(final, str) and final:
+            return final
+        if reasoning_trace and stripped:
+            return stripped
+
+    return text
+
+
 def _build_sft_dataset(
     cfg: Dict[str, Any],
     tok: Any,
 ) -> tuple[Dataset, Dict[str, Any]]:
     tcfg = cfg.get("training", {}) or {}
     source_path = _resolve_sft_source_path(cfg)
+    completion_field = _resolve_sft_completion_field(cfg)
     rows = read_jsonl(source_path)
 
     sft_filter = dict(tcfg.get("sft_filter") or {})
@@ -150,7 +182,7 @@ def _build_sft_dataset(
 
     for r in sorted_rows:
         prompt = r.get("prompt")
-        completion = r.get("completion")
+        completion = _resolve_completion_text(r, completion_field)
 
         if not isinstance(prompt, str) or not isinstance(completion, str):
             dropped_missing += 1
@@ -194,6 +226,7 @@ def _build_sft_dataset(
 
     stats = {
         "source_path": source_path,
+        "completion_field": completion_field,
         "source_rows": int(len(rows)),
         "filtered_rows": int(len(filtered)),
         "selected_rows_before_length": int(len(sorted_rows)),
@@ -320,6 +353,7 @@ def main() -> None:
     stats_path = Path(out_dir) / "sft_train_stats.json"
     stats_path.write_text(json.dumps(sft_stats, indent=2), encoding="utf-8")
     print(f"[train_sft] wrote dataset stats -> {stats_path}")
+    print(f"[train_sft] completion_field={sft_stats['completion_field']}")
     print(f"[train_sft] train_examples={sft_stats['train_examples']}")
 
     last_ckpt = get_last_checkpoint(str(out_dir)) if Path(out_dir).exists() else None

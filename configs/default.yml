@@ -10,28 +10,13 @@ vocab:
   extra_banlist: null
   manifest_path: "data/vocab_manifest.json"
 
-# ------------------------------------------------------------
-# Iteration knobs (single-config iteration workflow)
-#
-# iter.n:
-#   0 => "base run" writes to original paths/dirs (no suffix)
-#   1 => "iter1" uses previous adapter from iter0 (base dir)
-#   2 => "iter2" uses previous adapter from iter1, etc.
-#
-# iter.use_trained:
-#   false => rollouts from base model; training does NOT init from adapter
-#   true  => rollouts use prev adapter; training initializes from prev adapter
-#
-# You can override iter.n with env var ITER (e.g., sbatch --export=ALL,ITER=1 ...)
-# ------------------------------------------------------------
 iter:
   n: 0
   use_trained: true
   root: "outputs/dpo"
 
 inference:
-  backend: "vllm"   # "hf" or "vllm"
-
+  backend: "vllm"
   num_processes: 4
   batch_size: 16
 
@@ -39,13 +24,11 @@ inference:
     tensor_parallel_size: 1
     gpu_memory_utilization: 0.90
     max_model_len: 4096
-    dtype: "bfloat16"   # "auto" | "float16" | "bfloat16"
+    dtype: "bfloat16"
     trust_remote_code: true
-
     enable_lora: true
     max_lora_rank: 64
 
-  # If iter.use_trained=true, rollouts will use this adapter dir (prev iter).
   rollout_adapter_dir: "{root}{prev_dir}/lora_spymaster"
 
 paths:
@@ -54,8 +37,6 @@ paths:
   vocab_path: "data/vocab.txt"
   boards_train_path: "data/boards_train.jsonl"
   boards_eval_path: "data/boards_eval.jsonl"
-
-  # Iteration-scoped artifacts (iter0 keeps original names; iter>=1 gets suffix)
   turns_path: "data/turns{iter_suffix}.jsonl"
   turns_raw_path: "data/turns_raw{iter_suffix}.jsonl"
   dpo_pairs_path: "data/dpo_pairs{iter_suffix}.jsonl"
@@ -82,9 +63,20 @@ models:
 
 qwen:
   use_chat_template: true
+
+  # Spymaster reasoning policy:
+  #   none    -> final answer only
+  #   visible -> visible rationale in completion text (preserved in turns_raw)
+  #   native  -> model-native thinking mode; visible output should still be final-only
+  spymaster_reasoning_mode: "visible"
+  spymaster_visible_reasoning_max_words: 40
+
+  # Kept for back-compat with chat-template wrappers.
+  # Only used when spymaster_reasoning_mode == "native".
   enable_thinking_spymaster: false
   enable_thinking_guesser: true
-  system_spymaster: "You are the Spymaster in a Codenames-like game. Reason carefully, but keep your reasoning concise and decision-focused."
+
+  system_spymaster: "You are the Spymaster in a Codenames-like game. Reason carefully, but keep your visible answer concise and decision-focused."
   system_guesser: "You are the Guesser in a Codenames-like game."
 
 decoding:
@@ -130,6 +122,7 @@ training:
   deepspeed_config: null
   dpo_beta: 0.1
   dpo_reward_margin: 2.0
+  dpo_completion_field: "completion"
 
   dpo_max_rejected_per_prompt: 2
   trl_max_length: 4096
@@ -145,10 +138,7 @@ training:
   grad_accum: 2
   max_seq_len: 4096
 
-  # Iteration-scoped output adapter dir (iter0 keeps original dir; iter>=1 under /iterN)
   output_adapter_dir: "{root}{iter_dir}/lora_spymaster"
-
-  # If iter.use_trained=true, training will initialize from this (prev iter).
   init_adapter_dir: "{root}{prev_dir}/lora_spymaster"
 
   bf16: true
@@ -162,10 +152,8 @@ training:
   distributed:
     num_nodes: 4
 
-  # -------------------------
-  # One-round SFT bootstrap
-  # -------------------------
-  sft_source: "turns_raw"   # "turns_raw" or "turns"
+  sft_source: "turns_raw"
+  sft_completion_field: "completion"
   sft_output_adapter_dir: "outputs/sft/lora_spymaster"
   sft_init_adapter_dir: null
   sft_max_examples: 5000

@@ -35,16 +35,7 @@ def _merge_shards(out_dir: str | Path, num_shards: int) -> List[Dict[str, Any]]:
     return combined
 
 
-# -------------------------
-# vLLM LoRA toggling proxy (so we can share one engine)
-# -------------------------
-
 class _VLLMProxy:
-    """
-    Delegate to a base generator but force a particular LoRA request for calls.
-    Works with VLLMTextGenerator which stores LoRARequest on `._lora_request`.
-    """
-
     def __init__(self, base, lora_request):
         self._base = base
         self._lora_request = lora_request
@@ -70,10 +61,6 @@ class _VLLMProxy:
             setattr(self._base, "_lora_request", old)
 
 
-# -------------------------
-# Main
-# -------------------------
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -89,7 +76,6 @@ def main():
 
     out_dir = ensure_dir(args.out)
 
-    # Master process: write run meta, spawn children, then merge + aggregate
     if num_procs > 1 and not is_child_process():
         save_config_snapshot(cfg, out_dir)
         save_run_meta(
@@ -105,10 +91,8 @@ def main():
                     f"Usually you want tensor_parallel_size=1 when using multiple processes."
                 )
 
-        # mp_utils.launch_children(module, argv, num_procs)
         launch_children("src.eval", ["--config", args.config, "--mode", args.mode, "--out", args.out], num_procs)
 
-        # Merge shard outputs and compute metrics once
         per_board = _merge_shards(out_dir, num_procs)
         per_path = Path(out_dir) / "per_board.jsonl"
         write_jsonl(per_path, per_board)
@@ -121,7 +105,6 @@ def main():
         print(f"Wrote metrics   -> {Path(out_dir) / 'metrics.json'}")
         return
 
-    # Worker (or single process)
     if num_procs == 1 and not is_child_process():
         save_config_snapshot(cfg, out_dir)
         save_run_meta(
@@ -136,7 +119,6 @@ def main():
         boards = [b for i, b in enumerate(boards) if (i % num_shards) == shard_id]
         print(f"[shard {shard_id}/{num_shards}] boards={len(boards)}")
 
-    # Build generators (avoid two vLLM engines when model_ids match)
     backend = cfg.get("inference", {}).get("backend", "hf")
     sp_id = cfg["models"]["spymaster_model_id"]
     g_id = cfg["models"]["guesser_model_id"]
@@ -147,7 +129,6 @@ def main():
         if args.mode == "trained":
             adapter_dir = cfg["training"]["output_adapter_dir"]
             base = load_lora_on_generator(base, adapter_dir)
-            # capture LoRA request then disable it for guesser calls
             lora_req = getattr(base, "_lora_request", None)
             setattr(base, "_lora_request", None)
 
@@ -157,24 +138,19 @@ def main():
             spymaster = base
             guesser = base
     else:
-        # General case: separate generators
         spymaster = make_text_generator(sp_id, cfg)
         if args.mode == "trained":
             adapter_dir = cfg["training"]["output_adapter_dir"]
             spymaster = load_lora_on_generator(spymaster, adapter_dir)
         guesser = make_text_generator(g_id, cfg)
 
-    # Embedder
     use_embed = bool(cfg.get("constraints", {}).get("enable_directness_check", True))
     embedder = None
     if use_embed:
         device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
         embedder = Embedder(cfg["models"]["embedding_model_id"], device=device)
 
-    # Evaluate
     per_board: List[Dict[str, Any]] = []
-
-    # Keep n_candidates=1 in eval and force one-shot behavior (no resampling)
     n_candidates = 1
 
     for start in range(0, len(boards), max(1, batch_size)):
@@ -200,7 +176,7 @@ def main():
                 "stats": {**best.stats, "directness": float(best.directness)},
                 "clue_meta": {
                     "valid": bool(best.valid),
-                    "parse_valid": bool(c.parse_valid),
+                    "parse_valid": bool(best.parse_valid),
                     "rejected_total": int(meta["rejected_total"]),
                     "rejection_counts": meta["rejection_counts"],
                 },
@@ -212,14 +188,12 @@ def main():
             mr = float(np.mean([r["reward"] for r in per_board])) if per_board else 0.0
             print(f"[shard {shard_id}/{num_shards}] [{done}/{len(boards)}] mean_reward={mr:.3f}")
 
-    # Write outputs
     if num_shards > 1 and is_child_process():
         shard_path = _shard_out_path(out_dir, shard_id, num_shards)
         write_jsonl(shard_path, per_board)
         print(f"[shard {shard_id}/{num_shards}] Wrote per-board shard -> {shard_path}")
         return
 
-    # Single-process final outputs
     per_path = Path(out_dir) / "per_board.jsonl"
     write_jsonl(per_path, per_board)
 

@@ -20,18 +20,16 @@ import torch
 
 try:
     from transformers import TrainerCallback
-except Exception:  # very defensive
+except Exception:
     TrainerCallback = object  # type: ignore[misc]
 
 from .metrics import aggregate as aggregate_codenames
 from .model_wrappers import apply_chat_template, Embedder
+from .prompting import get_spymaster_reasoning_mode
 from .rollout import run_turns_batched
+from .think_utils import split_think_and_rest
 from .utils import read_jsonl
 
-
-# -------------------------
-# Distributed helpers
-# -------------------------
 
 def _dist_available() -> bool:
     try:
@@ -82,10 +80,6 @@ def _all_reduce_sum_int(x: int, device: torch.device) -> int:
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return int(t.item())
 
-
-# -------------------------
-# Small stats helpers
-# -------------------------
 
 def _mean(xs: List[float]) -> float:
     return float(sum(xs) / max(1, len(xs))) if xs else 0.0
@@ -157,13 +151,8 @@ def _maybe_disable_adapter(model: Any, disable: bool):
             yield
         return
 
-    # Non-PEFT model or no disable hook available.
     yield
 
-
-# -------------------------
-# In-trainer generator (no second model load)
-# -------------------------
 
 @dataclass
 class _GenCfg:
@@ -174,10 +163,6 @@ class _GenCfg:
 
 
 class _InTrainerGenerator:
-    """
-    Minimal TextGenerator-like adapter around the current trainer model + tokenizer.
-    """
-
     def __init__(self, model: Any, tokenizer: Any, device: torch.device, *, disable_adapter: bool = False):
         self.model = model
         self.tokenizer = tokenizer
@@ -265,10 +250,6 @@ class _InTrainerGenerator:
         ]
 
 
-# -------------------------
-# Eval pieces: Codenames
-# -------------------------
-
 def sample_codenames_eval_boards(cfg: Dict[str, Any], *, n_boards: int, seed: int) -> List[Dict[str, Any]]:
     boards_eval_path = cfg["paths"]["boards_eval_path"]
     boards_all = read_jsonl(boards_eval_path)
@@ -283,22 +264,33 @@ def sample_codenames_eval_boards(cfg: Dict[str, Any], *, n_boards: int, seed: in
     return [boards_all[i] for i in take]
 
 
-def _count_think_tokens(tokenizer: Any, text: str) -> int:
-    try:
-        from .think_utils import extract_think
-        think = extract_think(text, mode="inner", which="last", allow_partial=True)
-    except Exception:
-        m = list(re.finditer(r"<think>(.*?)</think>", text, flags=re.IGNORECASE | re.DOTALL))
-        think = (m[-1].group(1).strip() if m else "")
+def _count_spymaster_reasoning_tokens(cfg: Dict[str, Any], tokenizer: Any, text: str) -> int:
+    mode = get_spymaster_reasoning_mode(cfg)
+    if mode not in {"visible", "native"}:
+        return 0
 
-    if not think:
+    t = text or ""
+    rationale = ""
+
+    if mode == "native":
+        rationale, _ = split_think_and_rest(t, which="first", allow_partial=True)
+    else:
+        m = list(re.finditer(r"^RATIONALE\s*:\s*(.+)$", t, flags=re.IGNORECASE | re.MULTILINE))
+        if m:
+            rationale = m[-1].group(1).strip()
+        else:
+            clue_match = list(re.finditer(r"^CLUE\s*:", t, flags=re.IGNORECASE | re.MULTILINE))
+            if clue_match:
+                rationale = t[: clue_match[-1].start()].strip()
+
+    if not rationale:
         return 0
     try:
-        ids = tokenizer(think, return_tensors=None, add_special_tokens=False)["input_ids"]
+        ids = tokenizer(rationale, return_tensors=None, add_special_tokens=False)["input_ids"]
         return int(len(ids))
     except Exception:
         try:
-            return int(len(tokenizer.encode(think, add_special_tokens=False)))
+            return int(len(tokenizer.encode(rationale, add_special_tokens=False)))
         except Exception:
             return 0
 
@@ -311,7 +303,7 @@ def eval_codenames_subset_raw(
     boards: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     if not boards:
-        return {"per_board": [], "think_tokens": []}
+        return {"per_board": [], "reasoning_tokens": []}
 
     spymaster = _InTrainerGenerator(model, tokenizer, device, disable_adapter=False)
     guesser = _InTrainerGenerator(model, tokenizer, device, disable_adapter=True)
@@ -328,7 +320,7 @@ def eval_codenames_subset_raw(
     bs = max(1, bs)
 
     per_board: List[Dict[str, Any]] = []
-    think_tokens: List[int] = []
+    reasoning_tokens: List[int] = []
 
     was_training = bool(getattr(model, "training", False))
     try:
@@ -366,7 +358,7 @@ def eval_codenames_subset_raw(
                         },
                     }
                 )
-                think_tokens.append(_count_think_tokens(tokenizer, best.raw_spymaster_text or ""))
+                reasoning_tokens.append(_count_spymaster_reasoning_tokens(cfg, tokenizer, best.raw_spymaster_text or ""))
     finally:
         try:
             if was_training:
@@ -374,12 +366,8 @@ def eval_codenames_subset_raw(
         except Exception:
             pass
 
-    return {"per_board": per_board, "think_tokens": think_tokens}
+    return {"per_board": per_board, "reasoning_tokens": reasoning_tokens}
 
-
-# -------------------------
-# Eval pieces: WikiText-2 PPL
-# -------------------------
 
 def eval_wikitext2_ppl_raw(
     model: Any,
@@ -438,10 +426,6 @@ def eval_wikitext2_ppl_raw(
 
     return {"total_nll": total_nll, "total_tokens": total_tokens, "blocks_done": blocks_done}
 
-
-# -------------------------
-# Eval pieces: GSM8K
-# -------------------------
 
 _GSM8K_GOLD_RE = re.compile(r"####\s*([-+]?\d[\d,]*(?:\.\d+)?)")
 _GSM8K_FINAL_RE = re.compile(r"(?:FINAL|ANSWER)\s*:\s*([-+]?\d[\d,]*(?:\.\d+)?)", re.IGNORECASE)
@@ -578,10 +562,6 @@ def eval_gsm8k_raw(
 
     return {"n": len(examples), "correct": correct, "records": records}
 
-
-# -------------------------
-# Eval pieces: HumanEval
-# -------------------------
 
 def load_humaneval_subset(*, n: int, seed: int) -> List[Dict[str, Any]]:
     from datasets import load_dataset  # type: ignore
@@ -743,10 +723,6 @@ def eval_humaneval_raw(
     return {"n": len(examples), "passed": passed, "records": records}
 
 
-# -------------------------
-# Plotting
-# -------------------------
-
 def plot_epoch_history(history_path: Path, plots_dir: Path) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -787,8 +763,8 @@ def plot_epoch_history(history_path: Path, plots_dir: Path) -> None:
         "wikitext2_ppl",
         "gsm8k_exact_match",
         "humaneval_pass_at_1",
-        "codenames_spymaster_think_tokens_mean",
-        "codenames_spymaster_think_tokens_p90",
+        "codenames_spymaster_reasoning_tokens_mean",
+        "codenames_spymaster_reasoning_tokens_p90",
     ]
 
     for k in keys:
@@ -805,20 +781,7 @@ def plot_epoch_history(history_path: Path, plots_dir: Path) -> None:
         plt.close()
 
 
-# -------------------------
-# Callback
-# -------------------------
-
 class EpochEvalCallback(TrainerCallback):
-    """
-    End-of-epoch eval callback.
-
-    Writes (rank0):
-      - <out_dir>/epoch_eval_history.jsonl
-      - <out_dir>/epoch_eval_plots/*.png
-      - <out_dir>/epoch_eval_board_ids.json
-    """
-
     def __init__(self, cfg: Dict[str, Any], out_dir: str | Path):
         self.cfg = cfg
         self.out_dir = Path(out_dir)
@@ -903,11 +866,8 @@ class EpochEvalCallback(TrainerCallback):
         metrics: Dict[str, Any] = {}
         t0 = time.time()
 
-        # -------------------------
-        # Codenames subset
-        # -------------------------
         per_board_local: List[Dict[str, Any]] = []
-        think_local: List[int] = []
+        reasoning_local: List[int] = []
 
         try:
             n_boards = int(ecfg.get("codenames_n_boards", 0))
@@ -917,7 +877,7 @@ class EpochEvalCallback(TrainerCallback):
 
                 raw = eval_codenames_subset_raw(self.cfg, model, tok, device, subset_local)
                 per_board_local = list(raw.get("per_board", []) or [])
-                think_local = [int(x) for x in (raw.get("think_tokens", []) or [])]
+                reasoning_local = [int(x) for x in (raw.get("reasoning_tokens", []) or [])]
         except Exception as e:
             err_msgs.append(
                 f"[epoch_eval][rank {rank} host={host}] Codenames subset eval failed: {type(e).__name__}: {e}\n"
@@ -929,10 +889,10 @@ class EpochEvalCallback(TrainerCallback):
         for part in gathered_records:
             per_board.extend(part or [])
 
-        gathered_think = _all_gather_objects(think_local)
-        think_tokens: List[int] = []
-        for part in gathered_think:
-            think_tokens.extend([int(x) for x in (part or [])])
+        gathered_reasoning = _all_gather_objects(reasoning_local)
+        reasoning_tokens: List[int] = []
+        for part in gathered_reasoning:
+            reasoning_tokens.extend([int(x) for x in (part or [])])
 
         if rank == 0 and per_board:
             try:
@@ -959,8 +919,8 @@ class EpochEvalCallback(TrainerCallback):
                     safe_k = re.sub(r"[^0-9A-Za-z_]+", "_", str(k)).strip("_") or "unknown"
                     metrics[f"rejection_reason_count__{safe_k}"] = int(v)
 
-                metrics["codenames_spymaster_think_tokens_mean"] = float(_mean([float(x) for x in think_tokens]))
-                metrics["codenames_spymaster_think_tokens_p90"] = float(_p90([float(x) for x in think_tokens]))
+                metrics["codenames_spymaster_reasoning_tokens_mean"] = float(_mean([float(x) for x in reasoning_tokens]))
+                metrics["codenames_spymaster_reasoning_tokens_p90"] = float(_p90([float(x) for x in reasoning_tokens]))
             except Exception as e:
                 err_msgs.append(
                     f"[epoch_eval][rank {rank} host={host}] Aggregation/metrics failed: {type(e).__name__}: {e}\n"
@@ -969,9 +929,6 @@ class EpochEvalCallback(TrainerCallback):
 
         _barrier()
 
-        # -------------------------
-        # WikiText-2 PPL
-        # -------------------------
         wt_total_nll = 0.0
         wt_total_tokens = 0
         wt_blocks_done = 0
@@ -1015,9 +972,6 @@ class EpochEvalCallback(TrainerCallback):
 
         _barrier()
 
-        # -------------------------
-        # GSM8K
-        # -------------------------
         gsm_correct_local = 0
         gsm_total_local = 0
 
@@ -1051,9 +1005,6 @@ class EpochEvalCallback(TrainerCallback):
 
         _barrier()
 
-        # -------------------------
-        # HumanEval
-        # -------------------------
         he_pass_local = 0
         he_total_local = 0
 
@@ -1088,9 +1039,6 @@ class EpochEvalCallback(TrainerCallback):
 
         _barrier()
 
-        # -------------------------
-        # Emit gathered errors to rank0
-        # -------------------------
         all_errs = _all_gather_objects("\n\n".join([m for m in err_msgs if m.strip()]))
         if rank == 0:
             for r, s in enumerate(all_errs):
@@ -1099,9 +1047,6 @@ class EpochEvalCallback(TrainerCallback):
 
         _barrier()
 
-        # -------------------------
-        # Write + plot (rank0)
-        # -------------------------
         metrics["epoch"] = int(epoch_i)
         metrics["global_step"] = int(getattr(state, "global_step", 0))
         metrics["epoch_eval_seconds"] = float(time.time() - t0)

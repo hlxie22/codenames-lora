@@ -10,6 +10,7 @@ from .prompting import render_prompt, generate_from_messages
 from .rules import is_valid_clue, normalize_word, score_turn
 from .spymaster_prompt import build_spymaster_messages
 from .guesser_prompt import build_guesser_messages
+from .think_utils import strip_think_blocks
 
 # -------------------------
 # Parsing helpers
@@ -20,12 +21,17 @@ _NUM_RE = re.compile(r"NUM\s*:\s*([0-9]+)", re.IGNORECASE)
 _GUESSES_RE = re.compile(r"GUESSES\s*:\s*(.+)", re.IGNORECASE)
 
 
+def _visible_text(text: str) -> str:
+    return strip_think_blocks(text or "", remove_dangling_tags=True).strip()
+
+
 def parse_spymaster_output(text: str) -> Tuple[Optional[str], Optional[int]]:
     """
-    Extract the last CLUE/NUM pair from a completion.
+    Extract the last CLUE/NUM pair from the visible portion of a completion.
     """
-    clues = _CLUE_RE.findall(text)
-    nums = _NUM_RE.findall(text)
+    visible = _visible_text(text)
+    clues = _CLUE_RE.findall(visible)
+    nums = _NUM_RE.findall(visible)
     clue = clues[-1].strip().splitlines()[0].strip() if clues else None
     num = int(nums[-1]) if nums else None
     return clue, num
@@ -34,12 +40,13 @@ def parse_spymaster_output(text: str) -> Tuple[Optional[str], Optional[int]]:
 def parse_guesser_output(text: str) -> List[str]:
     """
     Extract guesses from "GUESSES: a, b, c" (last match wins),
-    otherwise fall back to first non-empty line.
+    otherwise fall back to first non-empty visible line.
     """
-    ms = _GUESSES_RE.findall(text)
+    visible = _visible_text(text)
+    ms = _GUESSES_RE.findall(visible)
     raw = ms[-1] if ms else ""
     if not raw:
-        raw = text.strip().splitlines()[0] if text.strip() else ""
+        raw = visible.strip().splitlines()[0] if visible.strip() else ""
 
     parts = [p.strip() for p in raw.replace("\n", " ").split(",")]
     return [p for p in parts if p]

@@ -127,13 +127,6 @@ def _maybe_disable_adapter(model: Any, disable: bool):
 
 
 class _InTrainerGenerator:
-    """
-    Minimal TextGenerator-like adapter around the *current trainer model + tokenizer*.
-
-    Works with rollout.run_turns_batched via generate() / generate_batch() / format_chat().
-    Avoids loading a second model (which is the usual OOM trap during training).
-    """
-
     def __init__(
         self,
         model: Any,
@@ -231,20 +224,6 @@ class _InTrainerGenerator:
 
 
 class FullCodenamesEvalCallback(TrainerCallback):
-    """
-    Full eval (boards_eval gameplay) at epoch end.
-
-    Outputs:
-      <out_dir>/full_eval/epoch_XXX_step_YYY/per_board.jsonl
-      <out_dir>/full_eval/epoch_XXX_step_YYY/metrics.json
-
-    Also writes:
-      <out_dir>/full_eval_rank{rank}.err   (tracebacks)
-      stderr (SLURM .err)
-
-    Distributed-safe: all ranks always participate in gathers/barriers.
-    """
-
     def __init__(self, cfg: Dict[str, Any], out_dir: str | Path, *, every_epochs: int = 1, batch_size: int = 1):
         self.cfg = cfg
         self.out_dir = Path(out_dir)
@@ -256,7 +235,6 @@ class FullCodenamesEvalCallback(TrainerCallback):
         epoch_f = state.epoch
         epoch_i = int(epoch_f) if epoch_f is not None else 0
 
-        # avoid double fire
         if self._last_epoch_logged is not None and epoch_i == self._last_epoch_logged:
             return control
         self._last_epoch_logged = epoch_i
@@ -279,7 +257,6 @@ class FullCodenamesEvalCallback(TrainerCallback):
 
         err_msgs: List[str] = []
 
-        # ---- resolve trainer/model/tokenizer/device ----
         trainer = kwargs.get("trainer", None)
 
         if trainer is not None:
@@ -287,7 +264,6 @@ class FullCodenamesEvalCallback(TrainerCallback):
             tok = _get_tokenizer(trainer)
             device = _trainer_device(trainer)
         else:
-            # Fallback: many Trainer/TRL versions do NOT pass `trainer` in kwargs.
             model = kwargs.get("model", None)
             tok = kwargs.get("tokenizer", None) or kwargs.get("processing_class", None)
             device = _infer_device_from_model(model) if model is not None else _infer_device_from_model(object())
@@ -302,7 +278,6 @@ class FullCodenamesEvalCallback(TrainerCallback):
             _barrier()
             return control
 
-        # Load boards (small enough) + shard across ranks
         boards_local: List[Dict[str, Any]] = []
         try:
             boards_eval_path = self.cfg["paths"]["boards_eval_path"]
@@ -315,7 +290,6 @@ class FullCodenamesEvalCallback(TrainerCallback):
             )
             boards_local = []
 
-        # Generators: spymaster uses current adapter, guesser uses base model.
         spymaster = _InTrainerGenerator(
             model,
             tok,
@@ -331,7 +305,6 @@ class FullCodenamesEvalCallback(TrainerCallback):
             disable_adapter=True,
         )
 
-        # Optional: directness embedder, but put it on CPU to avoid GPU OOM during training.
         embedder = None
         try:
             use_embed = bool(self.cfg.get("constraints", {}).get("enable_directness_check", True))
@@ -344,7 +317,6 @@ class FullCodenamesEvalCallback(TrainerCallback):
             )
             embedder = None
 
-        # eval loop
         was_training = bool(getattr(model, "training", False))
         try:
             model.eval()
@@ -355,7 +327,6 @@ class FullCodenamesEvalCallback(TrainerCallback):
         per_board_local: List[Dict[str, Any]] = []
 
         try:
-            # Always eval with n_candidates=1 and force one-shot behavior (no resampling)
             n_candidates = 1
 
             for start in range(0, len(boards_local), self.batch_size):
@@ -381,7 +352,7 @@ class FullCodenamesEvalCallback(TrainerCallback):
                         "stats": {**best.stats, "directness": float(best.directness)},
                         "clue_meta": {
                             "valid": bool(best.valid),
-                            "parse_valid": bool(c.parse_valid),
+                            "parse_valid": bool(best.parse_valid),
                             "rejected_total": int(meta["rejected_total"]),
                             "rejection_counts": meta["rejection_counts"],
                         },
@@ -395,14 +366,12 @@ class FullCodenamesEvalCallback(TrainerCallback):
             )
             per_board_local = []
 
-        # restore mode
         try:
             if was_training:
                 model.train()
         except Exception:
             pass
 
-        # ALWAYS gather to avoid rank divergence
         gathered = _all_gather_objects(per_board_local)
         per_board_all: List[Dict[str, Any]] = []
         for part in gathered:
@@ -410,7 +379,6 @@ class FullCodenamesEvalCallback(TrainerCallback):
 
         _barrier()
 
-        # Gather errors to rank0 and write them (also to per-rank files via stderr on rank0)
         all_errs = _all_gather_objects("\n\n".join([m for m in err_msgs if m.strip()]))
         if rank == 0:
             for r, s in enumerate(all_errs):
@@ -435,7 +403,6 @@ class FullCodenamesEvalCallback(TrainerCallback):
 
                 (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-                # best-effort Trainer logging (only if we actually have trainer)
                 if trainer is not None:
                     try:
                         trainer.log({f"full_eval/{k}": v for k, v in metrics.items() if isinstance(v, (int, float))})

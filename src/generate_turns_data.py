@@ -12,10 +12,10 @@ import numpy as np
 from .io_utils import shard_path_append_to_suffix, merge_jsonl_shards
 from .model_wrappers import Embedder, make_text_generator, load_lora_on_generator
 from .mp_utils import launch_children, is_child_process, child_shard_info
-from .prompting import render_prompt
+from .prompting import render_prompt, get_spymaster_reasoning_mode
 from .rollout import run_turns_batched
 from .spymaster_prompt import build_spymaster_messages
-from .think_utils import extract_think as _extract_think
+from .think_utils import split_think_and_rest
 from .utils import load_yaml, read_jsonl, set_global_seed, write_jsonl, save_progress
 
 
@@ -83,9 +83,9 @@ def build_rollout_generators(cfg: Dict[str, Any]):
         base = make_text_generator(sp_id, cfg)
 
         if adapter_ok:
-            base = load_lora_on_generator(base, adapter_dir)  # sets base._lora_request
+            base = load_lora_on_generator(base, adapter_dir)
             lora_req = getattr(base, "_lora_request", None)
-            setattr(base, "_lora_request", None)  # default: no LoRA
+            setattr(base, "_lora_request", None)
 
             spymaster = _VLLMProxy(base, lora_req)
             guesser = _VLLMProxy(base, None)
@@ -93,7 +93,6 @@ def build_rollout_generators(cfg: Dict[str, Any]):
 
         return base, base
 
-    # General case: separate generators
     spymaster = make_text_generator(sp_id, cfg)
     if adapter_ok:
         spymaster = load_lora_on_generator(spymaster, adapter_dir)
@@ -124,7 +123,6 @@ def load_done_example_ids(raw_path: str | Path) -> set[str]:
                 if eid:
                     done.add(str(eid))
             except Exception:
-                # If a partial/corrupt last line exists, ignore it
                 continue
     return done
 
@@ -138,24 +136,47 @@ def _try_load_progress(progress_path: Path) -> Optional[Dict[str, Any]]:
     return None
 
 
-def extract_think_block(text: str) -> str:
-    """
-    Back-compat wrapper: returns the FULL <think>...</think> block (or best-effort partial)
-    from the LAST block.
-    """
-    return _extract_think(text, mode="full", which="last", allow_partial=True)
+def _final_answer_completion(clue: str, num: int) -> str:
+    return f"CLUE: {clue}\nNUM: {int(num)}\n"
 
 
-def _candidate_completion_from_raw(raw_spymaster_text: str, clue: str, num: int) -> str:
+def _safe_completion_raw(raw_spymaster_text: str, clue: str, num: int) -> str:
+    raw = (raw_spymaster_text or "").strip()
+    if raw:
+        return raw
+    return _final_answer_completion(clue, num).strip()
+
+
+def _spymaster_completion_fields(
+    cfg: Dict[str, Any],
+    *,
+    raw_spymaster_text: str,
+    clue: str,
+    num: int,
+) -> Dict[str, Any]:
     """
-    Construct a completion that matches training format:
-      (<think>...</think>\n)?CLUE: ...\nNUM: ...\n
+    Normalize stored completions so native Qwen3 reasoning traces stay in raw fields,
+    while the training-facing `completion` field stays visible/final-only.
     """
-    think_block = extract_think_block(raw_spymaster_text or "")
-    out = ""
-    if think_block:
-        out += think_block.strip() + "\n"
-    out += f"CLUE: {clue}\nNUM: {int(num)}\n"
+    raw = _safe_completion_raw(raw_spymaster_text, clue, num)
+    final = _final_answer_completion(clue, int(num)).strip()
+    reasoning_trace, visible = split_think_and_rest(raw, which="first", allow_partial=True)
+    visible = visible.strip() or final
+
+    mode = get_spymaster_reasoning_mode(cfg)
+    if mode == "visible":
+        completion = raw
+    else:
+        completion = final
+
+    out: Dict[str, Any] = {
+        "completion": completion,
+        "completion_raw": raw,
+        "completion_final": final,
+        "visible_completion": visible,
+    }
+    if reasoning_trace:
+        out["reasoning_trace"] = reasoning_trace
     return out
 
 
@@ -166,7 +187,6 @@ def _candidate_completion_from_raw(raw_spymaster_text: str, clue: str, num: int)
 def filter_examples(records: List[Dict[str, Any]], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Keeps board-records whose BEST candidate satisfies filtering config.
-    This is the same logic as your previous SFT filtering.
     """
     fcfg = cfg["filtering"]
     mode = fcfg["mode"]
@@ -214,10 +234,6 @@ def _merge_shards_to_base(base_raw_path: str | Path, num_shards: int) -> List[Di
 
 
 def _cfg_turns_paths(cfg: Dict[str, Any]) -> tuple[str, str]:
-    """
-    Returns (turns_path, turns_raw_path).
-    Requires the new keys, but keeps a fallback to the old SFT keys if present.
-    """
     paths = cfg.get("paths", {}) or {}
     turns_path = paths.get("turns_path") or paths.get("sft_turns_path")
     turns_raw_path = paths.get("turns_raw_path") or paths.get("sft_turns_raw_path")
@@ -234,9 +250,6 @@ def _cfg_turns_paths(cfg: Dict[str, Any]) -> tuple[str, str]:
 # -------------------------
 
 def _slurm_array_info() -> tuple[int, int]:
-    """
-    Return (task_id, task_count). If not in a SLURM array, returns (0, 1).
-    """
     tid = os.environ.get("SLURM_ARRAY_TASK_ID")
     if tid is None:
         return (0, 1)
@@ -252,7 +265,6 @@ def _slurm_array_info() -> tuple[int, int]:
         n = int(tmax) - int(tmin) + 1
         return (sid, max(1, n))
 
-    # Fallback if SLURM doesn't expose count/min/max
     return (sid, 1)
 
 
@@ -263,8 +275,6 @@ def _slurm_array_info() -> tuple[int, int]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-
-    # Optional overrides (useful outside SLURM or for debugging)
     ap.add_argument("--job-shard-id", type=int, default=None, help="Override SLURM_ARRAY_TASK_ID")
     ap.add_argument("--job-num-shards", type=int, default=None, help="Override SLURM_ARRAY_TASK_COUNT")
     ap.add_argument("--no-merge", action="store_true", help="Do not merge/filter (write only shard outputs).")
@@ -277,7 +287,6 @@ def main():
     num_procs = int(cfg.get("inference", {}).get("num_processes", 1))
     batch_size = int(cfg.get("inference", {}).get("batch_size", 1))
 
-    # Job-level sharding (typically from SLURM array)
     sl_sid, sl_n = _slurm_array_info()
     job_sid = int(args.job_shard_id) if args.job_shard_id is not None else int(sl_sid)
     job_n = int(args.job_num_shards) if args.job_num_shards is not None else int(sl_n)
@@ -287,9 +296,6 @@ def main():
     if job_sid < 0 or job_sid >= job_n:
         raise ValueError(f"Invalid job shard {job_sid} for job_num_shards={job_n}")
 
-    # ---------------------------------------------------------------------
-    # MASTER: spawn GPU children (intra-job sharding), optionally merge/filter
-    # ---------------------------------------------------------------------
     if num_procs > 1 and not is_child_process():
         if cfg.get("inference", {}).get("backend") == "vllm":
             tp = int(cfg.get("inference", {}).get("vllm", {}).get("tensor_parallel_size", 1))
@@ -299,7 +305,6 @@ def main():
                     f"Usually you want tensor_parallel_size=1 when using multiple processes."
                 )
 
-        # Global sharding across SLURM jobs *and* GPUs-per-job (num_procs)
         total_shards = int(job_n) * int(num_procs)
         shard_base = int(job_sid) * int(num_procs)
 
@@ -311,7 +316,6 @@ def main():
             total_shards=total_shards,
         )
 
-        # In a SLURM array (job_n>1), you generally want ONE separate merge job.
         if job_n > 1 or bool(args.no_merge):
             print(
                 f"[master] finished job shard {job_sid}/{job_n} "
@@ -320,46 +324,35 @@ def main():
             )
             return
 
-        # Back-compat: single-job, multi-proc -> merge children + filter here
-        combined = _merge_shards_to_base(turns_raw_path, total_shards)  # total_shards == num_procs when job_n==1
+        combined = _merge_shards_to_base(turns_raw_path, total_shards)
         filtered = filter_examples(combined, cfg)
         write_jsonl(turns_path, filtered)
         print(f"Merged {len(combined)} raw -> Filtered {len(filtered)} -> {turns_path}")
         return
 
-    # ---------------------------------------------------------------------
-    # WORKER (child) OR single-process mode (possibly job-sharded)
-    # ---------------------------------------------------------------------
     set_global_seed(int(cfg["training"].get("seed", 0)))
 
     boards = read_jsonl(cfg["paths"]["boards_train_path"])
 
-    # Apply cap BEFORE sharding so total dataset size is bounded
     maxb = cfg.get("boards", {}).get("sft_max_train_boards", None)
     if maxb is not None:
         boards = boards[: int(maxb)]
         print(f"Using only first {len(boards)} train boards (boards.sft_max_train_boards={maxb}).")
 
-    # Determine global shard identity:
-    # - child processes: mp_utils provides global shard id/total (may be offset by SLURM job)
-    # - non-child single-proc: job sharding is the only sharding (job_sid/job_n)
     shard_id, num_shards = child_shard_info() if is_child_process() else (job_sid, job_n)
 
-    # Shard boards by index
     if num_shards > 1:
         boards = [b for i, b in enumerate(boards) if (i % num_shards) == shard_id]
         print(f"[shard {shard_id}/{num_shards}] boards={len(boards)}")
 
     shard_total = len(boards)
 
-    # Paths (use per-shard raw file to avoid concurrent appends)
     raw_path = Path(turns_raw_path)
     if num_shards > 1:
         raw_path = shard_path_append_to_suffix(raw_path, shard_id, num_shards)
 
     progress_path = raw_path.with_suffix(raw_path.suffix + ".progress.json")
 
-    # Resume: detect already-written examples
     done_ids = load_done_example_ids(raw_path)
     if done_ids:
         before = len(boards)
@@ -376,23 +369,17 @@ def main():
     prev_mean = prev_prog.get("mean_reward_running", None)
     prev_done = prev_prog.get("done", None)
 
-    # Running mean reward of BEST (one per board)
     running_sum = 0.0
     running_n = 0
-
-    # Running stats for best-of-N uplift vs average candidate
     uplift_sum = 0.0
     uplift_n = 0
     cand_avg_sum = 0.0
     cand_std_sum = 0.0
     cand_valid_frac_sum = 0.0
-
-    # Valid-only variants
     uplift_valid_sum = 0.0
     uplift_valid_n = 0
     cand_avg_valid_sum = 0.0
 
-    # Carry forward progress if consistent
     try:
         if prev_mean is not None and prev_done is not None and int(prev_done) == len(done_ids):
             running_n = int(prev_done)
@@ -451,7 +438,7 @@ def main():
             "batch_size": int(batch_size),
             "shard_id": int(shard_id),
             "num_shards": int(num_shards),
-            "include_raw_texts": False,
+            "preserve_spymaster_raw_text": True,
             "uplift_done": int(uplift_n),
             "mean_candidate_reward_running": (cand_avg_sum / uplift_n) if uplift_n else None,
             "mean_best_minus_avg_reward_running": (uplift_sum / uplift_n) if uplift_n else None,
@@ -463,12 +450,8 @@ def main():
         },
     )
 
-    # -------------------------
-    # Models (optionally load rollout adapter)
-    # -------------------------
     spymaster, guesser = build_rollout_generators(cfg)
 
-    # Embedder (OPTIONAL via constraints.enable_directness_check)
     use_embed = bool(cfg.get("constraints", {}).get("enable_directness_check", True))
     embedder = None
     if use_embed:
@@ -478,16 +461,10 @@ def main():
     n_candidates = int(cfg["decoding"]["n_candidates"])
     progress_every = int(cfg.get("decoding", {}).get("progress_every", 50))
 
-    # -------------------------
-    # Buffered writer
-    # -------------------------
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     f_raw = open(raw_path, "a", encoding="utf-8")
     writes_since_flush = 0
     FLUSH_EVERY = int(cfg.get("decoding", {}).get("flush_every", 10))
-
-    # To keep files small, do NOT store raw texts by default.
-    INCLUDE_RAW_TEXTS = False
 
     try:
         if not boards and len(done_ids) >= shard_total:
@@ -515,13 +492,13 @@ def main():
                     msgs = build_spymaster_messages(b["board_words"], b["labels"], revealed, cfg)
                     prompt = render_prompt(spymaster, msgs, cfg, role="spymaster")
 
-                    best_completion = _candidate_completion_from_raw(
-                        best.raw_spymaster_text,
-                        best.clue,
-                        int(best.num),
+                    best_completion_fields = _spymaster_completion_fields(
+                        cfg,
+                        raw_spymaster_text=best.raw_spymaster_text,
+                        clue=best.clue,
+                        num=int(best.num),
                     )
 
-                    # Best candidate index (identity match; fallback to value match)
                     best_idx = None
                     for j, c in enumerate(cands):
                         if c is best:
@@ -538,7 +515,6 @@ def main():
                                 best_idx = j
                                 break
 
-                    # --- variance / uplift stats ---
                     cand_rewards = [float(c.reward) for c in cands] if cands else []
                     avg_all = float(np.mean(cand_rewards)) if cand_rewards else 0.0
                     std_all = float(np.std(cand_rewards)) if cand_rewards else 0.0
@@ -555,10 +531,11 @@ def main():
 
                     cand_payload: List[Dict[str, Any]] = []
                     for c in cands:
-                        cand_completion = _candidate_completion_from_raw(
-                            c.raw_spymaster_text,
-                            c.clue,
-                            int(c.num),
+                        cand_completion_fields = _spymaster_completion_fields(
+                            cfg,
+                            raw_spymaster_text=c.raw_spymaster_text,
+                            clue=c.clue,
+                            num=int(c.num),
                         )
                         cd: Dict[str, Any] = {
                             "clue": c.clue,
@@ -570,37 +547,32 @@ def main():
                             "reward": float(c.reward),
                             "stats": c.stats,
                             "guess_words": c.guess_words,
-                            "completion": cand_completion,
+                            **cand_completion_fields,
+                            "raw_spymaster_text": c.raw_spymaster_text,
+                            "raw_guesser_text": c.raw_guesser_text,
                         }
-                        if INCLUDE_RAW_TEXTS:
-                            cd["raw_spymaster_text"] = c.raw_spymaster_text
-                            cd["raw_guesser_text"] = c.raw_guesser_text
                         cand_payload.append(cd)
 
                     rec = {
                         "example_id": example_id,
                         "board_id": str(b["board_id"]),
                         "prompt": prompt,
-
-                        # BEST (used for SFT; also the "chosen" for DPO)
-                        "completion": best_completion,
+                        **best_completion_fields,
+                        "raw_spymaster_text": best.raw_spymaster_text,
+                        "raw_guesser_text": best.raw_guesser_text,
                         "reward": float(best.reward),
                         "stats": {**best.stats, "directness": float(best.directness)},
                         "clue_meta": {
                             "clue": best.clue,
                             "num": int(best.num),
-                            "parse_valid": bool(c.parse_valid),
+                            "parse_valid": bool(best.parse_valid),
                             "valid": bool(best.valid),
                             "rejected_candidates": int(meta["rejected_total"]),
                             "rejection_counts": meta["rejection_counts"],
                         },
                         "debug": {"guess_words": best.guess_words},
-
-                        # Candidates for DPO pair building
                         "best_candidate_idx": best_idx,
                         "candidates": cand_payload,
-
-                        # per-example best-of-N uplift fields
                         "candidate_reward_mean": float(avg_all),
                         "candidate_reward_std": float(std_all),
                         "candidate_valid_frac": float(valid_frac),
@@ -617,11 +589,8 @@ def main():
 
                     done_ids.add(example_id)
 
-                    # Update running best reward mean
                     running_sum += float(best.reward)
                     running_n += 1
-
-                    # Update running uplift stats
                     cand_avg_sum += float(avg_all)
                     cand_std_sum += float(std_all)
                     cand_valid_frac_sum += float(valid_frac)
@@ -635,12 +604,10 @@ def main():
 
                     if len(done_ids) % progress_every == 0:
                         mean_r = (running_sum / running_n) if running_n else None
-
                         mean_cand = (cand_avg_sum / uplift_n) if uplift_n else None
                         mean_uplift = (uplift_sum / uplift_n) if uplift_n else None
                         mean_std = (cand_std_sum / uplift_n) if uplift_n else None
                         mean_vfrac = (cand_valid_frac_sum / uplift_n) if uplift_n else None
-
                         mean_cand_valid = (cand_avg_valid_sum / uplift_valid_n) if uplift_valid_n else None
                         mean_uplift_valid = (uplift_valid_sum / uplift_valid_n) if uplift_valid_n else None
 
@@ -657,7 +624,7 @@ def main():
                                 "batch_size": int(batch_size),
                                 "shard_id": int(shard_id),
                                 "num_shards": int(num_shards),
-                                "include_raw_texts": bool(INCLUDE_RAW_TEXTS),
+                                "preserve_spymaster_raw_text": True,
                                 "status": "running",
                                 "uplift_done": int(uplift_n),
                                 "mean_candidate_reward_running": mean_cand,
@@ -682,8 +649,6 @@ def main():
         except Exception:
             pass
 
-    # If we're sharded (child OR SLURM-array single-proc), stop here.
-    # A separate merge job should merge/filter once.
     if num_shards > 1:
         print(f"[shard {shard_id}/{num_shards}] done; skipping global filter/merge (merge job will handle).")
 
@@ -716,7 +681,6 @@ def main():
         )
         return
 
-    # Single-process, non-sharded mode: filter and write final file
     raw_for_filter = read_jsonl(raw_path) if raw_path.exists() else []
     filtered = filter_examples(raw_for_filter, cfg)
     write_jsonl(turns_path, filtered)

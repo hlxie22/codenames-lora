@@ -5,16 +5,46 @@ from typing import Any, Dict, List, Literal, Optional
 from .model_wrappers import GenerationConfig, TextGenerator
 
 Role = Literal["spymaster", "guesser", "generic"]
+SpymasterReasoningMode = Literal["none", "visible", "native"]
 
 
 def _use_chat_template(cfg: Dict[str, Any]) -> bool:
     return bool(cfg.get("qwen", {}).get("use_chat_template", False))
 
 
+def get_spymaster_reasoning_mode(cfg: Dict[str, Any]) -> SpymasterReasoningMode:
+    """
+    Decouple visible output format from native chat-template thinking mode.
+
+    Modes:
+      - none:    no visible reasoning, no native thinking
+      - visible: visible rationale is part of the completion text
+      - native:  model-native thinking mode may be enabled, but visible output should
+                 still be final-answer-only
+
+    Back-compat:
+      if qwen.spymaster_reasoning_mode is absent, infer:
+        enable_thinking_spymaster=true  -> native
+        otherwise                       -> none
+    """
+    q = cfg.get("qwen", {}) or {}
+    raw = q.get("spymaster_reasoning_mode", None)
+    if raw is None:
+        return "native" if bool(q.get("enable_thinking_spymaster", False)) else "none"
+
+    mode = str(raw).strip().lower()
+    if mode not in {"none", "visible", "native"}:
+        raise ValueError(
+            f"Unsupported qwen.spymaster_reasoning_mode={raw!r}. "
+            "Expected one of: none, visible, native."
+        )
+    return mode  # type: ignore[return-value]
+
+
 def _enable_thinking(cfg: Dict[str, Any], role: Role) -> bool:
     q = cfg.get("qwen", {}) or {}
     if role == "spymaster":
-        return bool(q.get("enable_thinking_spymaster", False))
+        return bool(get_spymaster_reasoning_mode(cfg) == "native")
     if role == "guesser":
         return bool(q.get("enable_thinking_guesser", True))
     return bool(q.get("enable_thinking", True))
@@ -66,5 +96,5 @@ def generate_from_messages(
         gen_cfg,
         seed=seed,
         use_chat_template=False,
-        enable_thinking=False,  # ignored for raw prompts
+        enable_thinking=False,
     )

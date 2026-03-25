@@ -1,6 +1,46 @@
 from __future__ import annotations
 
-from typing import Dict, List, Any
+from typing import Any, Dict, List
+
+from .prompting import get_spymaster_reasoning_mode
+
+
+def _visible_reasoning_header(cfg: Dict[str, Any]) -> str:
+    max_words = int((cfg.get("qwen", {}) or {}).get("spymaster_visible_reasoning_max_words", 40))
+    return f"""
+VISIBLE RATIONALE INSTRUCTIONS:
+- Include one short visible rationale line.
+- Keep it concise and decision-focused.
+- Do not restate the whole board.
+- Keep the rationale under {max_words} words.
+- Then give the final clue and number.
+
+OUTPUT FORMAT (exactly):
+RATIONALE: <short rationale>
+CLUE: <one_word>
+NUM: <integer>
+"""
+
+
+def _native_reasoning_header() -> str:
+    return """
+REASONING INSTRUCTIONS:
+- Think privately if helpful before answering.
+- Do not expose your chain-of-thought.
+- Return only the final clue and number.
+
+OUTPUT FORMAT (exactly):
+CLUE: <one_word>
+NUM: <integer>
+"""
+
+
+def _no_reasoning_header() -> str:
+    return """
+OUTPUT FORMAT (exactly):
+CLUE: <one_word>
+NUM: <integer>
+"""
 
 
 def build_spymaster_messages(
@@ -9,7 +49,10 @@ def build_spymaster_messages(
     revealed_mask: List[bool],
     cfg: Dict[str, Any],
 ) -> List[Dict[str, str]]:
-    system = cfg.get("qwen", {}).get("system_spymaster", "You are the Spymaster in a Codenames-like game.")
+    system = cfg.get("qwen", {}).get(
+        "system_spymaster",
+        "You are the Spymaster in a Codenames-like game.",
+    )
 
     words_lines = []
     for i, w in enumerate(board_words):
@@ -20,6 +63,14 @@ def build_spymaster_messages(
     opp_words = [w for w, lab, rev in zip(board_words, labels, revealed_mask) if (lab == "OPP" and not rev)]
     neu_words = [w for w, lab, rev in zip(board_words, labels, revealed_mask) if (lab == "NEU" and not rev)]
     ass_words = [w for w, lab, rev in zip(board_words, labels, revealed_mask) if (lab == "ASSASSIN" and not rev)]
+
+    mode = get_spymaster_reasoning_mode(cfg)
+    if mode == "visible":
+        reasoning_block = _visible_reasoning_header(cfg)
+    elif mode == "native":
+        reasoning_block = _native_reasoning_header()
+    else:
+        reasoning_block = _no_reasoning_header()
 
     user = f"""
 BOARD WORDS (25):
@@ -49,26 +100,7 @@ CONSTRAINTS:
 
 GOAL:
 Produce an indirect but helpful clue that helps a frozen Guesser pick TEAM words while avoiding OPP, NEU, and especially ASSASSIN.
-
-REASONING INSTRUCTIONS:
-- Think creatively and thoughtfully step by step before answering.
-- Keep the reasoning concise and decision-focused.
-- Briefly identify:
-  1. the best TEAM cluster,
-  2. the main risks/confounders,
-  3. why the final clue is a good tradeoff.
-- Do not be verbose.
-- Do not restate the full board.
-- Do not ramble.
-- Then give the final answer in the exact format below.
-
-OUTPUT FORMAT (exactly):
-<think>
-short step-by-step reasoning
-</think>
-CLUE: <one_word>
-NUM: <integer>
-
+{reasoning_block}
 Now produce your clue.
 """
     return [
