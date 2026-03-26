@@ -115,7 +115,7 @@ reward:
 filtering:
   mode: "rule_based"
   require_no_assassin: true
-  min_reward: 3.0
+  min_reward: 2.0
 
 training:
   objective: "sft"
@@ -159,7 +159,7 @@ training:
   sft_max_examples: 8000
   sft_max_length: 768
   sft_epochs: 1
-  sft_batch_size: 16
+  sft_batch_size: 14
   sft_grad_accum: 1
   sft_lr: 5.0e-5
   lr_scheduler_type: "constant_with_warmup"
