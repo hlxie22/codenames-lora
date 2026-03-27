@@ -24,11 +24,12 @@ except Exception:
     TrainerCallback = object  # type: ignore[misc]
 
 from .metrics import aggregate as aggregate_codenames
+from .metrics import aggregate_paired, prefix_metric_keys
 from .model_wrappers import apply_chat_template, Embedder
 from .prompting import get_spymaster_reasoning_mode
 from .rollout import run_turns_batched
 from .think_utils import split_think_and_rest
-from .utils import read_jsonl
+from .utils import read_jsonl, write_jsonl
 
 
 def _dist_available() -> bool:
@@ -765,6 +766,15 @@ def plot_epoch_history(history_path: Path, plots_dir: Path) -> None:
         "humaneval_pass_at_1",
         "codenames_spymaster_reasoning_tokens_mean",
         "codenames_spymaster_reasoning_tokens_p90",
+        "paired_ref_reward_delta_mean",
+        "paired_ref_reward_win_rate",
+        "paired_ref_reward_loss_rate",
+        "paired_ref_team_delta_mean",
+        "paired_ref_opp_delta_mean",
+        "paired_ref_neu_delta_mean",
+        "paired_ref_assassin_rate_delta",
+        "paired_ref_rejected_candidates_delta_mean",
+        "paired_ref_clue_changed_rate",
     ]
 
     for k in keys:
@@ -787,15 +797,21 @@ class EpochEvalCallback(TrainerCallback):
         self.out_dir = Path(out_dir)
         self.history_path = self.out_dir / "epoch_eval_history.jsonl"
         self.plots_dir = self.out_dir / "epoch_eval_plots"
+        self.reference_per_board_path = self.out_dir / "epoch_eval_reference_per_board.jsonl"
+        self.reference_metrics_path = self.out_dir / "epoch_eval_reference_metrics.json"
+        self.per_epoch_board_dir = self.out_dir / "epoch_eval_per_board"
         self._last_epoch_logged: Optional[int] = None
         self._fixed_codenames_boards: Optional[List[Dict[str, Any]]] = None
         self._fixed_gsm8k_examples: Optional[List[Dict[str, Any]]] = None
         self._fixed_humaneval_examples: Optional[List[Dict[str, Any]]] = None
+        self._reference_per_board_cache: Optional[List[Dict[str, Any]]] = None
 
     def on_train_begin(self, args, state, control, **kwargs):
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.per_epoch_board_dir.mkdir(parents=True, exist_ok=True)
 
         ecfg = (self.cfg.get("epoch_eval", {}) or {})
+        rank, world = _dist_rank_world()
 
         n_boards = int(ecfg.get("codenames_n_boards", 0))
         subset_seed = int(ecfg.get("codenames_subset_seed", 0))
@@ -807,7 +823,6 @@ class EpochEvalCallback(TrainerCallback):
                 seed=subset_seed,
             )
 
-            rank, _ = _dist_rank_world()
             if rank == 0:
                 ids_path = self.out_dir / "epoch_eval_board_ids.json"
                 ids = [b["board_id"] for b in self._fixed_codenames_boards]
@@ -823,6 +838,35 @@ class EpochEvalCallback(TrainerCallback):
             humaneval_seed = int(ecfg.get("humaneval_seed", 2028))
             self._fixed_humaneval_examples = load_humaneval_subset(n=humaneval_n, seed=humaneval_seed)
 
+        trainer = kwargs.get("trainer", None)
+        model, tok, device = _resolve_model_tokenizer_device(trainer, kwargs)
+        if model is None or tok is None or n_boards <= 0 or not self._fixed_codenames_boards:
+            return control
+
+        if self.reference_per_board_path.exists():
+            if rank == 0:
+                try:
+                    self._reference_per_board_cache = read_jsonl(self.reference_per_board_path)
+                except Exception:
+                    self._reference_per_board_cache = None
+            _barrier()
+            return control
+
+        subset_local = _shard_list(self._fixed_codenames_boards, rank, world)
+        ref_raw = eval_codenames_subset_raw(self.cfg, model, tok, device, subset_local)
+        gathered_records = _all_gather_objects(list(ref_raw.get("per_board", []) or []))
+
+        if rank == 0:
+            per_board: List[Dict[str, Any]] = []
+            for part in gathered_records:
+                per_board.extend(part or [])
+            per_board.sort(key=lambda r: str(r.get("board_id", "")))
+            self._reference_per_board_cache = per_board
+            write_jsonl(self.reference_per_board_path, per_board)
+            ref_metrics = aggregate_codenames(per_board)
+            self.reference_metrics_path.write_text(json.dumps(ref_metrics, indent=2), encoding="utf-8")
+
+        _barrier()
         return control
 
     def on_epoch_end(self, args, state, control, **kwargs):
@@ -888,6 +932,7 @@ class EpochEvalCallback(TrainerCallback):
         per_board: List[Dict[str, Any]] = []
         for part in gathered_records:
             per_board.extend(part or [])
+        per_board.sort(key=lambda r: str(r.get("board_id", "")))
 
         gathered_reasoning = _all_gather_objects(reasoning_local)
         reasoning_tokens: List[int] = []
@@ -921,6 +966,22 @@ class EpochEvalCallback(TrainerCallback):
 
                 metrics["codenames_spymaster_reasoning_tokens_mean"] = float(_mean([float(x) for x in reasoning_tokens]))
                 metrics["codenames_spymaster_reasoning_tokens_p90"] = float(_p90([float(x) for x in reasoning_tokens]))
+
+                ref_records = self._reference_per_board_cache
+                if ref_records is None and self.reference_per_board_path.exists():
+                    try:
+                        ref_records = read_jsonl(self.reference_per_board_path)
+                        self._reference_per_board_cache = ref_records
+                    except Exception:
+                        ref_records = None
+
+                if ref_records:
+                    paired = aggregate_paired(per_board, ref_records)
+                    metrics.update(prefix_metric_keys(paired, "paired_ref"))
+                    paired_ci = paired.get("reward_delta_ci95", (0.0, 0.0))
+                    if isinstance(paired_ci, (list, tuple)) and len(paired_ci) == 2:
+                        metrics["paired_ref_reward_delta_ci95_lo"] = float(paired_ci[0])
+                        metrics["paired_ref_reward_delta_ci95_hi"] = float(paired_ci[1])
             except Exception as e:
                 err_msgs.append(
                     f"[epoch_eval][rank {rank} host={host}] Aggregation/metrics failed: {type(e).__name__}: {e}\n"
@@ -1055,6 +1116,15 @@ class EpochEvalCallback(TrainerCallback):
             self.out_dir.mkdir(parents=True, exist_ok=True)
             with self.history_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(metrics, ensure_ascii=False) + "\n")
+
+            per_path = self.per_epoch_board_dir / f"epoch_{epoch_i:03d}_step_{int(getattr(state, 'global_step', 0)):06d}.jsonl"
+            try:
+                write_jsonl(per_path, per_board)
+            except Exception as e:
+                _errlog(
+                    f"[epoch_eval][rank {rank} host={host}] Failed writing per-board epoch dump: {type(e).__name__}: {e}\n"
+                    f"{traceback.format_exc()}"
+                )
 
             tr = trainer
             if tr is not None:

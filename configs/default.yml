@@ -159,9 +159,9 @@ training:
   sft_max_examples: 8000
   sft_max_length: 768
   sft_epochs: 1
-  sft_batch_size: 14
-  sft_grad_accum: 1
-  sft_lr: 5.0e-5
+  sft_batch_size: 4
+  sft_grad_accum: 2
+  sft_lr: 7e-5
   lr_scheduler_type: "constant_with_warmup"
   warmup_ratio: 0.05
   sft_filter:

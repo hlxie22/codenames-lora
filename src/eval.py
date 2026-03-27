@@ -3,12 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 from .io_utils import shard_path_insert_before_suffix, merge_jsonl_shards
-from .metrics import aggregate
+from .metrics import aggregate, aggregate_paired, prefix_metric_keys
 from .model_wrappers import Embedder, make_text_generator, load_lora_on_generator
 from .mp_utils import is_child_process, child_shard_info, launch_children
 from .rollout import run_turns_batched
@@ -61,6 +61,67 @@ class _VLLMProxy:
             setattr(self._base, "_lora_request", old)
 
 
+def _write_metrics_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _augment_trained_metrics_with_paired(trained_metrics_path: Path, paired: Dict[str, Any]) -> None:
+    payload: Dict[str, Any] = {}
+    if trained_metrics_path.exists():
+        try:
+            payload = json.loads(trained_metrics_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+
+    payload.update(prefix_metric_keys(paired, "paired_baseline"))
+    payload["paired_vs_baseline"] = paired
+    _write_metrics_json(trained_metrics_path, payload)
+
+
+def _maybe_write_post_eval_paired_metrics(root_dir: str | Path) -> Optional[Dict[str, Any]]:
+    root = Path(root_dir)
+    baseline_per = root / "baseline" / "per_board.jsonl"
+    trained_per = root / "trained" / "per_board.jsonl"
+    if not baseline_per.exists() or not trained_per.exists():
+        return None
+
+    baseline = read_jsonl(baseline_per)
+    trained = read_jsonl(trained_per)
+    paired = aggregate_paired(trained, baseline)
+
+    paired_path = root / "paired_metrics.json"
+    _write_metrics_json(paired_path, paired)
+
+    trained_metrics_path = root / "trained" / "metrics.json"
+    _augment_trained_metrics_with_paired(trained_metrics_path, paired)
+    return paired
+
+
+def _finalize_eval_outputs(out_dir: str | Path, per_board: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out_dir = Path(out_dir)
+    per_path = out_dir / "per_board.jsonl"
+    write_jsonl(per_path, per_board)
+
+    metrics = aggregate(per_board)
+    _write_metrics_json(out_dir / "metrics.json", metrics)
+
+    if out_dir.name in {"baseline", "trained"}:
+        _maybe_write_post_eval_paired_metrics(out_dir.parent)
+        if out_dir.name == "trained":
+            try:
+                metrics = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    print(f"Wrote per-board -> {per_path}")
+    print(f"Wrote metrics   -> {out_dir / 'metrics.json'}")
+    if out_dir.name in {"baseline", "trained"}:
+        paired_path = out_dir.parent / "paired_metrics.json"
+        if paired_path.exists():
+            print(f"Wrote paired    -> {paired_path}")
+    return metrics
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -94,15 +155,7 @@ def main():
         launch_children("src.eval", ["--config", args.config, "--mode", args.mode, "--out", args.out], num_procs)
 
         per_board = _merge_shards(out_dir, num_procs)
-        per_path = Path(out_dir) / "per_board.jsonl"
-        write_jsonl(per_path, per_board)
-
-        metrics = aggregate(per_board)
-        with open(Path(out_dir) / "metrics.json", "w", encoding="utf-8") as f:
-            json.dump(metrics, f, indent=2)
-
-        print(f"Wrote per-board -> {per_path}")
-        print(f"Wrote metrics   -> {Path(out_dir) / 'metrics.json'}")
+        _finalize_eval_outputs(out_dir, per_board)
         return
 
     if num_procs == 1 and not is_child_process():
@@ -194,15 +247,7 @@ def main():
         print(f"[shard {shard_id}/{num_shards}] Wrote per-board shard -> {shard_path}")
         return
 
-    per_path = Path(out_dir) / "per_board.jsonl"
-    write_jsonl(per_path, per_board)
-
-    metrics = aggregate(per_board)
-    with open(Path(out_dir) / "metrics.json", "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
-
-    print(f"Wrote per-board -> {per_path}")
-    print(f"Wrote metrics   -> {Path(out_dir) / 'metrics.json'}")
+    _finalize_eval_outputs(out_dir, per_board)
 
 
 if __name__ == "__main__":
