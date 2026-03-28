@@ -192,7 +192,15 @@ class HFTextGenerator:
     Thin wrapper around transformers generation for reproducible calls.
     """
 
-    def __init__(self, model_id: str, device_map: str = "auto", torch_dtype: str | None = None):
+    def __init__(
+        self,
+        model_id: str,
+        device_map: str = "auto",
+        torch_dtype: str | None = None,
+        *,
+        trust_remote_code: bool = True,
+        attn_implementation: str | None = None,
+    ):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         import torch
 
@@ -202,7 +210,11 @@ class HFTextGenerator:
         if torch_dtype:
             dtype = getattr(torch, torch_dtype)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            use_fast=True,
+            trust_remote_code=trust_remote_code,
+        )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -210,6 +222,8 @@ class HFTextGenerator:
             model_id,
             device_map=device_map,
             torch_dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            attn_implementation=attn_implementation,
         )
         self.model.eval()
 
@@ -297,7 +311,23 @@ def make_text_generator(model_id: str, cfg: Dict[str, Any]) -> TextGenerator:
     if backend == "vllm":
         vcfg = cfg.get("inference", {}).get("vllm", {})
         return VLLMTextGenerator(model_id, **vcfg)
-    return HFTextGenerator(model_id, device_map="auto")
+
+    inf = cfg.get("inference", {}) or {}
+    hf_cfg = inf.get("hf", {}) or {}
+    vllm_cfg = inf.get("vllm", {}) or {}
+
+    trust_remote_code = bool(hf_cfg.get("trust_remote_code", vllm_cfg.get("trust_remote_code", True)))
+    attn_impl = hf_cfg.get("attn_implementation", (cfg.get("training", {}) or {}).get("attn_implementation"))
+    torch_dtype = hf_cfg.get("torch_dtype", None)
+    device_map = hf_cfg.get("device_map", "auto")
+
+    return HFTextGenerator(
+        model_id,
+        device_map=device_map,
+        torch_dtype=torch_dtype,
+        trust_remote_code=trust_remote_code,
+        attn_implementation=attn_impl,
+    )
 
 
 class Embedder:

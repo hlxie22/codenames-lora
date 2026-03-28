@@ -158,6 +158,10 @@ def resolve_training_plan(cfg: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def resolve_trained_adapter_dir(cfg: Dict[str, Any]) -> str:
+    return resolve_training_plan(cfg)["out_dir"]
+
+
 def load_yaml(path: str | Path) -> Dict[str, Any]:
     """
     Loads YAML and applies iteration templating + objective normalization.

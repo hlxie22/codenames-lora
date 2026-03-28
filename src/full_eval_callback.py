@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import os
 import time
@@ -18,7 +19,7 @@ except Exception:
     TrainerCallback = object  # type: ignore[misc]
 
 from .metrics import aggregate
-from .model_wrappers import apply_chat_template, Embedder
+from .model_wrappers import apply_chat_template, Embedder, make_text_generator
 from .rollout import run_turns_batched
 from .utils import read_jsonl, write_jsonl
 
@@ -230,6 +231,28 @@ class FullCodenamesEvalCallback(TrainerCallback):
         self.every_epochs = max(1, int(every_epochs))
         self.batch_size = max(1, int(batch_size))
         self._last_epoch_logged: Optional[int] = None
+        self._external_guesser = None
+
+    def _get_external_guesser(self):
+        sp_id = self.cfg["models"]["spymaster_model_id"]
+        g_id = self.cfg["models"]["guesser_model_id"]
+
+        if g_id == sp_id:
+            return None
+
+        if self._external_guesser is None:
+            gcfg = copy.deepcopy(self.cfg)
+            inf = gcfg.get("inference", {}) or {}
+            inf["num_processes"] = 1
+            if inf.get("backend") == "vllm":
+                vcfg = inf.get("vllm", {}) or {}
+                vcfg["tensor_parallel_size"] = 1
+                inf["vllm"] = vcfg
+            gcfg["inference"] = inf
+
+            self._external_guesser = make_text_generator(g_id, gcfg)
+
+        return self._external_guesser
 
     def on_epoch_end(self, args, state, control, **kwargs):
         epoch_f = state.epoch
@@ -297,13 +320,18 @@ class FullCodenamesEvalCallback(TrainerCallback):
             enable_thinking_default=True,
             disable_adapter=False,
         )
-        guesser = _InTrainerGenerator(
-            model,
-            tok,
-            device,
-            enable_thinking_default=True,
-            disable_adapter=True,
-        )
+
+        guesser_override = self._get_external_guesser()
+        if guesser_override is not None:
+            guesser = guesser_override
+        else:
+            guesser = _InTrainerGenerator(
+                model,
+                tok,
+                device,
+                enable_thinking_default=True,
+                disable_adapter=True,
+            )
 
         embedder = None
         try:

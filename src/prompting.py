@@ -50,14 +50,26 @@ def _enable_thinking(cfg: Dict[str, Any], role: Role) -> bool:
     return bool(q.get("enable_thinking", True))
 
 
+def _render_plain_messages(messages: List[Dict[str, str]]) -> str:
+    parts: List[str] = []
+    for m in messages:
+        role = str(m.get("role", "user")).strip().lower()
+        content = str(m.get("content", "")).strip()
+        if not content:
+            continue
+        parts.append(f"{role.upper()}:\n{content}")
+    parts.append("ASSISTANT:")
+    return "\n\n".join(parts).strip()
+
+
 def render_prompt(generator: Any, messages: List[Dict[str, str]], cfg: Dict[str, Any], *, role: Role) -> str:
     """
     Canonical prompt rendering for both batched & non-batched paths.
-    If chat templates are disabled, returns the raw user content.
-    Otherwise uses generator.format_chat(...) with role-specific enable_thinking.
+    If chat templates are disabled, serialize the full message list into a plain-text prompt.
+    Otherwise use generator.format_chat(...) with role-specific enable_thinking.
     """
     if not _use_chat_template(cfg):
-        return messages[-1]["content"]
+        return _render_plain_messages(messages)
     return generator.format_chat(
         messages,
         add_generation_prompt=True,
@@ -91,8 +103,10 @@ def generate_from_messages(
             use_chat_template=True,
             enable_thinking=_enable_thinking(cfg, role),
         )
+
+    prompt = _render_plain_messages(messages)
     return generator.generate(
-        messages[-1]["content"],
+        prompt,
         gen_cfg,
         seed=seed,
         use_chat_template=False,

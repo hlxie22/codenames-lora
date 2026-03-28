@@ -16,6 +16,7 @@ from .utils import (
     ensure_dir,
     load_yaml,
     read_jsonl,
+    resolve_trained_adapter_dir,
     save_config_snapshot,
     save_run_meta,
     set_global_seed,
@@ -131,6 +132,7 @@ def main():
 
     cfg = load_yaml(args.config)
     set_global_seed(int(cfg["training"].get("seed", 0)))
+    trained_adapter_dir = resolve_trained_adapter_dir(cfg)
 
     num_procs = int(cfg.get("inference", {}).get("num_processes", 1))
     batch_size = int(cfg.get("inference", {}).get("batch_size", 1))
@@ -180,7 +182,7 @@ def main():
         base = make_text_generator(sp_id, cfg)
 
         if args.mode == "trained":
-            adapter_dir = cfg["training"]["output_adapter_dir"]
+            adapter_dir = trained_adapter_dir
             base = load_lora_on_generator(base, adapter_dir)
             lora_req = getattr(base, "_lora_request", None)
             setattr(base, "_lora_request", None)
@@ -193,7 +195,7 @@ def main():
     else:
         spymaster = make_text_generator(sp_id, cfg)
         if args.mode == "trained":
-            adapter_dir = cfg["training"]["output_adapter_dir"]
+            adapter_dir = trained_adapter_dir
             spymaster = load_lora_on_generator(spymaster, adapter_dir)
         guesser = make_text_generator(g_id, cfg)
 

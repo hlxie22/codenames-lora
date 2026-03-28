@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import math
 import os
@@ -25,7 +26,7 @@ except Exception:
 
 from .metrics import aggregate as aggregate_codenames
 from .metrics import aggregate_paired, prefix_metric_keys
-from .model_wrappers import apply_chat_template, Embedder
+from .model_wrappers import apply_chat_template, Embedder, make_text_generator
 from .prompting import get_spymaster_reasoning_mode
 from .rollout import run_turns_batched
 from .think_utils import split_think_and_rest
@@ -302,12 +303,14 @@ def eval_codenames_subset_raw(
     tokenizer: Any,
     device: torch.device,
     boards: List[Dict[str, Any]],
+    *,
+    guesser_override: Any | None = None,
 ) -> Dict[str, Any]:
     if not boards:
         return {"per_board": [], "reasoning_tokens": []}
 
     spymaster = _InTrainerGenerator(model, tokenizer, device, disable_adapter=False)
-    guesser = _InTrainerGenerator(model, tokenizer, device, disable_adapter=True)
+    guesser = guesser_override if guesser_override is not None else _InTrainerGenerator(model, tokenizer, device, disable_adapter=True)
 
     use_embed = bool(cfg.get("constraints", {}).get("enable_directness_check", True))
     embedder = None
@@ -805,6 +808,28 @@ class EpochEvalCallback(TrainerCallback):
         self._fixed_gsm8k_examples: Optional[List[Dict[str, Any]]] = None
         self._fixed_humaneval_examples: Optional[List[Dict[str, Any]]] = None
         self._reference_per_board_cache: Optional[List[Dict[str, Any]]] = None
+        self._external_guesser = None
+
+    def _get_external_guesser(self):
+        sp_id = self.cfg["models"]["spymaster_model_id"]
+        g_id = self.cfg["models"]["guesser_model_id"]
+
+        if g_id == sp_id:
+            return None
+
+        if self._external_guesser is None:
+            gcfg = copy.deepcopy(self.cfg)
+            inf = gcfg.get("inference", {}) or {}
+            inf["num_processes"] = 1
+            if inf.get("backend") == "vllm":
+                vcfg = inf.get("vllm", {}) or {}
+                vcfg["tensor_parallel_size"] = 1
+                inf["vllm"] = vcfg
+            gcfg["inference"] = inf
+
+            self._external_guesser = make_text_generator(g_id, gcfg)
+
+        return self._external_guesser
 
     def on_train_begin(self, args, state, control, **kwargs):
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -852,8 +877,16 @@ class EpochEvalCallback(TrainerCallback):
             _barrier()
             return control
 
+        guesser_override = self._get_external_guesser()
         subset_local = _shard_list(self._fixed_codenames_boards, rank, world)
-        ref_raw = eval_codenames_subset_raw(self.cfg, model, tok, device, subset_local)
+        ref_raw = eval_codenames_subset_raw(
+            self.cfg,
+            model,
+            tok,
+            device,
+            subset_local,
+            guesser_override=guesser_override,
+        )
         gathered_records = _all_gather_objects(list(ref_raw.get("per_board", []) or []))
 
         if rank == 0:
@@ -918,8 +951,16 @@ class EpochEvalCallback(TrainerCallback):
             if n_boards > 0:
                 subset = self._fixed_codenames_boards or []
                 subset_local = _shard_list(subset, rank, world)
+                guesser_override = self._get_external_guesser()
 
-                raw = eval_codenames_subset_raw(self.cfg, model, tok, device, subset_local)
+                raw = eval_codenames_subset_raw(
+                    self.cfg,
+                    model,
+                    tok,
+                    device,
+                    subset_local,
+                    guesser_override=guesser_override,
+                )
                 per_board_local = list(raw.get("per_board", []) or [])
                 reasoning_local = [int(x) for x in (raw.get("reasoning_tokens", []) or [])]
         except Exception as e:
