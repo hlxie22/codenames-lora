@@ -9,7 +9,7 @@ import numpy as np
 
 from .io_utils import shard_path_insert_before_suffix, merge_jsonl_shards
 from .metrics import aggregate, aggregate_paired, prefix_metric_keys
-from .model_wrappers import Embedder, make_text_generator, load_lora_on_generator
+from .model_wrappers import Embedder, build_codenames_generators
 from .mp_utils import is_child_process, child_shard_info, launch_children
 from .rollout import run_turns_batched
 from .utils import (
@@ -34,32 +34,6 @@ def _merge_shards(out_dir: str | Path, num_shards: int) -> List[Dict[str, Any]]:
     shard_paths = [_shard_out_path(out_dir, sid, num_shards) for sid in range(num_shards)]
     combined = merge_jsonl_shards(shard_paths, sort_key=lambda r: str(r.get("board_id", "")))
     return combined
-
-
-class _VLLMProxy:
-    def __init__(self, base, lora_request):
-        self._base = base
-        self._lora_request = lora_request
-        self.model_id = getattr(base, "model_id", "unknown")
-
-    def format_chat(self, *args, **kwargs):
-        return self._base.format_chat(*args, **kwargs)
-
-    def generate(self, *args, **kwargs):
-        old = getattr(self._base, "_lora_request", None)
-        try:
-            setattr(self._base, "_lora_request", self._lora_request)
-            return self._base.generate(*args, **kwargs)
-        finally:
-            setattr(self._base, "_lora_request", old)
-
-    def generate_batch(self, *args, **kwargs):
-        old = getattr(self._base, "_lora_request", None)
-        try:
-            setattr(self._base, "_lora_request", self._lora_request)
-            return self._base.generate_batch(*args, **kwargs)
-        finally:
-            setattr(self._base, "_lora_request", old)
 
 
 def _write_metrics_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -174,30 +148,11 @@ def main():
         boards = [b for i, b in enumerate(boards) if (i % num_shards) == shard_id]
         print(f"[shard {shard_id}/{num_shards}] boards={len(boards)}")
 
-    backend = cfg.get("inference", {}).get("backend", "hf")
-    sp_id = cfg["models"]["spymaster_model_id"]
-    g_id = cfg["models"]["guesser_model_id"]
-
-    if backend == "vllm" and sp_id == g_id:
-        base = make_text_generator(sp_id, cfg)
-
-        if args.mode == "trained":
-            adapter_dir = trained_adapter_dir
-            base = load_lora_on_generator(base, adapter_dir)
-            lora_req = getattr(base, "_lora_request", None)
-            setattr(base, "_lora_request", None)
-
-            spymaster = _VLLMProxy(base, lora_req)
-            guesser = _VLLMProxy(base, None)
-        else:
-            spymaster = base
-            guesser = base
-    else:
-        spymaster = make_text_generator(sp_id, cfg)
-        if args.mode == "trained":
-            adapter_dir = trained_adapter_dir
-            spymaster = load_lora_on_generator(spymaster, adapter_dir)
-        guesser = make_text_generator(g_id, cfg)
+    use_trained_adapter = trained_adapter_dir if args.mode == "trained" else None
+    spymaster, guesser = build_codenames_generators(
+        cfg,
+        spymaster_adapter_dir=use_trained_adapter,
+    )
 
     use_embed = bool(cfg.get("constraints", {}).get("enable_directness_check", True))
     embedder = None

@@ -150,13 +150,15 @@ training:
   distributed:
     num_nodes: 4
 
-  sft_source: "turns"
+  sft_source: "turns_raw"
+  sft_sampling_mode: "one_per_board_per_epoch"
+  sft_sampling_seed: 999
   sft_completion_field: "completion"
   sft_output_adapter_dir: "outputs/sft/lora_spymaster"
   sft_init_adapter_dir: null
   sft_max_examples: 8000
   sft_max_length: 768
-  sft_epochs: 1
+  sft_epochs: 2
   sft_batch_size: 4
   sft_grad_accum: 2
   sft_lr: 7e-5
@@ -195,5 +197,5 @@ epoch_eval:
   wikitext_block_size: 512
   wikitext_max_blocks: 80
 
-  codenames_n_boards: 20
+  codenames_n_boards: 200
   codenames_subset_seed: 2026

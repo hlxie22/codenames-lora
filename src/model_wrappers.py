@@ -284,6 +284,32 @@ class HFTextGenerator:
         return self.tokenizer.decode(gen_ids, skip_special_tokens=True)
 
 
+class LoRARequestProxy:
+    def __init__(self, base, lora_request):
+        self._base = base
+        self._lora_request = lora_request
+        self.model_id = getattr(base, "model_id", "unknown")
+
+    def format_chat(self, *args, **kwargs):
+        return self._base.format_chat(*args, **kwargs)
+
+    def generate(self, *args, **kwargs):
+        old = getattr(self._base, "_lora_request", None)
+        try:
+            setattr(self._base, "_lora_request", self._lora_request)
+            return self._base.generate(*args, **kwargs)
+        finally:
+            setattr(self._base, "_lora_request", old)
+
+    def generate_batch(self, *args, **kwargs):
+        old = getattr(self._base, "_lora_request", None)
+        try:
+            setattr(self._base, "_lora_request", self._lora_request)
+            return self._base.generate_batch(*args, **kwargs)
+        finally:
+            setattr(self._base, "_lora_request", old)
+
+
 def load_lora_on_generator(base_generator: TextGenerator, adapter_dir: str) -> TextGenerator:
     """
     HF path: wraps with PeftModel
@@ -328,6 +354,34 @@ def make_text_generator(model_id: str, cfg: Dict[str, Any]) -> TextGenerator:
         trust_remote_code=trust_remote_code,
         attn_implementation=attn_impl,
     )
+
+
+def build_codenames_generators(
+    cfg: Dict[str, Any],
+    *,
+    spymaster_adapter_dir: Optional[str] = None,
+) -> tuple[TextGenerator, TextGenerator]:
+    backend = cfg.get("inference", {}).get("backend", "hf")
+    sp_id = cfg["models"]["spymaster_model_id"]
+    g_id = cfg["models"]["guesser_model_id"]
+
+    if backend == "vllm" and sp_id == g_id:
+        base = make_text_generator(sp_id, cfg)
+
+        if spymaster_adapter_dir:
+            base = load_lora_on_generator(base, spymaster_adapter_dir)
+            lora_req = getattr(base, "_lora_request", None)
+            setattr(base, "_lora_request", None)
+            return LoRARequestProxy(base, lora_req), LoRARequestProxy(base, None)
+
+        return base, base
+
+    spymaster = make_text_generator(sp_id, cfg)
+    if spymaster_adapter_dir:
+        spymaster = load_lora_on_generator(spymaster, spymaster_adapter_dir)
+
+    guesser = make_text_generator(g_id, cfg)
+    return spymaster, guesser
 
 
 class Embedder:

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -16,73 +15,18 @@ from trl import DPOConfig, DPOTrainer
 
 from .epoch_eval import EpochEvalCallback
 from .full_eval_callback import FullCodenamesEvalCallback
+from .training_utils import (
+    resolve_training_precision,
+    safe_enable_gradient_checkpointing,
+    safe_enable_input_grads,
+    setup_node_local_hf_cache,
+    should_force_nonreentrant,
+)
 from .utils import ensure_dir, load_yaml, save_config_snapshot, save_run_meta, set_global_seed
-
-
-def _setup_node_local_hf_cache() -> Path:
-    """
-    Put HF caches on node-local storage to avoid shared FS filelock/stale handle issues.
-    """
-    base_tmp = os.environ.get("SLURM_TMPDIR") or os.environ.get("TMPDIR") or "/tmp"
-    job_id = os.environ.get("SLURM_JOB_ID") or "nojob"
-
-    local_hf_home = Path(base_tmp) / f"hf_{job_id}"
-    local_datasets_cache = local_hf_home / "datasets"
-    local_hub_cache = local_hf_home / "hub"
-
-    local_datasets_cache.mkdir(parents=True, exist_ok=True)
-    local_hub_cache.mkdir(parents=True, exist_ok=True)
-
-    os.environ["HF_HOME"] = str(local_hf_home)
-    os.environ["HF_DATASETS_CACHE"] = str(local_datasets_cache)
-    os.environ["HUGGINGFACE_HUB_CACHE"] = str(local_hub_cache)
-
-    return local_datasets_cache
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip() in ("1", "true", "True", "yes", "YES")
-
-
-def _world_size() -> int:
-    for k in ("WORLD_SIZE", "SLURM_NTASKS"):
-        v = os.environ.get(k)
-        if v:
-            with contextlib.suppress(Exception):
-                return max(1, int(v))
-    return 1
-
-
-def _should_force_nonreentrant(cfg: Dict[str, Any]) -> bool:
-    """
-    DDP + (re-entrant) gradient checkpointing can crash with:
-      "Expected to mark a variable ready only once"
-    DPO is especially likely to trigger it because it runs multiple forward passes
-    per step through the same modules.
-    """
-    tcfg = cfg.get("training", {}) or {}
-    if not bool(tcfg.get("gradient_checkpointing", True)):
-        return False
-    # If distributed, be conservative.
-    return _world_size() > 1
-
-
-def _safe_enable_input_grads(model: Any) -> None:
-    """
-    For PEFT/LoRA + gradient checkpointing, this prevents:
-      "None of the inputs have requires_grad=True. Gradients will be None"
-    """
-    with contextlib.suppress(Exception):
-        model.enable_input_require_grads()
-
-
-def _safe_enable_gradient_checkpointing(model: Any, *, use_reentrant: bool) -> None:
-    """
-    Some model classes require calling this explicitly (best-effort).
-    """
-    with contextlib.suppress(Exception):
-        if hasattr(model, "gradient_checkpointing_enable"):
-            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": use_reentrant})
 
 
 def _make_trainer(
@@ -168,7 +112,7 @@ def main() -> None:
     model_id = cfg["models"]["spymaster_model_id"]
 
     # ----- Node-local HF caches -----
-    local_datasets_cache = _setup_node_local_hf_cache()
+    local_datasets_cache = setup_node_local_hf_cache()
 
     # ----- Dataset -----
     from datasets import load_dataset
@@ -187,9 +131,7 @@ def main() -> None:
         tok.pad_token = tok.eos_token
 
     # ----- Model -----
-    use_bf16 = bool(tcfg.get("bf16", True)) and torch.cuda.is_available()
-    use_fp16 = bool(tcfg.get("fp16", False)) and torch.cuda.is_available()
-    dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_fp16 else None)
+    use_bf16, use_fp16, dtype = resolve_training_precision(tcfg)
 
     attn_impl = tcfg.get("attn_implementation", None)
 
@@ -231,7 +173,7 @@ def main() -> None:
     gc_on = bool(tcfg.get("gradient_checkpointing", True))
     user_use_reentrant = bool(tcfg.get("gradient_checkpointing_use_reentrant", False))
 
-    force_nonreentrant = _should_force_nonreentrant(cfg)
+    force_nonreentrant = should_force_nonreentrant(cfg)
     use_reentrant = user_use_reentrant
     if force_nonreentrant and user_use_reentrant:
         print(
@@ -240,9 +182,9 @@ def main() -> None:
         )
         use_reentrant = False
 
-    _safe_enable_input_grads(model)
+    safe_enable_input_grads(model)
     if gc_on:
-        _safe_enable_gradient_checkpointing(model, use_reentrant=use_reentrant)
+        safe_enable_gradient_checkpointing(model, use_reentrant=use_reentrant)
 
     # ----- TRL DPOConfig -----
     max_len = int(tcfg.get("trl_max_length", tcfg.get("max_seq_len", 4096)))
