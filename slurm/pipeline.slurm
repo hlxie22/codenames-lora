@@ -423,12 +423,12 @@ BUILD_JOB=$(sbatch --parsable \
   slurm/build_pairs.slurm)
 echo "build_pairs job: $BUILD_JOB"
 
-TRAIN_JOB=$(sbatch --parsable \
-  --dependency=afterok:"$BUILD_JOB" \
-  --nodes="$TRAIN_NODES" \
-  --ntasks-per-node=1 \
-  --export=ALL,CONFIG="$CONFIG_MAIN" \
-  slurm/train.slurm)
-echo "train job: $TRAIN_JOB"
+# TRAIN_JOB=$(sbatch --parsable \
+#   --dependency=afterok:"$BUILD_JOB" \
+#   --nodes="$TRAIN_NODES" \
+#   --ntasks-per-node=1 \
+#   --export=ALL,CONFIG="$CONFIG_MAIN" \
+#   slurm/train.slurm)
+# echo "train job: $TRAIN_JOB"
 
 echo "Pipeline submitted."

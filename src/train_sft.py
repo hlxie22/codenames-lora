@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 from datasets import Dataset as HFDataset
 from torch.utils.data import Dataset as TorchDataset
@@ -236,10 +237,117 @@ def _resolve_sft_completion_field(cfg: Dict[str, Any]) -> str:
     return str(tcfg.get("sft_completion_field", "completion"))
 
 
+def _safe_float(x: Any) -> float | None:
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def _get_sft_creativity_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    tcfg = cfg.get("training", {}) or {}
+    return dict(tcfg.get("sft_creativity") or {})
+
+
+def _compute_creativity_score(row: Dict[str, Any], cfg: Dict[str, Any]) -> float | None:
+    ccfg = _get_sft_creativity_cfg(cfg)
+    uplift = _safe_float(row.get("best_minus_avg_reward_valid"))
+    std = _safe_float(row.get("candidate_reward_std"))
+
+    if uplift is None:
+        return None
+
+    uplift_coef = float(ccfg.get("uplift_coef", 1.0))
+    std_coef = float(ccfg.get("std_coef", 0.0))
+    std_val = 0.0 if std is None else float(std)
+
+    return uplift_coef * float(uplift) + std_coef * std_val
+
+
+def _apply_creativity_filter(
+    rows: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    ccfg = _get_sft_creativity_cfg(cfg)
+    enabled = bool(ccfg.get("enabled", False))
+
+    if not enabled:
+        return rows, {
+            "enabled": False,
+            "input_rows": int(len(rows)),
+            "rows_with_score": int(len(rows)),
+            "rows_kept": int(len(rows)),
+            "dropped_no_score": 0,
+            "min_score": None,
+            "uplift_coef": None,
+            "std_coef": None,
+            "sort_by_score": None,
+        }
+
+    min_score = ccfg.get("min_score", None)
+    min_score = None if min_score is None else float(min_score)
+
+    scored_rows: List[Dict[str, Any]] = []
+    dropped_no_score = 0
+    all_scores: List[float] = []
+
+    for row in rows:
+        s = _compute_creativity_score(row, cfg)
+        if s is None:
+            dropped_no_score += 1
+            continue
+
+        all_scores.append(float(s))
+
+        rr = dict(row)
+        rr["_creative_score"] = float(s)
+
+        if min_score is not None and float(s) < min_score:
+            continue
+
+        scored_rows.append(rr)
+
+    if bool(ccfg.get("sort_by_score", False)):
+        scored_rows = sorted(
+            scored_rows,
+            key=lambda r: (
+                -float(r.get("_creative_score", 0.0)),
+                -float(r.get("reward", 0.0)),
+                -int((r.get("stats") or {}).get("n_team", 0)),
+                int((r.get("stats") or {}).get("assassin", 0)),
+                str(r.get("board_id") or r.get("example_id") or ""),
+            ),
+        )
+
+    stats = {
+        "enabled": True,
+        "input_rows": int(len(rows)),
+        "rows_with_score": int(len(rows) - dropped_no_score),
+        "rows_kept": int(len(scored_rows)),
+        "dropped_no_score": int(dropped_no_score),
+        "min_score": min_score,
+        "uplift_coef": float(ccfg.get("uplift_coef", 1.0)),
+        "std_coef": float(ccfg.get("std_coef", 0.0)),
+        "sort_by_score": bool(ccfg.get("sort_by_score", False)),
+        "score_mean_all_rows_with_score": float(np.mean(all_scores)) if all_scores else None,
+        "score_p50_all_rows_with_score": float(np.quantile(all_scores, 0.50)) if all_scores else None,
+        "score_p90_all_rows_with_score": float(np.quantile(all_scores, 0.90)) if all_scores else None,
+    }
+    return scored_rows, stats
+
+
 def _sort_sft_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     def key(r: Dict[str, Any]):
         stats = r.get("stats") or {}
+        creative_score = _safe_float(r.get("_creative_score"))
+        creative_key = -creative_score if creative_score is not None else 0.0
+        has_creative = 0 if creative_score is not None else 1
+
         return (
+            has_creative,
+            creative_key,
             -float(r.get("reward", 0.0)),
             -int(stats.get("n_team", 0)),
             int(stats.get("assassin", 0)),
@@ -283,6 +391,9 @@ def _build_sft_dataset(
     completion_field = _resolve_sft_completion_field(cfg)
     rows = read_jsonl(source_path)
 
+    rows_before_creativity = len(rows)
+    rows, creativity_stats = _apply_creativity_filter(rows, cfg)
+
     sft_filter = dict(tcfg.get("sft_filter") or {})
     max_len = int(tcfg.get("sft_max_length", tcfg.get("max_seq_len", 4096)))
     max_examples = tcfg.get("sft_max_examples", None)
@@ -296,6 +407,7 @@ def _build_sft_dataset(
 
         board_to_examples: Dict[str, List[Dict[str, Any]]] = {}
         board_rank: Dict[str, tuple[float, int, int]] = {}
+        board_creativity_score: Dict[str, float] = {}
 
         dropped_missing = 0
         dropped_overlong = 0
@@ -314,7 +426,6 @@ def _build_sft_dataset(
             if raw_candidates:
                 candidate_rows = [_candidate_parent_row(parent, c) for c in raw_candidates]
             else:
-                # Backward compatibility for rows with no candidate list.
                 candidate_rows = [parent]
 
             seen_texts = set()
@@ -332,7 +443,6 @@ def _build_sft_dataset(
 
                 eligible_before_dedupe += 1
 
-                # Dedupe by target text so repeated sampled candidates do not dominate.
                 dedupe_key = completion.strip()
                 if dedupe_key in seen_texts:
                     continue
@@ -353,6 +463,7 @@ def _build_sft_dataset(
             if pool:
                 board_to_examples[board_id] = pool
                 board_rank[board_id] = best_rank or (0.0, 0, 0)
+                board_creativity_score[board_id] = float(parent.get("_creative_score", 0.0))
                 boards_with_any_pool += 1
 
         if not board_to_examples:
@@ -361,17 +472,27 @@ def _build_sft_dataset(
                 f"source_path={source_path} filter={json.dumps(sft_filter)}"
             )
 
-        # Select boards in a stable, quality-first order. Here max_examples means
-        # max number of boards selected per epoch.
-        board_ids = sorted(
-            board_to_examples.keys(),
-            key=lambda bid: (
-                -board_rank[bid][0],
-                -board_rank[bid][1],
-                board_rank[bid][2],
-                bid,
-            ),
-        )
+        if bool(_get_sft_creativity_cfg(cfg).get("sort_by_score", False)):
+            board_ids = sorted(
+                board_to_examples.keys(),
+                key=lambda bid: (
+                    -float(board_creativity_score.get(bid, 0.0)),
+                    -board_rank[bid][0],
+                    -board_rank[bid][1],
+                    board_rank[bid][2],
+                    bid,
+                ),
+            )
+        else:
+            board_ids = sorted(
+                board_to_examples.keys(),
+                key=lambda bid: (
+                    -board_rank[bid][0],
+                    -board_rank[bid][1],
+                    board_rank[bid][2],
+                    bid,
+                ),
+            )
 
         if max_examples is not None:
             board_ids = board_ids[: int(max_examples)]
@@ -388,6 +509,7 @@ def _build_sft_dataset(
             "completion_field": completion_field,
             "sampling_mode": sampling_mode,
             "source_rows": int(len(rows)),
+            "source_rows_before_creativity_filter": int(rows_before_creativity),
             "boards_with_any_pool": int(boards_with_any_pool),
             "boards_selected_per_epoch": int(len(board_ids)),
             "eligible_candidates_before_dedupe": int(eligible_before_dedupe),
@@ -396,15 +518,13 @@ def _build_sft_dataset(
             "max_pool_size_per_selected_board": int(max(pool_sizes) if pool_sizes else 0),
             "dropped_missing_prompt_or_completion": int(dropped_missing),
             "dropped_overlong": int(dropped_overlong),
-            "train_examples": int(len(board_ids)),  # one sampled example per board per epoch
+            "train_examples": int(len(board_ids)),
             "max_length": int(max_len),
             "sft_filter": sft_filter,
+            "sft_creativity": creativity_stats,
         }
         return ds, stats
 
-    # -------------------------
-    # Original fixed-dataset behavior
-    # -------------------------
     filtered = [r for r in rows if _passes_chosen_filter(r, sft_filter)]
     sorted_rows = _sort_sft_rows(filtered)
 
@@ -443,6 +563,7 @@ def _build_sft_dataset(
         "completion_field": completion_field,
         "sampling_mode": sampling_mode,
         "source_rows": int(len(rows)),
+        "source_rows_before_creativity_filter": int(rows_before_creativity),
         "filtered_rows": int(len(filtered)),
         "selected_rows_before_length": int(len(sorted_rows)),
         "dropped_missing_prompt_or_completion": int(dropped_missing),
@@ -450,6 +571,7 @@ def _build_sft_dataset(
         "train_examples": int(len(examples)),
         "max_length": int(max_len),
         "sft_filter": sft_filter,
+        "sft_creativity": creativity_stats,
     }
 
     return HFDataset.from_list(examples), stats

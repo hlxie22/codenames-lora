@@ -116,7 +116,7 @@ filtering:
   min_reward: 2.0
 
 training:
-  objective: "sft"
+  objective: "dpo"
   deepspeed_config: null
   dpo_beta: 0.1
   dpo_reward_margin: 2.0
@@ -149,6 +149,13 @@ training:
 
   distributed:
     num_nodes: 4
+
+  sft_creativity:
+    enabled: true
+    uplift_coef: 1.0
+    std_coef: 0
+    min_score: 2
+    sort_by_score: true
 
   sft_source: "turns_raw"
   sft_sampling_mode: "one_per_board_per_epoch"

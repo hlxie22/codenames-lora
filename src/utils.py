@@ -113,6 +113,11 @@ def _parse_iter_spec(raw_iter: Any) -> Dict[str, Any]:
     }
 
 
+def _default_sft_adapter_dir(cfg: Dict[str, Any]) -> str:
+    tcfg = cfg.get("training", {}) or {}
+    return str(tcfg.get("sft_output_adapter_dir", "outputs/sft/lora_spymaster"))
+
+
 def resolve_training_objective(cfg: Dict[str, Any]) -> str:
     training = cfg.get("training", {}) or {}
     objective = str(training.get("objective", "dpo")).strip().lower() or "dpo"
@@ -186,10 +191,13 @@ def load_yaml(path: str | Path) -> Dict[str, Any]:
     Environment override:
       ITER=<int>    -> overrides iter.n
 
-    Effective adapter behavior:
-      - When iter.n > 0 and iter.use_trained=true, previous-iteration adapters stay enabled
-        for rollouts and training initialization.
-      - Otherwise rollout_adapter_dir / init_adapter_dir / sft_init_adapter_dir are disabled.
+    Adapter bootstrap behavior:
+      - SFT iter 0: no bootstrap
+      - DPO iter 0 with iter.use_trained=true: bootstrap from canonical SFT adapter
+        (training.sft_output_adapter_dir, default outputs/sft/lora_spymaster)
+      - Any objective with iter.n > 0 and iter.use_trained=true: keep existing
+        previous-iteration adapter behavior from templated paths
+      - Otherwise rollout/init adapters are disabled
     """
     with open(path, "r", encoding="utf-8") as f:
         obj = yaml.safe_load(f) or {}
@@ -237,7 +245,15 @@ def load_yaml(path: str | Path) -> Dict[str, Any]:
     cfg = _expand_templates(cfg, mapping)
     objective = resolve_training_objective(cfg)
 
-    effective_use_trained = bool(iter_n > 0 and requested_use_trained)
+    # Special case:
+    # DPO iter 0 with use_trained=true means "bootstrap from canonical SFT adapter".
+    bootstrap_from_sft = bool(
+        objective == "dpo" and iter_n == 0 and requested_use_trained
+    )
+
+    # Existing behavior remains for iter>0. The special case above treats
+    # the first DPO run as bootstrapping from SFT.
+    effective_use_trained = bool((iter_n > 0 and requested_use_trained) or bootstrap_from_sft)
 
     cfg["iter"] = {
         "n": iter_n,
@@ -246,10 +262,18 @@ def load_yaml(path: str | Path) -> Dict[str, Any]:
         "root": root,
     }
 
-    if not effective_use_trained:
-        cfg.setdefault("inference", {})
+    cfg.setdefault("inference", {})
+    cfg.setdefault("training", {})
+
+    if bootstrap_from_sft:
+        sft_adapter = _default_sft_adapter_dir(cfg)
+        cfg["inference"]["rollout_adapter_dir"] = sft_adapter
+        cfg["training"]["init_adapter_dir"] = sft_adapter
+        if "sft_init_adapter_dir" in cfg["training"]:
+            cfg["training"]["sft_init_adapter_dir"] = sft_adapter
+
+    elif not effective_use_trained:
         cfg["inference"]["rollout_adapter_dir"] = None
-        cfg.setdefault("training", {})
         cfg["training"]["init_adapter_dir"] = None
         if "sft_init_adapter_dir" in cfg["training"]:
             cfg["training"]["sft_init_adapter_dir"] = None
