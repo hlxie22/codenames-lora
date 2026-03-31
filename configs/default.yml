@@ -123,18 +123,18 @@ training:
   dpo_completion_field: "completion"
 
   dpo_max_rejected_per_prompt: 2
-  trl_max_length: 4096
+  trl_max_length: 768
   trl_truncation_mode: "keep_start"
 
   seed: 999
   r: 16
   alpha: 32
   dropout: 0.05
-  lr: 1.0e-4
+  lr: 5e-6
   epochs: 3
   batch_size: 1
-  grad_accum: 2
-  max_seq_len: 4096
+  grad_accum: 16
+  max_seq_len: 768
 
   output_adapter_dir: "{root}{iter_dir}/lora_spymaster"
   init_adapter_dir: "{root}{prev_dir}/lora_spymaster"
@@ -144,7 +144,7 @@ training:
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
   attn_implementation: "sdpa"
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   gradient_checkpointing_use_reentrant: false
 
   distributed:
@@ -167,7 +167,7 @@ training:
   sft_max_length: 768
   sft_epochs: 2
   sft_batch_size: 4
-  sft_grad_accum: 2
+  sft_grad_accum: 4
   sft_lr: 7e-5
   lr_scheduler_type: "constant_with_warmup"
   warmup_ratio: 0.05
