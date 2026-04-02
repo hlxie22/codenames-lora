@@ -193,9 +193,9 @@ def load_yaml(path: str | Path) -> Dict[str, Any]:
 
     Adapter bootstrap behavior:
       - SFT iter 0: no bootstrap
-      - DPO iter 0 with iter.use_trained=true: bootstrap from canonical SFT adapter
+      - DPO iter 1 with iter.use_trained=true: bootstrap from canonical SFT adapter
         (training.sft_output_adapter_dir, default outputs/sft/lora_spymaster)
-      - Any objective with iter.n > 0 and iter.use_trained=true: keep existing
+      - Any objective with iter.n > 1 and iter.use_trained=true: keep existing
         previous-iteration adapter behavior from templated paths
       - Otherwise rollout/init adapters are disabled
     """
@@ -246,14 +246,14 @@ def load_yaml(path: str | Path) -> Dict[str, Any]:
     objective = resolve_training_objective(cfg)
 
     # Special case:
-    # DPO iter 0 with use_trained=true means "bootstrap from canonical SFT adapter".
+    # DPO iter 1 with use_trained=true means "bootstrap from canonical SFT adapter".
     bootstrap_from_sft = bool(
-        objective == "dpo" and iter_n == 0 and requested_use_trained
+        objective == "dpo" and iter_n == 1 and requested_use_trained
     )
 
-    # Existing behavior remains for iter>0. The special case above treats
-    # the first DPO run as bootstrapping from SFT.
-    effective_use_trained = bool((iter_n > 0 and requested_use_trained) or bootstrap_from_sft)
+    # Existing behavior remains for later iterations. The special case above treats
+    # the first DPO run as iter 1 bootstrapping from SFT.
+    effective_use_trained = bool((iter_n > 1 and requested_use_trained) or bootstrap_from_sft)
 
     cfg["iter"] = {
         "n": iter_n,

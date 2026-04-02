@@ -309,6 +309,7 @@ def main() -> None:
     rejected_filter = dict(tcfg.get("dpo_rejected_filter") or {})
 
     cur_iter = int((cfg.get("iter", {}) or {}).get("n", 0))
+    first_dpo_iter = 1
     mix_previous = bool(tcfg.get("dpo_mix_previous_pairs", False))
     mix_num_previous = tcfg.get("dpo_mix_num_previous_iters", None)
 
@@ -323,11 +324,11 @@ def main() -> None:
     all_pairs = list(current_pairs)
 
     prev_added = 0
-    if mix_previous and cur_iter > 0:
+    if mix_previous and cur_iter > first_dpo_iter:
         if mix_num_previous is None:
-            start_iter = 0
+            start_iter = first_dpo_iter
         else:
-            start_iter = max(0, cur_iter - int(mix_num_previous))
+            start_iter = max(first_dpo_iter, cur_iter - int(mix_num_previous))
 
         for prev_iter in range(start_iter, cur_iter):
             prev_cfg = _load_cfg_for_iter(args.config, prev_iter)

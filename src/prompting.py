@@ -5,49 +5,63 @@ from typing import Any, Dict, List, Literal, Optional
 from .model_wrappers import GenerationConfig, TextGenerator
 
 Role = Literal["spymaster", "guesser", "generic"]
-SpymasterReasoningMode = Literal["none", "visible", "native"]
+ReasoningMode = Literal["none", "visible", "native"]
 
 
 def _use_chat_template(cfg: Dict[str, Any]) -> bool:
     return bool(cfg.get("qwen", {}).get("use_chat_template", False))
 
 
-def get_spymaster_reasoning_mode(cfg: Dict[str, Any]) -> SpymasterReasoningMode:
+def get_spymaster_reasoning_mode(cfg: Dict[str, Any]) -> ReasoningMode:
     """
-    Decouple visible output format from native chat-template thinking mode.
-
-    Modes:
-      - none:    no visible reasoning, no native thinking
-      - visible: visible rationale is part of the completion text
-      - native:  model-native thinking mode may be enabled, but visible output should
-                 still be final-answer-only
-
-    Back-compat:
-      if qwen.spymaster_reasoning_mode is absent, infer:
-        enable_thinking_spymaster=true  -> native
-        otherwise                       -> none
+    Spymaster reasoning modes:
+      - none:    final answer only, no native hidden thinking
+      - visible: visible rationale in completion text
+      - native:  model-native hidden thinking; visible output should remain final-only
     """
     q = cfg.get("qwen", {}) or {}
-    raw = q.get("spymaster_reasoning_mode", None)
-    if raw is None:
-        return "native" if bool(q.get("enable_thinking_spymaster", False)) else "none"
-
-    mode = str(raw).strip().lower()
+    mode = str(q.get("spymaster_reasoning_mode", "none")).strip().lower()
     if mode not in {"none", "visible", "native"}:
         raise ValueError(
-            f"Unsupported qwen.spymaster_reasoning_mode={raw!r}. "
+            f"Unsupported qwen.spymaster_reasoning_mode={mode!r}. "
             "Expected one of: none, visible, native."
         )
     return mode  # type: ignore[return-value]
 
 
-def _enable_thinking(cfg: Dict[str, Any], role: Role) -> bool:
+def get_guesser_reasoning_mode(cfg: Dict[str, Any]) -> ReasoningMode:
+    """
+    Guesser reasoning modes:
+      - none:    final answer only, no native hidden thinking
+      - visible: visible rationale in completion text
+      - native:  model-native hidden thinking; visible output should remain final-only
+    """
     q = cfg.get("qwen", {}) or {}
+    mode = str(q.get("guesser_reasoning_mode", "none")).strip().lower()
+    if mode not in {"none", "visible", "native"}:
+        raise ValueError(
+            f"Unsupported qwen.guesser_reasoning_mode={mode!r}. "
+            "Expected one of: none, visible, native."
+        )
+    return mode  # type: ignore[return-value]
+
+
+def approx_visible_reasoning_word_cap(max_tokens: int) -> int:
+    """
+    Conservative token->word conversion for prompt instructions.
+
+    We keep the config in tokens, but LLMs usually follow word caps more naturally.
+    Using a conservative ratio leaves some token headroom.
+    """
+    return max(1, int(max_tokens * 0.6))
+
+
+def _enable_thinking(cfg: Dict[str, Any], role: Role) -> bool:
     if role == "spymaster":
-        return bool(get_spymaster_reasoning_mode(cfg) == "native")
+        return get_spymaster_reasoning_mode(cfg) == "native"
     if role == "guesser":
-        return bool(q.get("enable_thinking_guesser", True))
-    return bool(q.get("enable_thinking", True))
+        return get_guesser_reasoning_mode(cfg) == "native"
+    return False
 
 
 def _render_plain_messages(messages: List[Dict[str, str]]) -> str:
@@ -64,9 +78,10 @@ def _render_plain_messages(messages: List[Dict[str, str]]) -> str:
 
 def render_prompt(generator: Any, messages: List[Dict[str, str]], cfg: Dict[str, Any], *, role: Role) -> str:
     """
-    Canonical prompt rendering for both batched & non-batched paths.
+    Canonical prompt rendering for both batched and non-batched paths.
+
     If chat templates are disabled, serialize the full message list into a plain-text prompt.
-    Otherwise use generator.format_chat(...) with role-specific enable_thinking.
+    Otherwise use generator.format_chat(...) with role-specific native-thinking control.
     """
     if not _use_chat_template(cfg):
         return _render_plain_messages(messages)
@@ -87,12 +102,12 @@ def generate_from_messages(
     seed: Optional[int] = None,
 ) -> str:
     """
-    Canonical "messages -> generator.generate(...)" wrapper.
+    Canonical messages -> generator.generate(...) wrapper.
 
-    This removes duplicated logic scattered around the codebase:
-      - chat_template vs raw string prompt
-      - role-specific enable_thinking flags
-      - passing the correct flags into generator.generate()
+    Handles:
+      - chat_template vs plain-text prompting
+      - role-specific native hidden thinking
+      - correct flags into generator.generate()
     """
     use_chat = _use_chat_template(cfg)
     if use_chat:

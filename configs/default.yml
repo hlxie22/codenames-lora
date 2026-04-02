@@ -64,20 +64,13 @@ models:
 qwen:
   use_chat_template: true
 
-  # Spymaster reasoning policy:
-  #   none    -> final answer only
-  #   visible -> visible rationale in completion text (preserved in turns_raw)
-  #   native  -> model-native thinking mode; visible output should still be final-only
-  spymaster_reasoning_mode: "visible"
-  spymaster_visible_reasoning_max_words: 40
+  spymaster_reasoning_mode: "visible"  
+  guesser_reasoning_mode: "visible"     
+  spymaster_visible_reasoning_max_tokens: 768
+  guesser_visible_reasoning_max_tokens: 768
 
-  # Kept for back-compat with chat-template wrappers.
-  # Only used when spymaster_reasoning_mode == "native".
-  enable_thinking_spymaster: false
-  enable_thinking_guesser: true
-
-  system_spymaster: "You are the Spymaster in a Codenames-like game. Reason carefully, but keep your visible answer concise and decision-focused."
-  system_guesser: "You are the Guesser in a Codenames-like game."
+  system_spymaster: "You are the Spymaster in a Codenames-like game. Reason carefully and thoroughly before answering."
+  system_guesser: "You are the Guesser in a Codenames-like game. Reason carefully and thoroughly before answering."
 
 decoding:
   progress_every: 20
@@ -116,7 +109,7 @@ filtering:
   min_reward: 2.0
 
 training:
-  objective: "dpo"
+  objective: "sft"
   deepspeed_config: null
   dpo_beta: 0.1
   dpo_reward_margin: 2.0
