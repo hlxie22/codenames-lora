@@ -169,7 +169,8 @@ echo "prep job: $PREP_JOB"
 
 # -------------------------------------------------------------------
 # SFT path: prep -> gen -> merge -> train
-# Fast path: if selected SFT source already exists, go straight to train
+# Fast path 1: if selected SFT source already exists, go straight to train
+# Fast path 2: if merged turns_raw already exists, refilter -> train
 # -------------------------------------------------------------------
 if [[ "$TRAINING_OBJECTIVE" == "sft" ]]; then
   if [[ "$SKIP_IF_READY" == "1" && "$CLEAN" != "1" && -s "$TRAIN_DATA_PATH" ]]; then
@@ -187,69 +188,24 @@ if [[ "$TRAINING_OBJECTIVE" == "sft" ]]; then
     exit 0
   fi
 
-  AUTO_SHARDS="$(
-  "$PYTHON" - <<'PY'
-import os
-import re
-import glob
-from pathlib import Path
-from src.utils import load_yaml
+  if [[ "$SKIP_IF_READY" == "1" && "$CLEAN" != "1" && -s "$TURNS_RAW_PATH" ]]; then
+    echo "[pipeline] Found existing merged turns_raw ($TURNS_RAW_PATH). Skipping gen/merge and refiltering."
 
-cfg = load_yaml(os.environ.get("CONFIG_MAIN", "configs/default.yml"))
-base = (cfg.get("paths", {}) or {}).get("turns_raw_path", "")
-if not base:
-    print("")
-    raise SystemExit(0)
-
-base = Path(base)
-files = glob.glob(str(base) + ".shard*-of-*")
-if not files:
-    print("")
-    raise SystemExit(0)
-
-ns = set()
-for f in files:
-    m = re.search(r"\.shard(\d+)-of-(\d+)$", f)
-    if m:
-        ns.add(int(m.group(2)))
-
-if len(ns) != 1:
-    print("")
-    raise SystemExit(0)
-
-N = next(iter(ns))
-
-ok = True
-for sid in range(N):
-    tag = f"shard{sid:02d}-of-{N:02d}"
-    sp = base.with_suffix(base.suffix + f".{tag}")
-    if (not sp.exists()) or sp.stat().st_size == 0:
-        ok = False
-        break
-
-print(str(N) if ok else "")
-PY
-  )"
-
-  if [[ "$SKIP_IF_READY" == "1" && "$CLEAN" != "1" && -n "$AUTO_SHARDS" ]]; then
-    TOTAL_SHARDS="$AUTO_SHARDS"
-    echo "[pipeline] Detected all $TOTAL_SHARDS shards already exist. Skipping gen array."
-
-    MERGE_JOB=$(sbatch --parsable \
+    REFILTER_JOB=$(sbatch --parsable \
       --dependency=afterok:"$PREP_JOB" \
-      --export=ALL,CONFIG="$CONFIG_MAIN",TOTAL_SHARDS="$TOTAL_SHARDS",ALLOW_MISSING="$ALLOW_MISSING" \
-      slurm/merge_turns.slurm)
-    echo "merge job: $MERGE_JOB (total_shards=$TOTAL_SHARDS)"
+      --export=ALL,CONFIG="$CONFIG_MAIN" \
+      slurm/refilter_turns.slurm)
+    echo "refilter job: $REFILTER_JOB"
 
     TRAIN_JOB=$(sbatch --parsable \
-      --dependency=afterok:"$MERGE_JOB" \
+      --dependency=afterok:"$REFILTER_JOB" \
       --nodes="$TRAIN_NODES" \
       --ntasks-per-node=1 \
       --export=ALL,CONFIG="$CONFIG_MAIN" \
       slurm/train.slurm)
     echo "train job: $TRAIN_JOB"
 
-    echo "Pipeline submitted (SFT mode, skipped gen)."
+    echo "Pipeline submitted (used existing merged turns_raw)."
     exit 0
   fi
 

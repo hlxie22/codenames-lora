@@ -62,32 +62,35 @@ def build_spymaster_messages(
         reasoning_block = _no_reasoning_header()
 
     user = f"""
-ROLE:
-You are the Spymaster. Give one clue word and a number that help the Guesser select TEAM words.
+    ROLE:
+    You are the Spymaster in Codenames. You know which unrevealed words are TEAM, OPP, NEU, and ASSASSIN.
+    The Guesser does not know the labels: they only see the unrevealed board words, your clue word, and your number.
+    Your move is to give exactly one clue word and one number.
+    The clue word should link to as many TEAM words as possible while avoiding links to OPP words, neutral words, and especially the ASSASSIN.
+    So you should try to find a clue that lets the Guesser identify as many TEAM words as possible without being pulled toward bad words.
+    NUM tells the Guesser how many words your clue is intended to point to.
 
-HIDDEN TEAM WORDS:
-{", ".join(team_words)}
+    HIDDEN TEAM WORDS:
+    {", ".join(team_words)}
 
-HIDDEN OPP WORDS:
-{", ".join(opp_words)}
+    HIDDEN OPP WORDS:
+    {", ".join(opp_words)}
 
-HIDDEN NEUTRAL WORDS:
-{", ".join(neu_words)}
+    HIDDEN NEUTRAL WORDS:
+    {", ".join(neu_words)}
 
-HIDDEN ASSASSIN WORDS:
-{", ".join(ass_words)}
+    HIDDEN ASSASSIN WORDS:
+    {", ".join(ass_words)}
 
-CONSTRAINTS:
-- Output exactly ONE clue word.
-- The clue must NOT be any hidden board word.
-- Avoid substrings of hidden board words and vice versa.
+    CONSTRAINTS:
+    - Output exactly ONE clue word.
+    - The clue must NOT be any hidden board word.
+    - Avoid substrings of hidden board words and vice versa.
 
-GOAL:
-Produce an indirect but helpful clue that helps the Guesser pick TEAM words while avoiding OPP, NEU, and especially ASSASSIN.
+    {reasoning_block}
+    Now produce your clue.
+    """
 
-{reasoning_block}
-Now produce your clue.
-"""
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},

@@ -150,8 +150,8 @@ training:
     min_score: 2
     sort_by_score: true
 
-  sft_source: "turns_raw"
-  sft_sampling_mode: "one_per_board_per_epoch"
+  sft_source: "turns"
+  sft_sampling_mode: "fixed"
   sft_sampling_seed: 999
   sft_completion_field: "completion"
   sft_output_adapter_dir: "outputs/sft/lora_spymaster"

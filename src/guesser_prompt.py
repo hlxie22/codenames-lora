@@ -56,20 +56,24 @@ def build_guesser_messages(
     else:
         reasoning_block = _no_reasoning_header()
 
-    user = f"""You only see the board words and the clue.
+    user = f"""
+    You are the Guesser in Codenames. You only see the board words plus the Spymaster's clue and number.
+    The clue is a one-word hint.
+    NUM tells you how many words the clue is intended to point to.
+    Your objective is to identify the group of {num} words most related to the clue.
 
-BOARD WORDS:
-{", ".join(visible)}
+    BOARD WORDS:
+    {", ".join(visible)}
 
-CLUE: {clue}
-NUM: {num}
+    CLUE: {clue}
+    NUM: {num}
 
-Choose the words most likely intended by the clue.
-Return at least {num} guesses if possible.
-List guesses in descending confidence.
+    CONSTRAINTS:
+    - Return exactly {num} guesses.
 
-{reasoning_block}
-"""
+    {reasoning_block}
+    """
+
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},

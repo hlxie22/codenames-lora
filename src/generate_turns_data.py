@@ -16,7 +16,14 @@ from .prompting import render_prompt, get_spymaster_reasoning_mode
 from .rollout import run_turns_batched
 from .spymaster_prompt import build_spymaster_messages
 from .think_utils import split_think_and_rest
-from .utils import load_yaml, read_jsonl, set_global_seed, write_jsonl, save_progress
+from .utils import (
+    load_yaml,
+    read_jsonl,
+    resolve_training_objective,
+    set_global_seed,
+    write_jsonl,
+    save_progress,
+)
 
 
 # -------------------------
@@ -126,18 +133,161 @@ def _spymaster_completion_fields(
 
 
 # -------------------------
-# Filtering (board-level; based on BEST)
+# Filtering / materialization
 # -------------------------
+
+def _record_valid(record: Dict[str, Any]) -> bool:
+    if "valid" in record:
+        return bool(record.get("valid", False))
+    clue_meta = record.get("clue_meta") or {}
+    return bool(clue_meta.get("valid", False))
+
+
+def _passes_structured_filter(
+    record: Dict[str, Any],
+    filt: Dict[str, Any] | None,
+) -> bool:
+    if not filt:
+        return True
+
+    stats = record.get("stats") or {}
+    reward = float(record.get("reward", 0.0))
+
+    if bool(filt.get("require_valid", False)) and not _record_valid(record):
+        return False
+
+    min_reward = filt.get("min_reward", None)
+    if min_reward is not None and reward < float(min_reward):
+        return False
+
+    min_team = filt.get("min_team_correct", None)
+    if min_team is not None and int(stats.get("n_team", 0)) < int(min_team):
+        return False
+
+    max_opp = filt.get("max_opp_wrong", None)
+    if max_opp is not None and int(stats.get("n_opp", 0)) > int(max_opp):
+        return False
+
+    max_neu = filt.get("max_neu_wrong", None)
+    if max_neu is not None and int(stats.get("n_neu", 0)) > int(max_neu):
+        return False
+
+    if bool(filt.get("require_no_assassin", False)) and int(stats.get("assassin", 0)) > 0:
+        return False
+
+    return True
+
+
+def _candidate_sort_key(row: Dict[str, Any]) -> tuple[float, int, int, int, int]:
+    stats = row.get("stats") or {}
+    return (
+        float(row.get("reward", 0.0)),
+        int(stats.get("n_team", 0)),
+        -int(stats.get("assassin", 0)),
+        -int(stats.get("n_opp", 0)),
+        -int(stats.get("n_neu", 0)),
+    )
+
+
+def _promote_candidate_to_parent(parent: Dict[str, Any], cand: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(parent)
+
+    for k in (
+        "completion",
+        "completion_raw",
+        "completion_final",
+        "visible_completion",
+        "reasoning_trace",
+        "raw_spymaster_text",
+        "raw_guesser_text",
+        "reward",
+    ):
+        if k in cand:
+            out[k] = cand[k]
+
+    out["stats"] = {
+        **(cand.get("stats") or {}),
+        "directness": float(cand.get("directness", 0.0)),
+    }
+
+    clue_meta = dict(parent.get("clue_meta") or {})
+    clue_meta.update(
+        {
+            "clue": cand.get("clue", clue_meta.get("clue")),
+            "num": int(cand.get("num", clue_meta.get("num", 0) or 0)),
+            "parse_valid": bool(cand.get("parse_valid", clue_meta.get("parse_valid", False))),
+            "valid": bool(cand.get("valid", clue_meta.get("valid", False))),
+        }
+    )
+    out["clue_meta"] = clue_meta
+    out["debug"] = {"guess_words": list(cand.get("guess_words") or [])}
+    return out
+
 
 def filter_examples(records: List[Dict[str, Any]], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Keeps board-records whose BEST candidate satisfies filtering config.
-    """
-    fcfg = cfg["filtering"]
-    mode = fcfg["mode"]
+    DPO/default:
+      - keep old board-level filtering behavior from cfg["filtering"]
 
+    SFT:
+      - materialize SFT-ready turns.jsonl using training.sft_filter
+      - prune each row's candidates list to only SFT-valid candidates
+      - promote the best surviving candidate to the parent row
+    """
     if not records:
         return []
+
+    objective = resolve_training_objective(cfg)
+
+    if objective == "sft":
+        sft_filter = dict((cfg.get("training", {}) or {}).get("sft_filter") or {})
+        kept: List[Dict[str, Any]] = []
+
+        for parent in records:
+            raw_candidates = list(parent.get("candidates") or [])
+
+            if raw_candidates:
+                kept_candidates = [dict(c) for c in raw_candidates if _passes_structured_filter(c, sft_filter)]
+                if not kept_candidates:
+                    continue
+
+                best_idx = max(
+                    range(len(kept_candidates)),
+                    key=lambda i: _candidate_sort_key(kept_candidates[i]),
+                )
+                best = kept_candidates[best_idx]
+
+                row = _promote_candidate_to_parent(parent, best)
+                row["candidates"] = kept_candidates
+                row["best_candidate_idx"] = int(best_idx)
+
+                rewards = [float(c.get("reward", 0.0)) for c in kept_candidates]
+                valid_rewards = [float(c.get("reward", 0.0)) for c in kept_candidates if _record_valid(c)]
+
+                avg_all = float(np.mean(rewards)) if rewards else 0.0
+                row["candidate_reward_mean"] = avg_all
+                row["candidate_reward_std"] = float(np.std(rewards)) if rewards else 0.0
+                row["candidate_valid_frac"] = (
+                    float(np.mean([1.0 if _record_valid(c) else 0.0 for c in kept_candidates]))
+                    if kept_candidates else 0.0
+                )
+                row["best_minus_avg_reward"] = float(best.get("reward", 0.0)) - avg_all
+                row["candidate_reward_mean_valid"] = float(np.mean(valid_rewards)) if valid_rewards else None
+                row["best_minus_avg_reward_valid"] = (
+                    float(best.get("reward", 0.0)) - float(np.mean(valid_rewards))
+                    if valid_rewards else None
+                )
+
+                kept.append(row)
+            else:
+                if _passes_structured_filter(parent, sft_filter):
+                    kept.append(parent)
+
+        return kept
+
+    # ---- existing default / DPO behavior ----
+    fcfg = cfg["filtering"]
+    mode = fcfg["mode"]
 
     min_reward = fcfg.get("min_reward", None)
     min_reward = float(min_reward) if min_reward is not None else None

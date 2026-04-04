@@ -77,14 +77,14 @@ def _render_plain_messages(messages: List[Dict[str, str]]) -> str:
 
 
 def render_prompt(generator: Any, messages: List[Dict[str, str]], cfg: Dict[str, Any], *, role: Role) -> str:
-    """
-    Canonical prompt rendering for both batched and non-batched paths.
+    if not isinstance(messages, list):
+        raise TypeError(
+            f"render_prompt expected a list of chat messages, got {type(messages).__name__}: {messages!r}"
+        )
 
-    If chat templates are disabled, serialize the full message list into a plain-text prompt.
-    Otherwise use generator.format_chat(...) with role-specific native-thinking control.
-    """
     if not _use_chat_template(cfg):
         return _render_plain_messages(messages)
+
     return generator.format_chat(
         messages,
         add_generation_prompt=True,
