@@ -135,7 +135,7 @@ def resolve_training_plan(cfg: Dict[str, Any]) -> Dict[str, str]:
     paths = cfg.get("paths", {}) or {}
 
     if objective == "sft":
-        sft_source = str(tcfg.get("sft_source", "turns_raw")).strip().lower()
+        sft_source = str(tcfg.get("sft_source", "turns")).strip().lower()
         if sft_source not in {"turns_raw", "turns"}:
             raise ValueError(
                 f"Unsupported training.sft_source: {sft_source!r}. Expected 'turns_raw' or 'turns'."

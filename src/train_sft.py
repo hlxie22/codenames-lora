@@ -140,16 +140,6 @@ def _encode_sft_example(
     }
 
 
-def _candidate_parent_row(parent: Dict[str, Any], cand: Dict[str, Any]) -> Dict[str, Any]:
-    out = {
-        "prompt": parent.get("prompt"),
-        "board_id": parent.get("board_id"),
-        "example_id": parent.get("example_id"),
-    }
-    out.update(cand)
-    return out
-
-
 class OnePositivePerBoardPerEpochDataset(TorchDataset):
     """
     Holds a pool of encoded positive examples for each board and exposes exactly one
@@ -251,6 +241,72 @@ def _resolve_completion_text(row: Dict[str, Any], field: str) -> str | None:
     return text
 
 
+def _stable_board_hash(seed: int, board_id: str) -> int:
+    blob = f"{int(seed)}:{board_id}".encode("utf-8")
+    h = hashlib.sha256(blob).digest()
+    return int.from_bytes(h[:8], "big")
+
+
+def _select_board_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    max_boards: int | None,
+    seed: int,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    if max_boards is None:
+        return list(rows), {
+            "board_rows_available": int(len(rows)),
+            "board_rows_selected": int(len(rows)),
+            "board_cap_applied": False,
+        }
+
+    cap = max(0, int(max_boards))
+    if cap >= len(rows):
+        return list(rows), {
+            "board_rows_available": int(len(rows)),
+            "board_rows_selected": int(len(rows)),
+            "board_cap_applied": False,
+            "board_cap": int(cap),
+        }
+
+    ranked: List[tuple[int, int, str]] = []
+    for idx, row in enumerate(rows):
+        board_id = str(row.get("board_id") or row.get("example_id") or f"row_{idx:08d}")
+        ranked.append((_stable_board_hash(seed, board_id), idx, board_id))
+
+    ranked.sort()
+    chosen_idxs = {idx for _, idx, _ in ranked[:cap]}
+    selected = [row for idx, row in enumerate(rows) if idx in chosen_idxs]
+
+    return selected, {
+        "board_rows_available": int(len(rows)),
+        "board_rows_selected": int(len(selected)),
+        "board_cap_applied": True,
+        "board_cap": int(cap),
+    }
+
+
+def _require_turns_sft_pool_row(parent: Dict[str, Any]) -> List[Dict[str, Any]]:
+    pool = parent.get("sft_pool")
+    if not isinstance(pool, list) or not pool:
+        raise RuntimeError(
+            "training.sft_source='turns' requires canonical board-pool rows with non-empty sft_pool. "
+            f"Bad board_id={parent.get('board_id')!r}"
+        )
+    return [dict(c) for c in pool]
+
+
+def _resolve_default_sft_candidate(parent: Dict[str, Any]) -> Dict[str, Any]:
+    pool = _require_turns_sft_pool_row(parent)
+    idx = int(parent.get("sft_default_idx", 0) or 0)
+    if idx < 0 or idx >= len(pool):
+        raise RuntimeError(
+            "Invalid sft_default_idx in turns row. "
+            f"board_id={parent.get('board_id')!r} sft_default_idx={idx} pool_size={len(pool)}"
+        )
+    return pool[idx]
+
+
 def _build_sft_dataset(
     cfg: Dict[str, Any],
     tok: Any,
@@ -264,19 +320,71 @@ def _build_sft_dataset(
     max_len = int(tcfg.get("sft_max_length", tcfg.get("max_seq_len", 4096)))
     max_examples = tcfg.get("sft_max_examples", None)
     sampling_mode = str(tcfg.get("sft_sampling_mode", "fixed")).strip().lower()
+    sampling_seed = int(tcfg.get("sft_sampling_seed", tcfg.get("seed", 0)))
+
+    selected_rows, selection_stats = _select_board_rows(
+        rows,
+        max_boards=(int(max_examples) if max_examples is not None else None),
+        seed=sampling_seed,
+    )
 
     if source_kind == "turns_raw":
         print(
-            "[train_sft] WARNING: training.sft_source=turns_raw. "
-            "train_sft.py no longer applies semantic filtering, so this will consume raw rows as-is."
+            "[train_sft] WARNING: training.sft_source=turns_raw is treated as a dev-only fallback. "
+            "The intended path is training.sft_source=turns with canonical turns.jsonl sft_pool rows."
+        )
+        if sampling_mode != "fixed":
+            raise RuntimeError(
+                "training.sft_source='turns_raw' is only supported with training.sft_sampling_mode='fixed'. "
+                "Use canonical training.sft_source='turns' for pool-based sampling."
+            )
+
+        examples: List[Dict[str, Any]] = []
+        dropped_missing = 0
+        dropped_overlong = 0
+
+        for r in selected_rows:
+            prompt = r.get("prompt")
+            completion = _resolve_completion_text(r, completion_field)
+
+            if not isinstance(prompt, str) or not isinstance(completion, str) or not prompt or not completion:
+                dropped_missing += 1
+                continue
+
+            ex = _encode_sft_example(prompt, completion, tok, max_len=max_len)
+            if ex is None:
+                dropped_overlong += 1
+                continue
+
+            examples.append(ex)
+
+        if not examples:
+            raise RuntimeError(
+                f"No SFT examples survived prompt/completion and length checks. source_path={source_path}"
+            )
+
+        stats = {
+            "source_path": source_path,
+            "source_kind": source_kind,
+            "completion_field": completion_field,
+            "sampling_mode": sampling_mode,
+            "source_rows": int(len(rows)),
+            **selection_stats,
+            "semantic_filtering_applied_in_train_sft": False,
+            "selected_rows_before_length": int(len(selected_rows)),
+            "dropped_missing_prompt_or_completion": int(dropped_missing),
+            "dropped_overlong": int(dropped_overlong),
+            "train_examples": int(len(examples)),
+            "max_length": int(max_len),
+        }
+        return HFDataset.from_list(examples), stats
+
+    if source_kind != "turns":
+        raise RuntimeError(
+            f"Unsupported training.sft_source={source_kind!r}. Expected 'turns' or 'turns_raw'."
         )
 
     if sampling_mode == "one_per_board_per_epoch":
-        if source_kind not in {"turns_raw", "turns"}:
-            raise RuntimeError(
-                f"Unsupported training.sft_source={source_kind!r} for one_per_board_per_epoch"
-            )
-
         board_to_examples: Dict[str, List[Dict[str, Any]]] = {}
         board_ids_in_order: List[str] = []
 
@@ -284,28 +392,30 @@ def _build_sft_dataset(
         dropped_overlong = 0
         eligible_candidates_before_dedupe = 0
         eligible_candidates_after_dedupe = 0
+        dropped_empty_pool_rows = 0
 
-        for parent in rows:
+        for parent in selected_rows:
             prompt = parent.get("prompt")
             board_id = str(parent.get("board_id") or parent.get("example_id") or "")
             if not isinstance(prompt, str) or not prompt or not board_id:
                 dropped_missing += 1
                 continue
 
-            raw_candidates = parent.get("candidates") or []
-            candidate_rows = [_candidate_parent_row(parent, c) for c in raw_candidates] if raw_candidates else [parent]
+            try:
+                pool_rows = _require_turns_sft_pool_row(parent)
+            except RuntimeError:
+                dropped_empty_pool_rows += 1
+                continue
 
             seen_texts = set()
-            pool: List[Dict[str, Any]] = []
-
-            for row in candidate_rows:
-                completion = _resolve_completion_text(row, completion_field)
+            encoded_pool: List[Dict[str, Any]] = []
+            for cand in pool_rows:
+                completion = _resolve_completion_text(cand, completion_field)
                 if not isinstance(completion, str) or not completion:
                     dropped_missing += 1
                     continue
 
                 eligible_candidates_before_dedupe += 1
-
                 dedupe_key = completion.strip()
                 if dedupe_key in seen_texts:
                     continue
@@ -316,67 +426,75 @@ def _build_sft_dataset(
                     dropped_overlong += 1
                     continue
 
-                pool.append(ex)
+                encoded_pool.append(ex)
                 eligible_candidates_after_dedupe += 1
 
-            if pool:
-                if board_id not in board_to_examples:
-                    board_ids_in_order.append(board_id)
-                    board_to_examples[board_id] = []
-                board_to_examples[board_id].extend(pool)
+            if not encoded_pool:
+                continue
+
+            if board_id not in board_to_examples:
+                board_ids_in_order.append(board_id)
+                board_to_examples[board_id] = []
+            board_to_examples[board_id].extend(encoded_pool)
 
         if not board_to_examples:
             raise RuntimeError(
                 f"No SFT examples survived prompt/completion and length checks. source_path={source_path}"
             )
 
-        board_ids = list(board_ids_in_order)
-        if max_examples is not None:
-            board_ids = board_ids[: int(max_examples)]
-
         ds = OnePositivePerBoardPerEpochDataset(
             board_to_examples,
-            board_ids=board_ids,
-            seed=int(tcfg.get("sft_sampling_seed", tcfg.get("seed", 0))),
+            board_ids=board_ids_in_order,
+            seed=sampling_seed,
         )
 
-        pool_sizes = [len(board_to_examples[bid]) for bid in board_ids]
+        pool_sizes = [len(board_to_examples[bid]) for bid in board_ids_in_order]
         stats = {
             "source_path": source_path,
             "source_kind": source_kind,
             "completion_field": completion_field,
             "sampling_mode": sampling_mode,
             "source_rows": int(len(rows)),
+            **selection_stats,
             "semantic_filtering_applied_in_train_sft": False,
             "boards_with_any_pool": int(len(board_to_examples)),
-            "boards_selected_per_epoch": int(len(board_ids)),
+            "boards_selected_per_epoch": int(len(board_ids_in_order)),
             "eligible_candidates_before_dedupe": int(eligible_candidates_before_dedupe),
             "eligible_candidates_after_dedupe": int(eligible_candidates_after_dedupe),
             "avg_pool_size_per_selected_board": float(sum(pool_sizes) / max(1, len(pool_sizes))),
             "max_pool_size_per_selected_board": int(max(pool_sizes) if pool_sizes else 0),
+            "dropped_empty_pool_rows": int(dropped_empty_pool_rows),
             "dropped_missing_prompt_or_completion": int(dropped_missing),
             "dropped_overlong": int(dropped_overlong),
-            "train_examples": int(len(board_ids)),
+            "train_examples": int(len(board_ids_in_order)),
             "max_length": int(max_len),
         }
         return ds, stats
 
-    selected_rows = list(rows)
-    if max_examples is not None:
-        selected_rows = selected_rows[: int(max_examples)]
+    if sampling_mode != "fixed":
+        raise RuntimeError(
+            f"Unsupported training.sft_sampling_mode={sampling_mode!r}. Expected 'fixed' or 'one_per_board_per_epoch'."
+        )
 
     examples: List[Dict[str, Any]] = []
     dropped_missing = 0
     dropped_overlong = 0
+    dropped_empty_pool_rows = 0
 
-    for r in selected_rows:
-        prompt = r.get("prompt")
-        completion = _resolve_completion_text(r, completion_field)
-
-        if not isinstance(prompt, str) or not isinstance(completion, str):
+    for parent in selected_rows:
+        prompt = parent.get("prompt")
+        if not isinstance(prompt, str) or not prompt:
             dropped_missing += 1
             continue
-        if not prompt or not completion:
+
+        try:
+            default_cand = _resolve_default_sft_candidate(parent)
+        except RuntimeError:
+            dropped_empty_pool_rows += 1
+            continue
+
+        completion = _resolve_completion_text(default_cand, completion_field)
+        if not isinstance(completion, str) or not completion:
             dropped_missing += 1
             continue
 
@@ -398,8 +516,10 @@ def _build_sft_dataset(
         "completion_field": completion_field,
         "sampling_mode": sampling_mode,
         "source_rows": int(len(rows)),
+        **selection_stats,
         "semantic_filtering_applied_in_train_sft": False,
         "selected_rows_before_length": int(len(selected_rows)),
+        "dropped_empty_pool_rows": int(dropped_empty_pool_rows),
         "dropped_missing_prompt_or_completion": int(dropped_missing),
         "dropped_overlong": int(dropped_overlong),
         "train_examples": int(len(examples)),

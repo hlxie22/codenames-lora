@@ -193,6 +193,11 @@ def _promote_candidate_to_parent(parent: Dict[str, Any], cand: Dict[str, Any]) -
     out = dict(parent)
 
     for k in (
+        "clue",
+        "num",
+        "parse_valid",
+        "valid",
+        "rejection_reason",
         "completion",
         "completion_raw",
         "completion_final",
@@ -201,6 +206,10 @@ def _promote_candidate_to_parent(parent: Dict[str, Any], cand: Dict[str, Any]) -
         "raw_spymaster_text",
         "raw_guesser_text",
         "reward",
+        "guess_words",
+        "sft_uplift_raw",
+        "sft_score",
+        "sft_rank",
     ):
         if k in cand:
             out[k] = cand[k]
@@ -224,15 +233,149 @@ def _promote_candidate_to_parent(parent: Dict[str, Any], cand: Dict[str, Any]) -
     return out
 
 
+def _score_sft_candidates_against_raw_pool(
+    parent: Dict[str, Any],
+    cfg: Dict[str, Any],
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    raw_pool = [dict(c) for c in list(parent.get("candidates") or [])]
+    if not raw_pool:
+        return [], {
+            "raw_pool_size": 0,
+            "raw_reward_mean": 0.0,
+            "raw_reward_std": 0.0,
+            "raw_valid_frac": 0.0,
+        }
+
+    rewards = [float(c.get("reward", 0.0)) for c in raw_pool]
+    raw_mean = float(np.mean(rewards)) if rewards else 0.0
+    raw_std = float(np.std(rewards)) if rewards else 0.0
+    raw_valid_frac = (
+        float(np.mean([1.0 if _record_valid(c) else 0.0 for c in raw_pool]))
+        if raw_pool else 0.0
+    )
+
+    creativity_cfg = ((cfg.get("training", {}) or {}).get("sft_creativity") or {})
+    uplift_coef = float(creativity_cfg.get("uplift_coef", 1.0))
+    std_coef = float(creativity_cfg.get("std_coef", 0.0))
+
+    scored: List[Dict[str, Any]] = []
+    for cand in raw_pool:
+        cand_reward = float(cand.get("reward", 0.0))
+        cand_uplift_raw = cand_reward - raw_mean
+        sft_score = uplift_coef * cand_uplift_raw + std_coef * raw_std
+
+        scored_cand = dict(cand)
+        scored_cand["sft_uplift_raw"] = float(cand_uplift_raw)
+        scored_cand["sft_score"] = float(sft_score)
+        scored.append(scored_cand)
+
+    raw_stats = {
+        "raw_pool_size": int(len(raw_pool)),
+        "raw_reward_mean": float(raw_mean),
+        "raw_reward_std": float(raw_std),
+        "raw_valid_frac": float(raw_valid_frac),
+    }
+    return scored, raw_stats
+
+
+def _apply_sft_creativity_gate(
+    cands: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    creativity_cfg = ((cfg.get("training", {}) or {}).get("sft_creativity") or {})
+    if not bool(creativity_cfg.get("enabled", True)):
+        return [dict(c) for c in cands]
+
+    min_score = float(creativity_cfg.get("min_score", 0.0))
+    return [dict(c) for c in cands if float(c.get("sft_score", 0.0)) >= min_score]
+
+
+def _apply_sft_structured_filter(
+    cands: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    sft_filter = dict((cfg.get("training", {}) or {}).get("sft_filter") or {})
+    return [dict(c) for c in cands if _passes_structured_filter(c, sft_filter)]
+
+
+def _sort_sft_pool(
+    cands: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    creativity_cfg = ((cfg.get("training", {}) or {}).get("sft_creativity") or {})
+    sort_by_score = bool(creativity_cfg.get("sort_by_score", False))
+
+    def _score_key(row: Dict[str, Any]) -> tuple[float, float, float, int, int, int, int]:
+        stats = row.get("stats") or {}
+        return (
+            float(row.get("sft_score", 0.0)),
+            float(row.get("reward", 0.0)),
+            float(row.get("reward", 0.0)),
+            int(stats.get("n_team", 0)),
+            -int(stats.get("assassin", 0)),
+            -int(stats.get("n_opp", 0)),
+            -int(stats.get("n_neu", 0)),
+        )
+
+    sorted_pool = sorted(
+        [dict(c) for c in cands],
+        key=_score_key if sort_by_score else _candidate_sort_key,
+        reverse=True,
+    )
+
+    for idx, cand in enumerate(sorted_pool):
+        cand["sft_rank"] = int(idx)
+
+    return sorted_pool
+
+
+def _build_sft_pool_row(
+    parent: Dict[str, Any],
+    final_pool: List[Dict[str, Any]],
+    raw_stats: Dict[str, Any],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    default_idx = 0
+    default_cand = final_pool[default_idx]
+
+    row = {
+        "example_id": str(parent.get("example_id") or parent.get("board_id") or ""),
+        "board_id": str(parent.get("board_id") or parent.get("example_id") or ""),
+        "prompt": parent.get("prompt"),
+    }
+    row = _promote_candidate_to_parent(row, default_cand)
+
+    row["sft_pool"] = [dict(c) for c in final_pool]
+    row["sft_pool_size"] = int(len(final_pool))
+    row["sft_default_idx"] = int(default_idx)
+
+    row["sft_raw_pool_size"] = int(raw_stats.get("raw_pool_size", 0))
+    row["sft_raw_reward_mean"] = float(raw_stats.get("raw_reward_mean", 0.0))
+    row["sft_raw_reward_std"] = float(raw_stats.get("raw_reward_std", 0.0))
+    row["sft_raw_valid_frac"] = float(raw_stats.get("raw_valid_frac", 0.0))
+
+    # Backward-compatibility mirrors for one transition cycle.
+    row["candidate_reward_mean"] = float(raw_stats.get("raw_reward_mean", 0.0))
+    row["candidate_reward_std"] = float(raw_stats.get("raw_reward_std", 0.0))
+    row["candidate_valid_frac"] = float(raw_stats.get("raw_valid_frac", 0.0))
+    row["best_minus_avg_reward"] = float(default_cand.get("sft_uplift_raw", 0.0))
+
+    for stale_key in ("candidates", "best_candidate_idx"):
+        row.pop(stale_key, None)
+
+    return row
+
+
 def filter_examples(records: List[Dict[str, Any]], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     DPO/default:
       - keep old board-level filtering behavior from cfg["filtering"]
 
     SFT:
-      - materialize SFT-ready turns.jsonl using training.sft_filter
-      - prune each row's candidates list to only SFT-valid candidates
-      - promote the best surviving candidate to the parent row
+      - materialize canonical board-level SFT pools in turns.jsonl
+      - score creativity relative to the full raw candidate distribution per board
+      - apply creativity threshold first, then hard SFT filtering
+      - drop boards with no final SFT-approved completions
     """
     if not records:
         return []
@@ -240,48 +383,23 @@ def filter_examples(records: List[Dict[str, Any]], cfg: Dict[str, Any]) -> List[
     objective = resolve_training_objective(cfg)
 
     if objective == "sft":
-        sft_filter = dict((cfg.get("training", {}) or {}).get("sft_filter") or {})
         kept: List[Dict[str, Any]] = []
 
         for parent in records:
-            raw_candidates = list(parent.get("candidates") or [])
+            scored_candidates, raw_stats = _score_sft_candidates_against_raw_pool(parent, cfg)
+            if not scored_candidates:
+                continue
 
-            if raw_candidates:
-                kept_candidates = [dict(c) for c in raw_candidates if _passes_structured_filter(c, sft_filter)]
-                if not kept_candidates:
-                    continue
+            creativity_survivors = _apply_sft_creativity_gate(scored_candidates, cfg)
+            if not creativity_survivors:
+                continue
 
-                best_idx = max(
-                    range(len(kept_candidates)),
-                    key=lambda i: _candidate_sort_key(kept_candidates[i]),
-                )
-                best = kept_candidates[best_idx]
+            final_pool = _apply_sft_structured_filter(creativity_survivors, cfg)
+            if not final_pool:
+                continue
 
-                row = _promote_candidate_to_parent(parent, best)
-                row["candidates"] = kept_candidates
-                row["best_candidate_idx"] = int(best_idx)
-
-                rewards = [float(c.get("reward", 0.0)) for c in kept_candidates]
-                valid_rewards = [float(c.get("reward", 0.0)) for c in kept_candidates if _record_valid(c)]
-
-                avg_all = float(np.mean(rewards)) if rewards else 0.0
-                row["candidate_reward_mean"] = avg_all
-                row["candidate_reward_std"] = float(np.std(rewards)) if rewards else 0.0
-                row["candidate_valid_frac"] = (
-                    float(np.mean([1.0 if _record_valid(c) else 0.0 for c in kept_candidates]))
-                    if kept_candidates else 0.0
-                )
-                row["best_minus_avg_reward"] = float(best.get("reward", 0.0)) - avg_all
-                row["candidate_reward_mean_valid"] = float(np.mean(valid_rewards)) if valid_rewards else None
-                row["best_minus_avg_reward_valid"] = (
-                    float(best.get("reward", 0.0)) - float(np.mean(valid_rewards))
-                    if valid_rewards else None
-                )
-
-                kept.append(row)
-            else:
-                if _passes_structured_filter(parent, sft_filter):
-                    kept.append(parent)
+            final_pool = _sort_sft_pool(final_pool, cfg)
+            kept.append(_build_sft_pool_row(parent, final_pool, raw_stats, cfg))
 
         return kept
 
